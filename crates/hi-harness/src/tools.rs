@@ -8,14 +8,14 @@ use hi_ai::ToolSpec;
 use hi_lsp::LspManager;
 use hi_tools::shell_policy::classify_shell_tool_arguments;
 use hi_tools::{
-    BackgroundRegistry, PlanStep, ProcessRunner, ReadCache, RepoMapCache, TOOL_SPECS, ToolEffects,
-    ToolOutcome, ToolStatus, TruncationState, execute_prepared_in_runtime,
+    BackgroundRegistry, InspectRepeatLedger, PlanStep, ProcessRunner, ReadCache, RepoMapCache,
+    TOOL_SPECS, ToolEffects, ToolOutcome, ToolStatus, TruncationState, execute_prepared_in_runtime,
     execute_streaming_in_runtime_with_runner, is_filesystem_mutating,
     prepare_mutation_in_with_state,
 };
 
 use crate::liveness::tool_fingerprint;
-use crate::ui::{ConfirmationRequest, ConfirmationResult, PermissionMode, Ui};
+use crate::ui::{AutoHint, ConfirmationRequest, ConfirmationResult, PermissionMode, Ui};
 
 const ADVERTISED: &[&str] = &[
     "read",
@@ -68,6 +68,7 @@ pub struct ToolHost {
     background: Arc<BackgroundRegistry>,
     read_cache: Mutex<ReadCache>,
     repo_map: Mutex<RepoMapCache>,
+    inspect_repeats: Mutex<InspectRepeatLedger>,
     liveness: hi_liveness::Publisher,
 }
 
@@ -91,6 +92,7 @@ impl ToolHost {
             background: Arc::new(BackgroundRegistry::default()),
             read_cache: Mutex::new(ReadCache::new()),
             repo_map: Mutex::new(RepoMapCache::new()),
+            inspect_repeats: Mutex::new(InspectRepeatLedger::new()),
             liveness: hi_liveness::Publisher::new(),
         };
         host.bind_pgid_source();
@@ -136,6 +138,39 @@ impl ToolHost {
 
     pub fn reset_bash_repeats(&self) {
         self.runner.reset_bash_repeats();
+        if let Ok(mut cache) = self.read_cache.lock() {
+            cache.reset_turn_full_reads();
+        }
+        if let Ok(mut ledger) = self.inspect_repeats.lock() {
+            ledger.reset();
+        }
+    }
+
+    pub(crate) fn forget_inspect_keys(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut ledger = self
+            .inspect_repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in keys {
+            ledger.forget(key);
+        }
+    }
+
+    fn admit_inspect_repeat(&self, name: &str, fingerprint: &str) -> Option<String> {
+        self.inspect_repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(name, fingerprint)
+    }
+
+    fn record_inspect_output(&self, name: &str, fingerprint: &str, output: &str) {
+        self.inspect_repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_output(name, fingerprint, output);
     }
 
     pub fn sandbox_enforced(&self) -> bool {
@@ -158,16 +193,36 @@ impl ToolHost {
         permission: impl Fn() -> PermissionMode,
         ui: &mut dyn Ui,
     ) -> ToolOutcome {
+        self.execute_with_auto(id, name, arguments, permission, AutoHint::Heuristic, ui)
+            .await
+    }
+
+    pub async fn execute_with_auto(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        permission: impl Fn() -> PermissionMode,
+        auto: AutoHint,
+        ui: &mut dyn Ui,
+    ) -> ToolOutcome {
         if let Some(denied) = self
-            .confirm_if_needed(name, arguments, permission, ui)
+            .confirm_if_needed(name, arguments, permission, auto, ui)
             .await
         {
             return denied;
         }
         self.liveness.note_tool_start(id, name);
-        self.liveness
-            .note_tool_fingerprint(&tool_fingerprint(name, arguments));
+        let fingerprint = tool_fingerprint(name, arguments);
         ui.tool_started_id(id, name, arguments);
+        if let Some(message) = self.admit_inspect_repeat(name, &fingerprint) {
+            // Do not count a refusal toward identical-tool storm: a single
+            // model round of eight greps would otherwise hit the storm
+            // invariant before the harness can stop on probe refusals.
+            self.liveness.note_tool_end(false);
+            return failed_outcome(message);
+        }
+        self.liveness.note_tool_fingerprint(&fingerprint);
         let outcome = if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
             match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
                 .await
@@ -197,6 +252,13 @@ impl ToolHost {
             )
             .await
         };
+        if outcome.effects.mutation_applied {
+            // Exact grep/read repeats are stale once the tree changed.
+            if let Ok(mut ledger) = self.inspect_repeats.lock() {
+                ledger.reset();
+            }
+        }
+        self.record_inspect_output(name, &fingerprint, &outcome.content);
         if outcome.status == ToolStatus::Failed {
             self.liveness.note_tool_error(&outcome.content);
         }
@@ -207,47 +269,63 @@ impl ToolHost {
         outcome
     }
 
+    pub(crate) async fn confirmation_request(
+        &self,
+        name: &str,
+        arguments: &str,
+    ) -> Option<ConfirmationRequest> {
+        if is_filesystem_mutating(name) {
+            return Some(
+                match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
+                    .await
+                {
+                    Ok(prepared) => ConfirmationRequest::FileEdit {
+                        path: prepared
+                            .single_target_path()
+                            .unwrap_or_else(|| "(multiple files)".into()),
+                        diff: prepared.preview(),
+                    },
+                    Err(_) => ConfirmationRequest::FileEdit {
+                        path: path_from_args(arguments).unwrap_or_else(|| name.to_string()),
+                        diff: arguments.to_string(),
+                    },
+                },
+            );
+        }
+        if name == "bash" && !classify_shell_tool_arguments(arguments).is_proven_read_only() {
+            return Some(ConfirmationRequest::ShellMutation {
+                command: command_from_args(arguments),
+                cwd: self.root.display().to_string(),
+            });
+        }
+        None
+    }
+
     async fn confirm_if_needed(
         &self,
         name: &str,
         arguments: &str,
         permission: impl Fn() -> PermissionMode,
+        auto: AutoHint,
         ui: &mut dyn Ui,
     ) -> Option<ToolOutcome> {
         if permission() == PermissionMode::Always {
             return None;
         }
-        let request = if is_filesystem_mutating(name) {
-            match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
-                .await
-            {
-                Ok(prepared) => ConfirmationRequest::FileEdit {
-                    path: prepared
-                        .single_target_path()
-                        .unwrap_or_else(|| "(multiple files)".into()),
-                    diff: prepared.preview(),
-                },
-                Err(_) => ConfirmationRequest::FileEdit {
-                    path: path_from_args(arguments).unwrap_or_else(|| name.to_string()),
-                    diff: arguments.to_string(),
-                },
-            }
-        } else if name == "bash" && !classify_shell_tool_arguments(arguments).is_proven_read_only()
-        {
-            ConfirmationRequest::ShellMutation {
-                command: command_from_args(arguments),
-                cwd: self.root.display().to_string(),
-            }
-        } else {
-            return None;
-        };
+        let request = self.confirmation_request(name, arguments).await?;
         // Re-read after the (possibly slow) preview so `/yolo` typed while
         // the diff was being prepared is honored without a prompt.
         let mode = permission();
         if mode == PermissionMode::Always {
             return None;
         }
-        if mode == PermissionMode::Auto && request.safe_for_auto() {
+        let skip = mode == PermissionMode::Auto
+            && match auto {
+                AutoHint::Approve => !request.blocks_auto_expand(),
+                AutoHint::Confirm => false,
+                AutoHint::Heuristic => request.safe_for_auto(),
+            };
+        if skip {
             return None;
         }
         self.liveness
@@ -366,7 +444,7 @@ fn denied_outcome(content: impl Into<String>) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::TestUi;
+    use crate::ui::{ConfirmationResult, TestUi};
     use hi_tools::ProcessRunner;
     use hi_tools::sandbox::SandboxPolicy;
 
@@ -413,6 +491,165 @@ mod tests {
             "echo should run: {}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn second_identical_list_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let args = serde_json::json!({"path": "."}).to_string();
+        let mut ui = TestUi::default();
+        let first = host
+            .execute("c1", "list", &args, || PermissionMode::Always, &mut ui)
+            .await;
+        assert_eq!(first.status, ToolStatus::Succeeded);
+        let second = host
+            .execute("c2", "list", &args, || PermissionMode::Always, &mut ui)
+            .await;
+        assert_eq!(second.status, ToolStatus::Failed);
+        assert!(
+            second.content.contains("already ran this turn"),
+            "{}",
+            second.content
+        );
+        assert!(
+            hi_tools::is_probe_refusal(&second.content),
+            "refusals must trip the same-turn stop: {}",
+            second.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_repeat_resets_after_a_successful_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let list_args = serde_json::json!({"path": "."}).to_string();
+        let mut ui = TestUi::default();
+        let first = host
+            .execute("c1", "list", &list_args, || PermissionMode::Always, &mut ui)
+            .await;
+        assert_eq!(first.status, ToolStatus::Succeeded);
+        let refused = host
+            .execute("c2", "list", &list_args, || PermissionMode::Always, &mut ui)
+            .await;
+        assert!(
+            hi_tools::is_probe_refusal(&refused.content),
+            "{}",
+            refused.content
+        );
+        let write_args = serde_json::json!({
+            "path": "added.rs",
+            "content": "pub const MAX_PASSWORD: u32 = 64;\n"
+        })
+        .to_string();
+        let wrote = host
+            .execute(
+                "c3",
+                "write",
+                &write_args,
+                || PermissionMode::Always,
+                &mut ui,
+            )
+            .await;
+        assert_eq!(wrote.status, ToolStatus::Succeeded, "{}", wrote.content);
+        assert!(wrote.effects.mutation_applied);
+        let again = host
+            .execute("c4", "list", &list_args, || PermissionMode::Always, &mut ui)
+            .await;
+        assert_eq!(again.status, ToolStatus::Succeeded, "{}", again.content);
+        assert!(
+            !hi_tools::is_probe_refusal(&again.content),
+            "post-write list must see the new tree, got {}",
+            again.content
+        );
+        assert!(
+            again.content.contains("added.rs"),
+            "list after write should include the new file: {}",
+            again.content
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_hint_approve_skips_overlay_for_gray_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let args = serde_json::json!({"command": "touch jev-ok"}).to_string();
+        let mut ui = TestUi {
+            confirm: ConfirmationResult::Rejected,
+            ..TestUi::default()
+        };
+        let out = host
+            .execute_with_auto(
+                "c1",
+                "bash",
+                &args,
+                || PermissionMode::Auto,
+                AutoHint::Approve,
+                &mut ui,
+            )
+            .await;
+        assert_eq!(out.status, ToolStatus::Succeeded, "{}", out.content);
+        assert!(dir.path().join("jev-ok").exists());
+    }
+
+    #[tokio::test]
+    async fn auto_hint_cannot_expand_force_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let args = serde_json::json!({"command": "git push --force origin main"}).to_string();
+        let mut ui = TestUi {
+            confirm: ConfirmationResult::Rejected,
+            ..TestUi::default()
+        };
+        let out = host
+            .execute_with_auto(
+                "c1",
+                "bash",
+                &args,
+                || PermissionMode::Auto,
+                AutoHint::Approve,
+                &mut ui,
+            )
+            .await;
+        assert_eq!(out.status, ToolStatus::Denied, "{}", out.content);
+        assert!(out.content.contains("rejected by user"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn auto_hint_confirm_withholds_heuristic_safe_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let args = serde_json::json!({
+            "path": "lib.rs",
+            "content": "pub fn ok() {}\n"
+        })
+        .to_string();
+        let mut ui = TestUi {
+            confirm: ConfirmationResult::Rejected,
+            ..TestUi::default()
+        };
+        let withheld = host
+            .execute_with_auto(
+                "c1",
+                "write",
+                &args,
+                || PermissionMode::Auto,
+                AutoHint::Confirm,
+                &mut ui,
+            )
+            .await;
+        assert_eq!(withheld.status, ToolStatus::Denied, "{}", withheld.content);
+        let allowed = host
+            .execute_with_auto(
+                "c2",
+                "write",
+                &args,
+                || PermissionMode::Auto,
+                AutoHint::Heuristic,
+                &mut ui,
+            )
+            .await;
+        assert_eq!(allowed.status, ToolStatus::Succeeded, "{}", allowed.content);
     }
 
     #[test]

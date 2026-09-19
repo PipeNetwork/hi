@@ -132,3 +132,42 @@ fn pipe_route_login_profile_ref_does_not_leak_openai_key() {
         }
     }
 }
+
+#[test]
+fn turn_report_records_silent_inspect_stop_fields() {
+    let ui = StdoutUi {
+        assistant: String::new(),
+        turn_end: "stopped repeating the same inspect".into(),
+        statuses: vec!["shrunk tool results".into()],
+        tool_calls: vec![serde_json::json!({
+            "name": "read",
+            "arguments": "{\"path\":\"src/server.rs\"}",
+            "output": "read src/server.rs · 12000 chars · omitted",
+        })],
+        ..StdoutUi::default()
+    };
+    let outcome = TurnOutcome {
+        stop_reason: TurnStopReason::Completed,
+        usage: hi_ai::Usage {
+            input_tokens: 12,
+            output_tokens: 0,
+            ..Default::default()
+        },
+        changed_files: Vec::new(),
+        error: None,
+        verification: None,
+    };
+    let body = turn_report_json(&outcome, &ui, 4, &[]);
+    assert_eq!(body["assistant_response"], "");
+    assert_eq!(body["turn_end"], "stopped repeating the same inspect");
+    assert_eq!(
+        body["outcome"]["turn_end"],
+        "stopped repeating the same inspect"
+    );
+    assert_eq!(body["usage"]["input_tokens"], 12);
+    let output = body["tools"][0]["output"].as_str().unwrap();
+    assert!(
+        output.contains("omitted"),
+        "report must keep stubbed read output: {output}"
+    );
+}

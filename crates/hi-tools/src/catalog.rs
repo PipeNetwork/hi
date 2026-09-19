@@ -107,7 +107,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                         "items": { "type": "string", "minLength": 1 }
                     },
                     "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 2000)." }
+                    "limit": { "type": "integer", "description": format!("Maximum number of lines to return (default: {}).", crate::read::DEFAULT_READ_LIMIT) }
                 },
                 "oneOf": [{ "required": ["path"] }, { "required": ["paths"] }, { "required": ["uri"] }],
                 "additionalProperties": false

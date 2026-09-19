@@ -1,0 +1,8 @@
+[package]
+name = "linux_review"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Nested workspace so `cargo test` here does not join the hi repo workspace.
+[workspace]

@@ -398,6 +398,7 @@ impl crate::App {
         let inner = chrome::inset(area, hpad_left, hpad_right, top_vpad, bottom_vpad);
         let composer_w = inner.width;
         let overlay_composer = self.confirmation.is_some()
+            || self.pending_resume.is_some()
             || self.fetching.is_some()
             || self.picker.is_some()
             || self.provider_picker.is_some()
@@ -558,6 +559,12 @@ impl crate::App {
             } else {
                 confirm_h
             }
+        } else if self.pending_resume.is_some() {
+            inner
+                .height
+                .saturating_sub(3 + chrome_rows)
+                .clamp(8, 16)
+                .min(composer_box_max)
         } else if self.fetching.is_some() {
             3.min(composer_box_max)
         } else if let Some(p) = &self.picker {
@@ -1194,6 +1201,52 @@ impl crate::App {
                     input_area,
                 );
             }
+        } else if let Some(card) = &self.pending_resume {
+            let th = crate::theme::theme();
+            let continue_style = if card.selected == 0 {
+                Style::default()
+                    .fg(th.accent_plan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim()
+            };
+            let dismiss_style = if card.selected == 1 {
+                Style::default()
+                    .fg(th.accent_plan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim()
+            };
+            let body = vec![
+                Line::styled(
+                    "This session stopped mid-turn.",
+                    Style::default().fg(th.warning).add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    if card.selected == 0 {
+                        "  › Continue the unfinished turn"
+                    } else {
+                        "    Continue the unfinished turn"
+                    },
+                    continue_style,
+                ),
+                Line::styled(
+                    if card.selected == 1 {
+                        "  › Dismiss (leave as-is)"
+                    } else {
+                        "    Dismiss (leave as-is)"
+                    },
+                    dismiss_style,
+                ),
+            ];
+            let block = th
+                .panel_block("Unfinished turn", UiTone::Warning)
+                .title_bottom(Line::styled("j/k · Enter · Esc dismisses", dim()));
+            frame.render_widget(
+                Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+                input_area,
+            );
         } else if let Some(started) = self.fetching.or(self.planning) {
             let frame_ch = SPINNER[self.spinner % SPINNER.len()];
             let elapsed = fmt_elapsed(started.elapsed().as_secs());

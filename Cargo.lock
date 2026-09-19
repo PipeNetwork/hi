@@ -3793,6 +3793,7 @@ dependencies = [
  "hi-test-utils",
  "hi-tools",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

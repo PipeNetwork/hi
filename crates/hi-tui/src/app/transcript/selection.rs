@@ -420,7 +420,6 @@ mod tests {
         let mut block = ActivityBlock::verb_group(ExploreVerb::Read, Some("a.rs".into()));
         if let Some(group) = block.as_verb_group_mut() {
             group.add(ExploreVerb::Read, Some("b.rs".into()));
-            group.add(ExploreVerb::List, Some("src".into()));
             group.live = false;
         }
         block
@@ -438,7 +437,7 @@ mod tests {
         };
         app.view_scroll = 0;
         app.view_prefix = vec![0, 1];
-        app.view_line_texts = vec!["◆ Read 2 files, Listed 1 dir ›".into()];
+        app.view_line_texts = vec!["Read 2 files ›".into()];
         app.block_row_spans = vec![(0, 1, 0)];
         app
     }

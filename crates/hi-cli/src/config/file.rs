@@ -44,6 +44,9 @@ pub struct Config {
     pub browser: BrowserSection,
     #[serde(default)]
     pub harness: HarnessConfig,
+    /// Optional TypeSafe (Jev) next-action gate. Machine-scoped; env key is enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typesafe: Option<TypesafeSection>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -223,6 +226,62 @@ impl BrowserSection {
     }
 }
 
+/// Optional TypeSafe (Jev) supervisor. A key in `TYPESAFE_API_KEY` is enough;
+/// this section can disable the gate or override model/base URL.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct TypesafeSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<bool>,
+}
+
+impl TypesafeSection {
+    pub fn to_harness_settings(&self) -> hi_harness::TypesafeSettings {
+        if self.enabled == Some(false) {
+            return hi_harness::TypesafeSettings::disabled();
+        }
+        let env_name = self
+            .api_key_env
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(hi_harness::TypesafeSettings::API_KEY_ENV);
+        let mut settings = hi_harness::TypesafeSettings::from_env_name(env_name);
+        if !settings.is_enabled()
+            && let Some(reference) = self
+                .api_key_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|reference| !reference.is_empty())
+        {
+            match super::resolve_credential_reference(reference, false, true) {
+                Ok(key) => settings.api_key = Some(key),
+                Err(err) => tracing::debug!("typesafe credential {reference:?}: {err:#}"),
+            }
+        }
+        settings.apply_file(
+            self.base_url.as_deref(),
+            self.model.as_deref(),
+            self.min_confidence,
+            self.auto,
+            self.effort,
+        );
+        settings
+    }
+}
+
 pub fn resolve_rsi(cli: &Cli, file: &Config) -> anyhow::Result<RsiRequested> {
     if cli.rsi_managed {
         anyhow::ensure!(!cli.no_rsi, "managed RSI cannot be disabled");
@@ -332,7 +391,7 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 15)?;
+        let mut s = serializer.serialize_struct("Config", 16)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
         }
@@ -379,6 +438,9 @@ impl serde::Serialize for Config {
         }
         if !self.harness.is_empty() {
             s.serialize_field("harness", &self.harness)?;
+        }
+        if let Some(typesafe) = &self.typesafe {
+            s.serialize_field("typesafe", typesafe)?;
         }
         s.end()
     }

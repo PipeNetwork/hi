@@ -7,11 +7,12 @@
 /// Tolerant — a failed parse yields `None`, which the caller treats as "no
 /// dependency inferred" (safe fallback to emission order).
 pub fn target_path(name: &str, arguments: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    let value: serde_json::Value = serde_json::from_str(arguments.as_ref()).ok()?;
     match name {
         // `read` accepts compatibility paths or a typed workspace URI. Other
         // schemes have no local path until a host resolver routes them.
-        "read" => crate::read::workspace_path_from_read_arguments(arguments),
+        "read" => crate::read::workspace_path_from_read_arguments(arguments.as_ref()),
         "write" | "edit" | "multi_edit" => value.get("path")?.as_str().map(str::to_string),
         // list's path is optional (defaults to ".").
         "list" => value.get("path")?.as_str().map(str::to_string),
@@ -54,7 +55,8 @@ pub fn target_paths(name: &str, arguments: &str) -> Vec<String> {
     if let Some(one) = target_path(name, arguments) {
         return vec![one];
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments.as_ref()) else {
         return Vec::new();
     };
     if name == "read" {

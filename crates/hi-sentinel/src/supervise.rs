@@ -87,6 +87,12 @@ pub fn run() -> Result<i32> {
 
 async fn run_async() -> Result<i32> {
     let cli = SentinelCli::parse();
+    // Swallow SIGTSTP's default stop for every Sentinel path, including
+    // `--incident` apply which never enters `run_generation`. A second
+    // listener in `run_generation` still delivers user-stop while `hi` runs.
+    let _sigtstp =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP))
+            .context("install SIGTSTP handler")?;
     let mut hi_argv = cli.hi_argv;
     let mut incident = cli.incident;
     if hi_argv.first().is_some_and(|arg| arg == "repair") {
@@ -242,6 +248,17 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
     ];
     env_pairs.extend(cfg.extra_env.iter().cloned());
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    // Default SIGTSTP *stops* this process. Install before spawn so the
+    // handler is in place before we give the TTY away. spawn/restore must
+    // not call libc::signal(SIGTSTP): tokio registers once (`get_or_init`),
+    // and SIG_DFL/SIG_IGN would either freeze us in `T` or kill later
+    // generations' Ctrl-Z listener.
+    let mut sigtstp =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGTSTP))
+            .context("install SIGTSTP handler")?;
+
     spawn::write_supervisor_log(&runtime, "spawning child");
     let terminal = spawn::snapshot_terminal();
     let spawned = spawn::spawn_child(cfg, &env_pairs, terminal)?;
@@ -252,8 +269,6 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
     let mut monitor = Monitor::new(cfg.monitor.clone(), pid, instance);
     let mut report_written: Option<PathBuf> = None;
     let mut repair_task: Option<tokio::task::JoinHandle<String>> = None;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("install SIGTERM handler")?;
 
     loop {
         tokio::select! {
@@ -330,6 +345,21 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
                     &mut repair_task,
                     &runtime,
                     "aborted in-flight slash repair (SIGTERM)",
+                )
+                .await;
+            }
+            _ = sigtstp.recv() => {
+                spawn::write_supervisor_log(&runtime, "SIGTSTP; stopping child and exiting");
+                return exit_user_stop(
+                    &mut child,
+                    pgid,
+                    monitor.last_heartbeat().and_then(|h| h.current_tool_pgid),
+                    cfg.monitor.term_grace,
+                    &terminal,
+                    pid,
+                    &mut repair_task,
+                    &runtime,
+                    "aborted in-flight slash repair (SIGTSTP)",
                 )
                 .await;
             }

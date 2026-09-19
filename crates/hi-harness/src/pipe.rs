@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 pub const DEFAULT_BASE_URL: &str = "https://api.pipenetwork.ai/v1";
 pub const DEFAULT_MODEL: &str = "pipe/deepseek-v4-flash-0731";
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
+/// Cap body/header `retry_after_seconds` so a bad payload cannot stall a turn.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
 
 #[derive(Debug)]
 pub struct PipeError {
@@ -79,6 +81,13 @@ impl PipeCompletion {
         self.text.trim().is_empty()
             && self.reasoning.trim().is_empty()
             && self.tool_calls.is_empty()
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        matches!(
+            self.finish_reason.as_deref(),
+            Some("length" | "max_tokens" | "max_output_tokens")
+        )
     }
 }
 
@@ -170,9 +179,14 @@ impl PipeClient {
             };
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS && attempts < 3 {
-                let retry_after = retry_after_seconds(response.headers());
+                let header = retry_after_seconds(response.headers());
+                let body = response.text().await.unwrap_or_default();
+                let wait = header
+                    .or_else(|| retry_after_from_json_body(&body))
+                    .unwrap_or(1)
+                    .min(MAX_RETRY_AFTER_SECS);
                 attempts += 1;
-                tokio::time::sleep(Duration::from_secs(retry_after.unwrap_or(1).min(8))).await;
+                tokio::time::sleep(Duration::from_secs(wait)).await;
                 continue;
             }
             if status.is_server_error() && attempts < 2 {
@@ -181,8 +195,9 @@ impl PipeClient {
                 continue;
             }
             if !status.is_success() {
-                let retry_after = retry_after_seconds(response.headers());
+                let header = retry_after_seconds(response.headers());
                 let message = response.text().await.unwrap_or_default();
+                let retry_after = header.or_else(|| retry_after_from_json_body(&message));
                 return Err(PipeError {
                     status: Some(status.as_u16()),
                     message,
@@ -213,6 +228,36 @@ fn retry_after_seconds(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
+}
+
+/// Pipe capacity 429s put `retry_after_seconds` in JSON and often omit Retry-After.
+fn retry_after_from_json_body(body: &str) -> Option<u64> {
+    let trimmed = body.trim();
+    let json = if trimmed.starts_with('{') {
+        trimmed
+    } else {
+        trimmed.find('{').map(|idx| &trimmed[idx..])?
+    };
+    let value: Value = serde_json::from_str(json).ok()?;
+    fn find(v: &Value) -> Option<u64> {
+        match v {
+            Value::Object(map) => {
+                if let Some(n) = map.get("retry_after_seconds").and_then(json_u64) {
+                    return Some(n);
+                }
+                map.values().find_map(find)
+            }
+            Value::Array(items) => items.iter().find_map(find),
+            _ => None,
+        }
+    }
+    find(&value)
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
 }
 
 fn build_body(
@@ -755,8 +800,12 @@ pub mod test_support {
     }
 
     pub fn usage_chunk(prompt: u64, completion: u64) -> String {
+        usage_chunk_with_reason(prompt, completion, "stop")
+    }
+
+    pub fn usage_chunk_with_reason(prompt: u64, completion: u64, finish_reason: &str) -> String {
         serde_json::json!({
-            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
             "usage": { "prompt_tokens": prompt, "completion_tokens": completion }
         })
         .to_string()
@@ -976,6 +1025,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_reads_advertised_output_cap() {
+        let models = super::parse_models(
+            r#"{"data":[{"id":"pipe/deepseek-v4-flash-0731","context_window":212992,"max_output_tokens":16384}]}"#,
+        )
+        .unwrap();
+        assert_eq!(models[0].id, "pipe/deepseek-v4-flash-0731");
+        assert_eq!(models[0].context_window, Some(212_992));
+        assert_eq!(models[0].max_output_tokens, Some(16_384));
+    }
+
+    #[test]
     fn user_image_uses_multipart_content() {
         let messages = vec![Message::user_with_image("see this", "abc", "image/png")];
         let encoded = super::to_openai_messages(&messages);
@@ -1026,6 +1086,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completion.text, "ok");
+    }
+
+    #[test]
+    fn retry_after_from_json_body_reads_pipe_capacity_payload() {
+        let body = r#"{"code":"capacity_unavailable","retry_after_seconds":5,"retryable":true}"#;
+        assert_eq!(super::retry_after_from_json_body(body), Some(5));
+        let wrapped = r#"pipe http 429: {"error":{"retry_after_seconds":7}}"#;
+        assert_eq!(super::retry_after_from_json_body(wrapped), Some(7));
+        assert_eq!(super::retry_after_from_json_body("slow down"), None);
+    }
+
+    #[tokio::test]
+    async fn retries_429_using_json_retry_after_without_header() {
+        let Some(server) = MockPipe::new(vec![
+            Scripted::Http {
+                status: 429,
+                body: r#"{"code":"capacity_unavailable","retry_after_seconds":0,"retryable":true}"#
+                    .into(),
+                retry_after: None,
+            },
+            Scripted::Sse(vec![text_chunk("ok"), usage_chunk(1, 1)]),
+        ]) else {
+            return;
+        };
+        let client = PipeClient::new(server.url.clone(), "pk_test");
+        let completion = client
+            .stream(
+                DEFAULT_MODEL,
+                &[Message::user("hi")],
+                &[],
+                128,
+                None,
+                &mut |_| {},
+                &TurnCancellation::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "ok");
+        assert_eq!(server.bodies.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

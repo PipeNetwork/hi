@@ -8,7 +8,8 @@ Commands:
   auth               Paste and verify an API key (pipenetwork / openai / anthropic / xai)
   browser            Install the Chrome debugger extension (`install`)
   update             Update the hi binary
-  resume             Continue the latest session (same as -c)
+  resume             Continue unfinished work in this directory (same as -c)
+  sessions           List sessions that need attention (`--all` for every session)
   tickets            Claim project tickets
   trace              List, show, or verify local traces
   announcements      Show product announcements
@@ -16,8 +17,8 @@ Commands:
   --quiet            Assistant text only (one-shot / --plain)
   --confirm-edits    Ask before mutations outside the TUI
 
-`hi setup fix nginx` is a prompt, not sign-in. `hi --list-sessions` lists
-saved sessions; `hi --resume <id>` opens one.
+`hi setup fix nginx` is a prompt, not sign-in. `hi sessions` lists unfinished
+work; `hi sessions --all` lists every session; `hi --resume <id>` opens one.
 ";
 
 fn parse_finite_u32_cap(value: &str) -> std::result::Result<u32, String> {
@@ -233,6 +234,10 @@ pub struct Cli {
     #[arg(long)]
     pub list_sessions: bool,
 
+    /// With `--list-sessions` / `hi sessions`, include finished sessions.
+    #[arg(long, requires = "list_sessions")]
+    pub all: bool,
+
     /// Run the headless `/loop` daemon: keep this project's loops firing (and
     /// auto-fixing) in the background, without the TUI, until Ctrl-C.
     #[arg(long)]
@@ -272,6 +277,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_auto_compact: bool,
 
+    /// Start this session with Jev tool prune on (needs a TypeSafe key).
+    #[arg(long)]
+    pub jev_compact: bool,
+
     /// Disable the end-of-turn finalization call that writes a structured recap
     /// after a turn changes files (saves one model call per such turn).
     #[arg(long)]
@@ -304,7 +313,8 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["subagent", "review_target"])]
     pub worktree: bool,
 
-    /// Compaction strategy: hybrid (default), full, or elide.
+    /// Compaction strategy: hybrid (default), jev, full, or elide.
+    /// Only `jev` is wired (starts Jev prune when a TypeSafe key is present).
     #[arg(long, value_name = "KIND")]
     pub compaction: Option<String>,
 

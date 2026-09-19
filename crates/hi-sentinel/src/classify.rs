@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_assistant_after_tools_is_harness_bug_even_when_idle() {
+    fn empty_assistant_after_tools_is_report_only_when_idle() {
         let mut hb = sample_beat(HarnessState::Idle, vec![], "/tmp/ws");
         hb.invariant = Some(InvariantViolation {
             code: InvariantCode::EmptyAssistantAfterTools,
@@ -474,14 +474,13 @@ mod tests {
         let class = classify(&MonitorSignal::Invariant { heartbeat: hb }, &ctx());
         assert_eq!(
             class,
-            Some(Class::HarnessBug {
-                kind: BugKind::Invariant,
-                confidence: Confidence::High
+            Some(Class::ReportOnly {
+                kind: ReportKind::AgentLoop
             })
         );
         assert!(
-            AUTO_REPAIR_SET.contains(&InvariantCode::EmptyAssistantAfterTools),
-            "sentinel must auto-repair this, not leave the live child idle"
+            !AUTO_REPAIR_SET.contains(&InvariantCode::EmptyAssistantAfterTools),
+            "empty-after-tools must not SIGTERM an idle TUI"
         );
     }
 

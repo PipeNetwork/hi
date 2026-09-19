@@ -8,9 +8,18 @@ use anyhow::{Context, Result};
 use hi_ai::{Message, Role, Usage};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDrive {
+    pub paused: bool,
+    #[serde(default)]
+    pub resume_on_user_input: bool,
+    #[serde(default)]
+    pub stall: u32,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum SessionMeta {
+pub(crate) enum SessionMeta {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -46,6 +55,16 @@ enum SessionMeta {
     TurnClosed {
         turn_index: u32,
     },
+    Plan {
+        steps: Vec<hi_tools::PlanStep>,
+    },
+    PlanDrive {
+        paused: bool,
+        #[serde(default)]
+        resume_on_user_input: bool,
+        #[serde(default)]
+        stall: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,10 +85,13 @@ pub struct LoadedSession {
     pub permission: Option<u8>,
     pub effort: Option<String>,
     pub pending_turn: Option<PendingTurn>,
+    pub plan: Vec<hi_tools::PlanStep>,
+    pub plan_drive: PlanDrive,
 }
 
 pub struct JsonlSession {
     path: PathBuf,
+    _lease: crate::session_lease::SessionLease,
 }
 
 impl JsonlSession {
@@ -79,12 +101,16 @@ impl JsonlSession {
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating session dir {}", parent.display()))?;
         }
+        let lease = crate::session_lease::SessionLease::acquire(&path)?;
         OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("creating session {}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            _lease: lease,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -149,6 +175,18 @@ impl JsonlSession {
                             pending = None;
                         }
                     }
+                    SessionMeta::Plan { steps } => loaded.plan = steps,
+                    SessionMeta::PlanDrive {
+                        paused,
+                        resume_on_user_input,
+                        stall,
+                    } => {
+                        loaded.plan_drive = PlanDrive {
+                            paused,
+                            resume_on_user_input,
+                            stall,
+                        };
+                    }
                 }
                 continue;
             }
@@ -157,6 +195,9 @@ impl JsonlSession {
             }
         }
         loaded.pending_turn = pending;
+        if loaded.plan.is_empty() {
+            loaded.plan = crate::completion::plan_from_messages(&loaded.messages);
+        }
         Ok(loaded)
     }
 
@@ -172,6 +213,7 @@ impl JsonlSession {
         // Turn-start persist must survive a mid-turn crash.
         file.flush()?;
         file.sync_all()?;
+        self.note_user_messages(messages);
         Ok(())
     }
 
@@ -180,7 +222,36 @@ impl JsonlSession {
             turn_index: pending.turn_index,
             started_unix_ms: pending.started_unix_ms,
             pre_checkpoint: pending.pre_checkpoint.clone(),
-        })
+        })?;
+        crate::session_index::patch_index(&self.path, |index| {
+            index.pending_turn = Some(pending.turn_index);
+        });
+        Ok(())
+    }
+
+    pub fn record_plan(&mut self, steps: &[hi_tools::PlanStep]) -> Result<()> {
+        self.write_meta_sync(&SessionMeta::Plan {
+            steps: steps.to_vec(),
+        })?;
+        let (done, total, active) = crate::session_index::plan_progress(steps);
+        crate::session_index::patch_index(&self.path, |index| {
+            index.plan_done = done;
+            index.plan_total = total;
+            index.plan_active = active;
+        });
+        Ok(())
+    }
+
+    pub fn record_plan_drive(&mut self, drive: &PlanDrive) -> Result<()> {
+        self.write_meta_sync(&SessionMeta::PlanDrive {
+            paused: drive.paused,
+            resume_on_user_input: drive.resume_on_user_input,
+            stall: drive.stall,
+        })?;
+        crate::session_index::patch_index(&self.path, |index| {
+            index.drive_paused = drive.paused;
+        });
+        Ok(())
     }
 
     /// User line + `PendingTurn` in one append/fsync so success/failure is one unit.
@@ -201,6 +272,10 @@ impl JsonlSession {
         )?;
         file.flush()?;
         file.sync_all()?;
+        self.note_user_messages(std::slice::from_ref(message));
+        crate::session_index::patch_index(&self.path, |index| {
+            index.pending_turn = Some(pending.turn_index);
+        });
         Ok(())
     }
 
@@ -222,7 +297,13 @@ impl JsonlSession {
     }
 
     pub fn record_turn_closed(&mut self, turn_index: u32) -> Result<()> {
-        self.write_meta_sync(&SessionMeta::TurnClosed { turn_index })
+        self.write_meta_sync(&SessionMeta::TurnClosed { turn_index })?;
+        crate::session_index::patch_index(&self.path, |index| {
+            if index.pending_turn == Some(turn_index) {
+                index.pending_turn = None;
+            }
+        });
+        Ok(())
     }
 
     pub fn record_usage(&mut self, usage: Usage) -> Result<()> {
@@ -322,6 +403,22 @@ impl JsonlSession {
                     },
                 )?;
             }
+            if !state.plan.is_empty() {
+                write_meta_to(
+                    &mut file,
+                    &SessionMeta::Plan {
+                        steps: state.plan.clone(),
+                    },
+                )?;
+            }
+            write_meta_to(
+                &mut file,
+                &SessionMeta::PlanDrive {
+                    paused: state.plan_drive.paused,
+                    resume_on_user_input: state.plan_drive.resume_on_user_input,
+                    stall: state.plan_drive.stall,
+                },
+            )?;
             file.flush()?;
             file.sync_all()?;
             drop(file);
@@ -332,7 +429,40 @@ impl JsonlSession {
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
         }
+        if result.is_ok() {
+            let index = crate::session_index::index_from_loaded(&self.path, state);
+            let _ = crate::session_index::write_index(&self.path, &index);
+        }
         result
+    }
+
+    fn note_user_messages(&self, messages: &[Message]) {
+        for message in messages {
+            if message.role != Role::User {
+                continue;
+            }
+            let text = message.text();
+            if crate::session_index::is_harness_injection(&text) {
+                continue;
+            }
+            let preview: String = text
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(96)
+                .collect();
+            if preview.is_empty() {
+                continue;
+            }
+            crate::session_index::patch_index(&self.path, |index| {
+                index.last_user.clone_from(&preview);
+                if index.title.is_empty() {
+                    index.title = preview.clone();
+                }
+            });
+        }
     }
 
     fn write_meta(&mut self, meta: &SessionMeta) -> Result<()> {
@@ -500,7 +630,123 @@ mod tests {
             Some("in flight")
         );
         let loaded = JsonlSession::load(&path).unwrap();
-        assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.pending_turn.unwrap().turn_index, 1);
+    }
+
+    #[test]
+    fn rewrite_and_load_restore_an_open_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        let steps = vec![
+            hi_tools::PlanStep {
+                title: "Add /metrics".into(),
+                status: hi_tools::PlanStatus::Active,
+            },
+            hi_tools::PlanStep {
+                title: "Run tests".into(),
+                status: hi_tools::PlanStatus::Pending,
+            },
+        ];
+        session
+            .rewrite(&LoadedSession {
+                messages: vec![Message::user("do all of that")],
+                plan: steps.clone(),
+                ..LoadedSession::default()
+            })
+            .unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.plan, steps);
+        assert!(!hi_tools::PlanStep::all_complete(&loaded.plan));
+    }
+
+    #[test]
+    fn load_rehydrates_plan_from_update_plan_tool_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        let arguments = serde_json::json!({
+            "steps": [
+                {"title":"Add /metrics","status":"active"},
+                {"title":"Run tests","status":"pending"}
+            ]
+        })
+        .to_string();
+        session
+            .record_messages(&[Message::assistant(vec![hi_ai::Content::ToolCall {
+                id: "p1".into(),
+                name: "update_plan".into(),
+                arguments,
+            }])])
+            .unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.plan.len(), 2);
+        assert_eq!(loaded.plan[0].title, "Add /metrics");
+        assert!(!hi_tools::PlanStep::all_complete(&loaded.plan));
+    }
+
+    #[test]
+    fn record_and_load_plan_and_plan_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        let steps = vec![hi_tools::PlanStep {
+            title: "Add /metrics".into(),
+            status: hi_tools::PlanStatus::Active,
+        }];
+        session.record_plan(&steps).unwrap();
+        session
+            .record_plan_drive(&PlanDrive {
+                paused: true,
+                resume_on_user_input: true,
+                stall: 2,
+            })
+            .unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.plan, steps);
+        assert!(loaded.plan_drive.paused);
+        assert!(loaded.plan_drive.resume_on_user_input);
+        assert_eq!(loaded.plan_drive.stall, 2);
+    }
+
+    #[test]
+    fn load_keeps_plan_from_messages_when_meta_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = JsonlSession::create(&path).unwrap();
+        let arguments = serde_json::json!({
+            "steps": [{"title":"from tool","status":"pending"}]
+        })
+        .to_string();
+        session
+            .record_messages(&[Message::assistant(vec![hi_ai::Content::ToolCall {
+                id: "p1".into(),
+                name: "update_plan".into(),
+                arguments,
+            }])])
+            .unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.plan[0].title, "from tool");
+        assert!(!loaded.plan_drive.paused);
+    }
+
+    #[test]
+    fn smoke_seed_plan_drive_json_loads_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"plan","steps":[{"title":"Durable pending smoke step","status":"Pending"}]}"#,
+                "\n",
+                r#"{"type":"plan_drive","paused":true,"resume_on_user_input":false,"stall":1}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let loaded = JsonlSession::load(&path).unwrap();
+        assert_eq!(loaded.plan[0].title, "Durable pending smoke step");
+        assert!(loaded.plan_drive.paused);
+        assert_eq!(loaded.plan_drive.stall, 1);
     }
 }

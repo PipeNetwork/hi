@@ -7,7 +7,9 @@ use hi_sqlite_journal::JournalMode;
 
 use super::WorkspaceStore;
 use crate::error::{Result, StoreError, classify_open_error};
-use crate::owner_only::{create_dir_owner_only, create_owner_only, sibling_path, tighten_owner_only};
+use crate::owner_only::{
+    create_dir_owner_only, create_owner_only, sibling_path, tighten_owner_only,
+};
 use crate::schema::{self, SchemaInit, USER_VERSION, read_user_version};
 use crate::types::SchemaState;
 

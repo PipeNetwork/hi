@@ -105,6 +105,8 @@ impl crate::App {
             confirmation_selected: 0,
             confirm_focus: crate::confirm_overlay::ConfirmFocus::Options,
             confirmation_waiting: 0,
+            pending_resume: None,
+            resume_incomplete_requested: false,
             mouse_col: 0,
             mouse_row: 0,
             ctx_chip_rect: ratatui::layout::Rect::default(),
@@ -229,6 +231,13 @@ impl crate::App {
     }
 
     pub(crate) fn drain_loops(&mut self) {}
+
+    /// Hide last turn's finished checklist when a new prompt starts running.
+    pub(crate) fn dismiss_completed_plan(&mut self) {
+        if hi_tools::PlanStep::all_complete(&self.plan) {
+            self.plan.clear();
+        }
+    }
 
     /// Mark the turn as running (or done), stamping the start time so the
     /// prompt bar can show elapsed seconds.
@@ -697,6 +706,34 @@ mod page_flip_tests {
         );
         assert_eq!(app.scroll, 0);
         assert!(app.page_flip_on_send);
+    }
+
+    #[test]
+    fn sending_a_new_prompt_clears_a_finished_plan() {
+        let mut app = test_app("pipe", "m");
+        app.plan = vec![
+            hi_tools::PlanStep {
+                title: "read server.rs".into(),
+                status: hi_tools::PlanStatus::Done,
+            },
+            hi_tools::PlanStep {
+                title: "fix the loop".into(),
+                status: hi_tools::PlanStatus::Done,
+            },
+        ];
+        app.dismiss_completed_plan();
+        assert!(app.plan.is_empty());
+    }
+
+    #[test]
+    fn sending_a_new_prompt_keeps_an_open_plan() {
+        let mut app = test_app("pipe", "m");
+        app.plan = vec![hi_tools::PlanStep {
+            title: "fix the loop".into(),
+            status: hi_tools::PlanStatus::Active,
+        }];
+        app.dismiss_completed_plan();
+        assert_eq!(app.plan.len(), 1);
     }
 
     #[test]

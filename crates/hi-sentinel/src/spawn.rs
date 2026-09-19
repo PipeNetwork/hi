@@ -1,7 +1,7 @@
 //! Job-control spawn. One wait API: tokio `child.wait()` — never waitpid(WNOHANG).
 
 use std::cell::Cell;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
@@ -54,7 +54,15 @@ impl TerminalGuard {
         if self.restored.replace(true) {
             return;
         }
-        restore_job_signals();
+        // POSIX: `tcsetpgrp` / tty writes from a background process group raise
+        // SIGTTOU and *stop* the process (`zsh: suspended (tty output)`). After
+        // the child exits we are that background group until we take the tty
+        // back, so keep TTOU ignored through handoff + the leave-alt-screen
+        // write, then restore SIG_DFL.
+        debug_assert!(
+            ttou_is_ignored(),
+            "SIGTTOU must stay ignored until after tty handoff"
+        );
         if let (Some(fd), Some(orig)) = (self.tty_fd, self.orig.as_ref()) {
             unsafe {
                 // Drop leftover TUI keystrokes so they cannot answer a later [y/N].
@@ -62,11 +70,14 @@ impl TerminalGuard {
                 libc::tcsetpgrp(fd, self.supervisor_pgid);
             }
         }
-        let mut out = io::stdout();
-        let _ = out.write_all(
-            b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1049l",
-        );
-        let _ = out.flush();
+        if io::stdout().is_terminal() {
+            let mut out = io::stdout();
+            let _ = out.write_all(
+                b"\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1049l",
+            );
+            let _ = out.flush();
+        }
+        restore_job_signals();
     }
 }
 
@@ -298,20 +309,31 @@ fn stdin_tty_fd() -> Option<i32> {
 fn ignore_job_signals() {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
-        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        // SIGTSTP: owned by the tokio handler in `supervise`. Do not SIG_IGN.
     }
 }
 
-/// Undo [`ignore_job_signals`]. Called when the TTY is given back to the
-/// supervisor so Ctrl-C after `hi` has stopped actually ends Sentinel.
+/// Undo [`ignore_job_signals`] for Ctrl-C / TTOU / TTIN. Do not touch SIGTSTP:
+/// `supervise` installs a tokio handler once (`get_or_init`), and
+/// `libc::signal(SIGTSTP, …)` would replace it. SIG_DFL *stops* this process
+/// (`T`) so repair never runs; SIG_IGN leaves later generations unable to
+/// observe Ctrl-Z. The tokio handler both swallows the default stop and
+/// delivers user-stop while `hi` is running.
 fn restore_job_signals() {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
         libc::signal(libc::SIGTTOU, libc::SIG_DFL);
         libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+    }
+}
+
+fn ttou_is_ignored() -> bool {
+    unsafe {
+        let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, previous);
+        previous == libc::SIG_IGN
     }
 }
 
@@ -319,7 +341,6 @@ fn restore_job_signals() {
 pub fn prepare_interactive_prompt() {
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
     }
     let Some(fd) = stdin_tty_fd() else {
         return;
@@ -346,4 +367,54 @@ pub fn write_supervisor_log(runtime: &Path, line: &str) {
         return;
     }
     let _ = fsutil::write_0600(&path, body.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SignalRestore {
+        int: libc::sighandler_t,
+        ttou: libc::sighandler_t,
+        ttin: libc::sighandler_t,
+    }
+
+    impl Drop for SignalRestore {
+        fn drop(&mut self) {
+            unsafe {
+                libc::signal(libc::SIGINT, self.int);
+                libc::signal(libc::SIGTTOU, self.ttou);
+                libc::signal(libc::SIGTTIN, self.ttin);
+            }
+        }
+    }
+
+    fn capture_job_signals() -> SignalRestore {
+        unsafe {
+            SignalRestore {
+                int: libc::signal(libc::SIGINT, libc::SIG_DFL),
+                ttou: libc::signal(libc::SIGTTOU, libc::SIG_DFL),
+                ttin: libc::signal(libc::SIGTTIN, libc::SIG_DFL),
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_ignores_ttou_and_restore_rearms_it_after_tty_handoff() {
+        let _signals = capture_job_signals();
+        let guard = snapshot_terminal();
+        let while_live = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        assert_eq!(
+            while_live,
+            libc::SIG_IGN,
+            "supervisor must ignore SIGTTOU while the child owns the tty"
+        );
+        guard.restore();
+        let after = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_DFL) };
+        assert_eq!(
+            after,
+            libc::SIG_DFL,
+            "SIGTTOU is rearmed only after tcsetpgrp and the leave-screen write"
+        );
+    }
 }

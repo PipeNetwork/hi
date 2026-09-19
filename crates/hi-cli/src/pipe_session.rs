@@ -47,17 +47,41 @@ pub async fn run(
         }
         Err(err) => return Err(err),
     };
+    let session_path = resolve_session_path(cli)?;
+    let (workspace_root, state_root) =
+        paths::bind_workspace_for_session(session_path.as_deref(), workspace_root, state_root);
     let mut config = HarnessConfig::pipe(workspace_root.clone(), route.api_key);
     config.state_root = state_root;
     config.model = route.model;
     config.base_url = route.base_url;
     if settings.provider == ProviderName::Pipenetwork && settings.max_tokens > 0 {
         config.max_tokens = settings.max_tokens;
+        config.max_tokens_explicit = settings.max_tokens_explicit;
     }
     config.reasoning_effort = settings.reasoning_effort;
-    let session_path = resolve_session_path(cli)?;
     config.session_path = session_path.clone();
     config.auto_compact = !cli.no_auto_compact;
+    config.typesafe = typesafe_settings(file);
+    config.jev_compact = cli.jev_compact
+        || cli
+            .compaction
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("jev"));
+    if let Some(kind) = cli.compaction.as_deref() {
+        let known = matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "jev" | "hybrid" | "full" | "elide"
+        );
+        if !known {
+            tracing::debug!("unknown --compaction {kind:?}; using hybrid");
+        } else if !kind.eq_ignore_ascii_case("jev") && !kind.eq_ignore_ascii_case("hybrid") {
+            tracing::debug!("--compaction {kind} is not wired; using hybrid shrink+summary");
+        }
+    }
+    if config.jev_compact && !config.typesafe.is_enabled() {
+        tracing::debug!("--jev-compact ignored: no TypeSafe key");
+        config.jev_compact = false;
+    }
     let mut harness = Harness::new(config)?;
     if let Some(path) = &session_path
         && path.is_file()
@@ -81,6 +105,9 @@ pub async fn run(
 
     let login_config_path = cli.config.clone();
     harness.set_turn_intent_mode(!use_tui && prompt.is_some(), cli.plain);
+    if !harness.api_key().is_empty() {
+        let _ = harness.refresh_provider_limits().await;
+    }
 
     if resume.run_incomplete && !use_tui {
         let mut ui = StdoutUi {
@@ -122,9 +149,12 @@ pub async fn run(
                         .into_iter()
                         .map(|summary| hi_tui::LocalSessionInfo {
                             id: summary.id,
-                            title: String::new(),
+                            title: summary.title,
                             age: summary.age,
                             lines: 0,
+                            flags: summary.flags,
+                            needs_attention: summary.needs_attention,
+                            dashboard: summary.dashboard,
                         })
                         .collect()
                 })),
@@ -181,7 +211,7 @@ pub async fn run(
                 Command::Quit => break,
                 Command::Help(_) => {
                     println!(
-                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
+                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /compact /jev-compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
                     );
                     continue;
                 }
@@ -270,6 +300,10 @@ pub async fn run(
                         Ok(false) => println!("nothing to compact"),
                         Err(err) => eprintln!("compact failed: {err:#}"),
                     }
+                    continue;
+                }
+                Command::JevCompact(arg) => {
+                    println!("{}", harness.apply_jev_compact_arg(&arg));
                     continue;
                 }
                 Command::Files => {
@@ -471,7 +505,7 @@ fn repl_status(harness: &Harness) -> String {
         "off"
     };
     format!(
-        "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox}",
+        "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox} · {}",
         harness.model(),
         harness.permission_mode().describe(),
         harness
@@ -483,7 +517,8 @@ fn repl_status(harness: &Harness) -> String {
         harness.context_window_source(),
         usage.input_tokens,
         usage.output_tokens,
-        harness.checkpoint_count()
+        harness.checkpoint_count(),
+        harness.jev_compact_status_line()
     )
 }
 
@@ -548,7 +583,7 @@ fn repl_model_status(harness: &Harness) -> String {
 async fn handle_repl_model(harness: &mut Harness, arg: &str) {
     let parsed = parse_model_args(arg);
     if parsed.model.is_none() && parsed.effort.is_none() {
-        match harness.list_models().await {
+        match harness.refresh_provider_limits().await {
             Ok(models) => {
                 for model in &models {
                     let mark = if model.id == harness.model() {
@@ -571,7 +606,7 @@ async fn handle_repl_model(harness: &mut Harness, arg: &str) {
         return;
     }
     if let Some(model) = parsed.model {
-        let ids = match harness.list_models().await {
+        let ids = match harness.refresh_provider_limits().await {
             Ok(models) => models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
             Err(_) => Vec::new(),
         };
@@ -615,6 +650,13 @@ fn handle_repl_effort(harness: &mut Harness, arg: &str) {
             println!("{}", repl_model_status(harness));
         }
         Err(message) => eprintln!("{message}"),
+    }
+}
+
+fn typesafe_settings(file: &Config) -> hi_harness::TypesafeSettings {
+    match &file.typesafe {
+        Some(section) => section.to_harness_settings(),
+        None => hi_harness::TypesafeSettings::from_env(),
     }
 }
 
@@ -790,6 +832,9 @@ struct StdoutUi {
     assistant: String,
     tools: Vec<String>,
     tool_calls: Vec<serde_json::Value>,
+    statuses: Vec<String>,
+    turn_end: String,
+    turn_error: Option<(String, String, String)>,
     quiet: bool,
     confirm_edits: bool,
 }
@@ -839,12 +884,20 @@ impl Ui for StdoutUi {
         println!("← {name}\n{preview}");
     }
     fn status(&mut self, text: &str) {
+        self.statuses.push(text.to_string());
         if !self.quiet {
             eprintln!("{text}");
         }
     }
-    fn turn_end(&mut self, _summary: &str) {}
+    fn turn_end(&mut self, summary: &str) {
+        self.turn_end = summary.to_string();
+    }
     fn turn_error(&mut self, error_kind: &str, message: &str, guidance: &str) {
+        self.turn_error = Some((
+            error_kind.to_string(),
+            message.to_string(),
+            guidance.to_string(),
+        ));
         eprintln!("{error_kind}: {message}\n{guidance}");
     }
     fn confirm(&mut self, request: ConfirmationRequest) -> hi_harness::ConfirmationFuture<'_> {
@@ -873,18 +926,39 @@ fn write_turn_report(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let status = match outcome.stop_reason {
-        TurnStopReason::Completed => "completed",
-        TurnStopReason::Cancelled => "cancelled",
-        TurnStopReason::Error => "failed",
-    };
     let model_requests = harness
         .messages()
         .iter()
         .filter(|message| message.role == hi_ai::Role::Assistant)
         .count() as u64;
-    let body = serde_json::json!({
+    let body = turn_report_json(outcome, ui, model_requests, harness.current_plan());
+    std::fs::write(path, serde_json::to_vec_pretty(&body)?)
+        .with_context(|| format!("writing report {}", path.display()))
+}
+
+fn turn_report_json(
+    outcome: &TurnOutcome,
+    ui: &StdoutUi,
+    model_requests: u64,
+    plan: &[hi_tools::PlanStep],
+) -> serde_json::Value {
+    let status = match outcome.stop_reason {
+        TurnStopReason::Completed => "completed",
+        TurnStopReason::Cancelled => "cancelled",
+        TurnStopReason::Error => "failed",
+    };
+    let error = ui.turn_error.as_ref().map(|(kind, message, guidance)| {
+        serde_json::json!({
+            "kind": kind,
+            "message": message,
+            "guidance": guidance,
+        })
+    });
+    serde_json::json!({
         "assistant_response": ui.assistant,
+        "turn_end": ui.turn_end,
+        "statuses": ui.statuses,
+        "error": error,
         "tools": if ui.tool_calls.is_empty() {
             ui.tools
                 .iter()
@@ -896,7 +970,9 @@ fn write_turn_report(
         "outcome": {
             "status": status,
             "stop_reason": status,
+            "turn_end": ui.turn_end,
             "changed_files": outcome.changed_files,
+            "error": outcome.error,
             "verification": outcome
                 .verification
                 .clone()
@@ -904,10 +980,14 @@ fn write_turn_report(
         },
         "model_outcome": {
             "model_requests": model_requests,
-        }
-    });
-    std::fs::write(path, serde_json::to_vec_pretty(&body)?)
-        .with_context(|| format!("writing report {}", path.display()))
+        },
+        "plan": plan,
+        "usage": {
+            "input_tokens": outcome.usage.input_tokens,
+            "output_tokens": outcome.usage.output_tokens,
+            "context_occupancy": outcome.usage.context_occupancy,
+        },
+    })
 }
 
 #[cfg(test)]

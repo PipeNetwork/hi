@@ -33,13 +33,14 @@ use formatting::{format_read_for_output, render_read_with_budget};
 use grep_fallback::ripgrep_binary_unavailable;
 use grep_fallback::{finish_ripgrep_execution, run_grep_fallback_sync};
 
-const DEFAULT_READ_LIMIT: usize = 2000;
+/// Default line page. A 2,000-line dump of `server.rs` blew the current-turn
+/// tool budget and forced cheap-shrink stubs + re-reads.
+pub(crate) const DEFAULT_READ_LIMIT: usize = 200;
 
-/// Dedicated `read` budget. The shared tool-result cap (~5k) is right for
-/// grep/bash noise but turns a documented 2,000-line default page into ~113
-/// lines of Rust and forces DeepSeek to page a typical source file 6–8 times.
-/// 64k is enough for an ~800-line file with line-number gutters.
-const DEFAULT_READ_OUTPUT_CHARS: usize = 64_000;
+/// Dedicated `read` budget. The shared ~5k cap is right for grep/bash noise
+/// but clips source. 16k chars (~200 numbered lines) is one typical module
+/// without filling the 24k-token current-turn tool budget.
+const DEFAULT_READ_OUTPUT_CHARS: usize = 16_000;
 const MIN_READ_OUTPUT_CHARS: usize = 1_000;
 const MAX_READ_OUTPUT_CHARS: usize = 200_000;
 
@@ -166,6 +167,14 @@ pub(crate) async fn run_read_with_mcp(
                 limit,
                 ..
             } = read;
+            if let resource::RoutedReadSource::WorkspacePath(path) = &source
+                && let Ok(mut cache) = cache.lock()
+            {
+                let full = offset.unwrap_or(0) == 0 && limit.is_none();
+                if let Some(message) = cache.admit_read(std::path::Path::new(path), full) {
+                    return Ok(crate::ToolOutcome::plain(message));
+                }
+            }
             let cursor_path = match &source {
                 resource::RoutedReadSource::WorkspacePath(path) => {
                     Some(std::path::PathBuf::from(path))

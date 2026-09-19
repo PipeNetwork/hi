@@ -172,6 +172,49 @@ if [[ "$hi_status" -ne 0 ]]; then
   echo "FAIL: tests pass but hi exited $hi_status" >&2
   exit 1
 fi
+if [[ -f "$REPORT" ]]; then
+  if ! python3 - "$REPORT" <<'PY' >&2
+import json, sys
+p = sys.argv[1]
+try:
+    r = json.load(open(p))
+except Exception as e:
+    print(f"report unreadable: {e}")
+    sys.exit(1)
+asst = str(r.get("assistant_response") or "").strip()
+turn_end = str(r.get("turn_end") or (r.get("outcome") or {}).get("turn_end") or "")
+outcome = r.get("outcome") or {}
+status = str(outcome.get("status") or "")
+error = r.get("error") or {}
+kind = str(error.get("kind") or "")
+tools = r.get("tools") or []
+omitted = []
+for tool in tools:
+    out = str(tool.get("output") or "")
+    if out.endswith(" · omitted") and out.startswith("read "):
+        path = out[len("read "):].split(" · ", 1)[0]
+        if path and not path.startswith("·") and path not in omitted:
+            omitted.append(path)
+if status == "failed" or kind in ("empty_stop", "tool_storm"):
+    print("FAIL: review-and-fix ended as an error stop status={} kind={}".format(status, kind))
+    sys.exit(1)
+if not asst:
+    print("FAIL: empty assistant_response after review-and-fix (silent inspect-stop)")
+    print("turn_end={} tools={} omitted={}".format(turn_end, len(tools), omitted))
+    sys.exit(1)
+if "stopped repeating the same inspect" in turn_end and not asst:
+    print("FAIL: inspect-repeat closed the turn with no verdict")
+    sys.exit(1)
+if len(omitted) >= 8:
+    print("FAIL: cheap-shrink hid unique files: {}".format(omitted))
+    sys.exit(1)
+print("assistant_chars={} turn_end={} omitted_unique={}".format(len(asst), turn_end, len(omitted)))
+PY
+  then
+    echo "FAIL: review-and-fix report failed silent-stop / unique-stub checks ($REPORT)" >&2
+    exit 1
+  fi
+fi
 
 # Second turn: a verify-only follow-up whose wording contains the noun
 # "change". A false-positive mutation classifier used to spend recovery on

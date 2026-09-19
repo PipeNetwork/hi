@@ -162,6 +162,96 @@ async fn diagnose_without_repro_skips_patch() {
 }
 
 #[tokio::test]
+async fn diagnose_retries_retryable_429_then_succeeds() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = test_fixture::minimal_checkout(root.path());
+    let (req, log, _, _) = request(root.path(), checkout, false);
+    let incident = req.incident_dir.clone();
+    fs::write(log.join("fail_once"), b"1").unwrap();
+    fs::write(log.join("no_repro"), b"1").unwrap();
+    let outcome = run_repair(req).await;
+    match outcome {
+        RepairOutcome::Skipped {
+            reason: RepairSkip::DiagnoseNoRepro,
+        } => {}
+        other => panic!("expected DiagnoseNoRepro after 429 retry, got {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(log.join("count")).unwrap().trim(), "2");
+    assert!(log.join("spawn-2.argv").exists());
+    assert!(!log.join("spawn-3.argv").exists());
+    assert_eq!(
+        fs::read_to_string(incident.join("attempts"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn retryable_diagnose_failure_refunds_attempt() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = test_fixture::minimal_checkout(root.path());
+    let (req, log, _, _) = request(root.path(), checkout, false);
+    let incident = req.incident_dir.clone();
+    fs::write(log.join("fail_always"), b"1").unwrap();
+    let outcome = run_repair(req).await;
+    match outcome {
+        RepairOutcome::Skipped {
+            reason: RepairSkip::DiagnoseFailed(detail),
+        } => {
+            assert!(
+                detail.contains("429") || detail.contains("capacity"),
+                "{detail}"
+            );
+            assert_eq!(
+                RepairSkip::DiagnoseFailed(detail.clone()).user_line(),
+                format!("diagnose failed; skipping patch ({detail})")
+            );
+        }
+        other => panic!("expected DiagnoseFailed, got {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(log.join("count")).unwrap().trim(), "3");
+    assert!(log.join("spawn-3.argv").exists());
+    assert!(!log.join("spawn-4.argv").exists());
+    assert_eq!(
+        fs::read_to_string(incident.join("attempts"))
+            .unwrap()
+            .trim(),
+        "0",
+        "retryable capacity skip must not burn the only incident attempt"
+    );
+}
+
+#[tokio::test]
+async fn permanent_diagnose_failure_does_not_retry_or_refund() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = test_fixture::minimal_checkout(root.path());
+    let (req, log, _, _) = request(root.path(), checkout, false);
+    let incident = req.incident_dir.clone();
+    fs::write(log.join("fail_hard"), b"1").unwrap();
+    let outcome = run_repair(req).await;
+    match outcome {
+        RepairOutcome::Skipped {
+            reason: RepairSkip::DiagnoseFailed(detail),
+        } => {
+            assert!(
+                detail.contains("panicked") || detail.contains("non-zero"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected DiagnoseFailed, got {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(log.join("count")).unwrap().trim(), "1");
+    assert!(!log.join("spawn-2.argv").exists());
+    assert_eq!(
+        fs::read_to_string(incident.join("attempts"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+}
+
+#[tokio::test]
 async fn fixture_invariant_repro_commits_only_autofix_branch() {
     let root = tempfile::tempdir().unwrap();
     let checkout = test_fixture::cargo_checkout(root.path());

@@ -119,6 +119,15 @@ const RESOURCE_CACHE_MAX: usize = 128;
 const RESOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const RESOURCE_BODY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// Full-file `read`s of the same path allowed per turn before a short
+/// reminder replaces the body. Cheap-shrink stubs older reads, and the
+/// model otherwise re-fetches the same 50KiB file in a loop.
+const MAX_FULL_READS_PER_PATH: u32 = 2;
+/// Any `read` of the same path (including offset/limit pages). A live
+/// ~/chat turn paged `src/server.rs` 25 times after stubs hid earlier
+/// pages; sixteen pages cover a ~3k-line file at the default limit.
+const MAX_READS_PER_PATH: u32 = 16;
+
 /// LRU-ordered file-read cache: a HashMap for O(1) lookup
 /// paired with a VecDeque tracking access order. On `get`, the key is
 /// promoted to the back of the deque (most-recently-used); on `insert`, it's
@@ -134,6 +143,8 @@ pub struct ReadCache {
     resource_order: std::collections::VecDeque<hi_workspace::ResourceUri>,
     resource_bytes: usize,
     resource_state_root: Option<PathBuf>,
+    full_reads: HashMap<String, u32>,
+    path_reads: HashMap<String, u32>,
 }
 
 impl ReadCache {
@@ -146,7 +157,50 @@ impl ReadCache {
             resource_order: std::collections::VecDeque::new(),
             resource_bytes: 0,
             resource_state_root: None,
+            full_reads: HashMap::new(),
+            path_reads: HashMap::new(),
         }
+    }
+
+    /// Count a no-offset, no-limit `read`. The third full fetch of the same
+    /// path this turn returns a reminder instead of the file body.
+    pub fn admit_full_read(&mut self, path: &Path) -> Option<String> {
+        self.admit_read(path, true)
+    }
+
+    /// Count a `read` of `path`. Full (no offset/limit) fetches still cap at
+    /// two; any mix of pages caps at [`MAX_READS_PER_PATH`].
+    pub fn admit_read(&mut self, path: &Path, full: bool) -> Option<String> {
+        let key = cache_key(path);
+        let total = self.path_reads.entry(key.clone()).or_insert(0);
+        *total = total.saturating_add(1);
+        let total = *total;
+        if full {
+            let count = self.full_reads.entry(key).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count > MAX_FULL_READS_PER_PATH {
+                return Some(format!(
+                    "Already returned `{}` in full this turn ({count} times). \
+                     Earlier content may have been compacted to a stub. Use `grep` or \
+                     `read` with offset/limit; do not fetch the whole file again.",
+                    path.display()
+                ));
+            }
+        }
+        if total > MAX_READS_PER_PATH {
+            return Some(format!(
+                "Already read `{}` {total} times this turn. \
+                 Earlier pages may have been compacted to a stub. Use `grep` or \
+                 `edit`; do not page the same file again.",
+                path.display()
+            ));
+        }
+        None
+    }
+
+    pub fn reset_turn_full_reads(&mut self) {
+        self.full_reads.clear();
+        self.path_reads.clear();
     }
 
     /// Bind lazy, content-addressed resource resolution to this runtime's
@@ -325,6 +379,8 @@ impl ReadCache {
             self.bytes = self.bytes.saturating_sub(value.len());
             self.order.retain(|k| k != key);
         }
+        self.full_reads.remove(key);
+        self.path_reads.remove(key);
     }
 
     /// Clear cached workspace files (between turns or after a mutation).

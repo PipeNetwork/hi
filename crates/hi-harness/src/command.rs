@@ -23,6 +23,7 @@ pub enum Command {
     Files,
     Copy(String),
     Compact(String),
+    JevCompact(String),
     Retry,
     Undo,
     Sessions(String),
@@ -68,7 +69,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "auto",
         args: "",
-        help: "toggle auto-approve for safe file edits",
+        help: "toggle auto-approve for safe file edits; Jev may auto-approve reversible shell",
     },
     CommandSpec {
         name: "yolo",
@@ -139,6 +140,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "compact",
         args: "[context]",
         help: "summarize the conversation to reclaim context",
+    },
+    CommandSpec {
+        name: "jev-compact",
+        args: "[on|off]",
+        help: "Jev tool prune this session (needs a TypeSafe key)",
+    },
+    CommandSpec {
+        name: "compact-jev",
+        args: "[on|off]",
+        help: "alias for /jev-compact",
     },
     CommandSpec {
         name: "copy",
@@ -287,6 +298,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "files" => Command::Files,
         "copy" | "cp" => Command::Copy(arg),
         "compact" => Command::Compact(arg),
+        "jev-compact" | "compact-jev" => Command::JevCompact(arg),
         "retry" | "redo" => Command::Retry,
         "undo" | "revert" => Command::Undo,
         "sessions" | "resume" => Command::Sessions(arg),
@@ -410,6 +422,24 @@ mod tests {
         assert_eq!(parse("/tutorial"), Some(Command::Tutorial));
         assert_eq!(parse("/copy"), Some(Command::Copy(String::new())));
         assert_eq!(parse("/mouse off"), Some(Command::Mouse("off".into())));
+        assert_eq!(
+            parse("/jev-compact"),
+            Some(Command::JevCompact(String::new()))
+        );
+        assert_eq!(
+            parse("/jev-compact on"),
+            Some(Command::JevCompact("on".into()))
+        );
+        assert_eq!(
+            parse("/jev-compact off"),
+            Some(Command::JevCompact("off".into()))
+        );
+        assert_eq!(
+            parse("/compact-jev on"),
+            Some(Command::JevCompact("on".into()))
+        );
+        assert!(COMMANDS.iter().any(|s| s.name == "jev-compact"));
+        assert!(COMMANDS.iter().any(|s| s.name == "compact-jev"));
         assert_eq!(parse("/usage"), Some(Command::Usage(String::new())));
         assert_eq!(parse("/cost"), Some(Command::Usage(String::new())));
         assert_eq!(

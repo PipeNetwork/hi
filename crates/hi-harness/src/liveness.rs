@@ -26,14 +26,17 @@ impl Harness {
         self.liveness.emit(EventCode::TurnStart, None, None, None);
 
         let persisted_before_user = self.messages.len().saturating_sub(1);
+        let mut persisted_before = self.messages.len();
         if let Some(session) = &mut self.session {
             let Some(last) = self.messages.last() else {
                 return self.messages.len();
             };
             if session.record_turn_start(last, &pending).is_err() {
-                hi_liveness::report_invariant(&self.liveness, InvariantCode::SessionAppendFailed);
+                // Do not report `SessionAppendFailed` here: that invariant
+                // auto-repairs and would kill a turn that can still persist
+                // on the next append or at close.
                 if session.last_recorded_user_text().as_deref() != Some(input) {
-                    return persisted_before_user;
+                    persisted_before = persisted_before_user;
                 }
             } else {
                 self.liveness.note_progress();
@@ -57,7 +60,7 @@ impl Harness {
             plain: self.turn_plain,
         };
         let _ = hi_liveness::write_turn_intent_from_env(&intent);
-        self.messages.len()
+        persisted_before
     }
 
     pub(crate) fn close_persisted_turn(&mut self, from: usize, reason: TurnStopReason) {
@@ -82,6 +85,7 @@ impl Harness {
 
     pub(crate) fn persist_new_messages(&mut self, from: usize) {
         if let Some(session) = &mut self.session {
+            let had_messages = from < self.messages.len();
             let failed = session.record_messages(&self.messages[from..]).is_err()
                 || session.record_usage(self.session_usage).is_err()
                 || session.record_checkpoints(&self.checkpoints).is_err();
@@ -89,7 +93,41 @@ impl Harness {
                 hi_liveness::report_invariant(&self.liveness, InvariantCode::SessionAppendFailed);
             } else {
                 self.liveness.note_progress();
+                if had_messages {
+                    self.liveness
+                        .emit(EventCode::SessionAppend, None, None, None);
+                }
             }
+        }
+    }
+
+    /// Fsync messages added since `persisted_before` so a mid-turn crash still
+    /// has a valid transcript to resume. Callers must only pass a complete
+    /// round (every `tool_call` already has a result). Also rewrites
+    /// `PendingTurn` so a failed turn-start persist can still resume.
+    /// Advances the cursor on success. A failed write is retried on the next
+    /// call and at close — do not report `SessionAppendFailed` here: that
+    /// invariant auto-repairs and would kill a turn that can still persist.
+    pub(crate) fn persist_turn_progress(&mut self, persisted_before: &mut usize) {
+        if *persisted_before >= self.messages.len() {
+            return;
+        }
+        let pending = self.pending_turn.clone();
+        if let Some(session) = &mut self.session {
+            if session
+                .record_messages(&self.messages[*persisted_before..])
+                .is_ok()
+            {
+                if let Some(pending) = pending.as_ref() {
+                    let _ = session.record_pending_turn(pending);
+                }
+                self.liveness.note_progress();
+                self.liveness
+                    .emit(EventCode::SessionAppend, None, None, None);
+                *persisted_before = self.messages.len();
+            }
+        } else {
+            *persisted_before = self.messages.len();
         }
     }
 }

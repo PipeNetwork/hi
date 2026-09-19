@@ -235,7 +235,7 @@ fn arg_values(cmd: &str) -> &'static [(&'static str, &'static str)] {
     match cmd {
         "permissions" | "permission" | "perms" => &[
             ("ask", "confirm each mutation"),
-            ("auto", "safe file edits without asking"),
+            ("auto", "safe edits; Jev may auto-approve reversible shell"),
             ("always", "approve mutations this session"),
             ("yolo", "same as always"),
         ],
@@ -246,6 +246,10 @@ fn arg_values(cmd: &str) -> &'static [(&'static str, &'static str)] {
         ],
         "theme" => &[("dark", "dark theme"), ("light", "light theme")],
         "mouse" => &[("on", "capture mouse"), ("off", "native selection")],
+        "jev-compact" | "compact-jev" => &[
+            ("on", "prune stale tools with Jev this session"),
+            ("off", "use cheap shrink and summary"),
+        ],
         "verify" => &[("off", "disable post-turn check")],
         "config" => &[("reasoning", "set reasoning effort")],
         "effort" | "model effort" => &[
@@ -401,6 +405,20 @@ mod tests {
         );
         // Commands without enumerable argument values close the menu after the name.
         assert_eq!(completion_context("/compact "), None);
+        assert_eq!(
+            completion_context("/jev-compact "),
+            Some(Arg {
+                cmd: "jev-compact",
+                prefix: String::new()
+            })
+        );
+        assert_eq!(
+            completion_context("/compact-jev on"),
+            Some(Arg {
+                cmd: "compact-jev",
+                prefix: "on".to_string()
+            })
+        );
         assert_eq!(
             completion_context("/config "),
             Some(Arg {

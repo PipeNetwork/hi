@@ -42,6 +42,14 @@ process-cleanup boundary without changing Hi's product behavior.
   no_progress. Live metrics remain separate from scripted and coding-eval scores.
   The review/fix case is also runnable headless with
   `PIPENETWORK_API_KEY=… scripts/review_fix_live_e2e.sh`.
+  In-repo unique-file + IRC + web-register + large chat-app + Linux-subset
+  live e2e (the silent inspect-stop and post-edit wander gate) is
+  `scripts/live_stall_e2e.sh`. It reads the interactive hi pipenetwork
+  credential from `~/.config/hi` unless `PIPENETWORK_API_KEY` / `HI_API_KEY`
+  is set. `HI_LIVE=0` opts out. The large app is vendored at
+  `scenarios/live_chat_app/fixture`; there is no `~/chat` checkout. Linux v6.6
+  is fetched on first run into `target/live-linux` (or `HI_LINUX_SRC`). Filter
+  `LIVE_E2E_FILTER=live_e2e_linux` for the kernel-tree cases.
 
 The nightly Ubuntu campaign also executes 250 deterministic chaos seeds across
 transport faults and stateful approval, pause/resume, restart, resize, queued

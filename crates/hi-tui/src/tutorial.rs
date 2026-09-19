@@ -27,7 +27,7 @@ const LESSONS: [(&str, &str); LESSON_COUNT] = [
     ),
     (
         "Confirm edits",
-        "File edits and mutating shell commands ask first (Shift-Tab cycles ask / auto / always). /yolo skips confirms for this session; /auto allows safe file edits without asking. Ctrl-C or Esc stops an in-flight turn.",
+        "File edits and mutating shell commands ask first (Shift-Tab cycles ask / auto / always). /yolo skips confirms for this session; /auto allows safe file edits without asking and may auto-approve reversible shell. Ctrl-C or Esc stops an in-flight turn.",
     ),
     (
         "Verify when you want",

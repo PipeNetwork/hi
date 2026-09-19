@@ -14,9 +14,21 @@ impl crate::App {
             self.touch_idle_run(command);
             return;
         }
-        if let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
-            && let Some((existing, dest, idle, _)) = block.as_run_mut()
-            && (existing == command || *idle)
+        let reuse = matches!(
+            self.transcript.last(),
+            Some(TranscriptEntry::Activity(block))
+                if matches!(
+                    &block.kind,
+                    ActivityKind::Run {
+                        command: existing,
+                        idle,
+                        ..
+                    } if (*idle || existing == command) && !(!*idle && existing == "grep" && command == "grep")
+                )
+        );
+        if reuse
+            && let Some(TranscriptEntry::Activity(block)) = self.transcript.last_mut()
+            && let Some((_, dest, idle, _)) = block.as_run_mut()
         {
             if !self.run_streamed_this_call {
                 dest.clear();
@@ -190,13 +202,46 @@ fn append_capped_run_body(body: &mut String, chunk: &str) {
     if body.len() <= LIVE_RUN_BODY_MAX {
         return;
     }
-    let overflow = body.len() - LIVE_RUN_BODY_MAX;
-    let cut = body[overflow..]
-        .find('\n')
+    // `overflow` is a byte index into a live bash transcript. Box-drawing and
+    // other multibyte UTF-8 (a 64k cap lands inside `─` easily) must not be
+    // sliced at a non-boundary — that panic aborted a supervised wrap with
+    // `turn_unclosed` and no auto-repair while Sentinel was job-stopped.
+    let overflow = floor_char_boundary(body, body.len() - LIVE_RUN_BODY_MAX);
+    let cut = body
+        .get(overflow..)
+        .and_then(|tail| tail.find('\n'))
         .map(|i| overflow + i + 1)
         .unwrap_or(overflow)
         .min(body.len());
+    let cut = floor_char_boundary(body, cut);
     body.replace_range(..cut, "");
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capping_live_run_body_does_not_panic_on_multibyte_at_cut() {
+        // One ASCII byte plus 3-byte `─` so a 64KiB cap lands inside a char.
+        let mut body = String::from("x");
+        body.push_str(&"─".repeat(22_000));
+        assert!(body.len() > LIVE_RUN_BODY_MAX);
+        append_capped_run_body(&mut body, "more ─ output");
+        assert!(body.len() <= LIVE_RUN_BODY_MAX + 32);
+        assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+        let _ = body.chars().count();
+    }
 }
 
 pub(super) fn bash_output_is_idle(result: &str) -> bool {

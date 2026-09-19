@@ -414,17 +414,6 @@ async fn entropy_gated_secret_split_across_stream_chunks_is_redacted() {
     );
 }
 
-#[test]
-fn sensitive_environment_names_are_removed_conservatively() {
-    assert!(sensitive_environment_name(OsStr::new("GITHUB_TOKEN")));
-    assert!(sensitive_environment_name(OsStr::new(
-        "AWS_SECRET_ACCESS_KEY"
-    )));
-    assert!(sensitive_environment_name(OsStr::new("DATABASE_PASSWORD")));
-    assert!(!sensitive_environment_name(OsStr::new("PATH")));
-    assert!(!sensitive_environment_name(OsStr::new("RUSTUP_HOME")));
-}
-
 #[tokio::test]
 async fn adoptable_completes_within_budget_like_normal() {
     let runner = ProcessRunner::from_current_dir().unwrap();

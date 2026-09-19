@@ -115,6 +115,8 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         }
     } else {
         super::hydrate::hydrate_transcript(&mut app, harness.messages());
+        app.plan = harness.current_plan().to_vec();
+        app.plan_drive_paused = harness.plan_drive().paused;
         app.push(Line::styled(
             format!(
                 "resumed {} message(s) · {} — /help for commands",
@@ -123,6 +125,14 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
             ),
             dim(),
         ));
+        let sentinel_resume = std::env::var("HI_SENTINEL_RESUME_INCOMPLETE")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
+        if harness.can_resume_incomplete(None) && !options.resume_incomplete && !sentinel_resume {
+            app.pending_resume = Some(crate::PendingResumeCard { selected: 0 });
+        } else if hi_harness::plan_is_open(harness.current_plan()) && !app.plan_drive_paused {
+            app.suggested_prompt = Some(hi_harness::CONTINUE_PLAN_PROMPT.to_string());
+        }
     }
     let mut startup_prompt = options.startup_prompt;
     let mut resume_incomplete = options.resume_incomplete;
@@ -145,6 +155,21 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         }
         if resume_incomplete {
             resume_incomplete = false;
+            run_turn(
+                &mut terminal,
+                &mut input_rx,
+                &mut ticker,
+                &mut app,
+                harness,
+                "",
+                true,
+            )
+            .await?;
+            continue;
+        }
+        if app.resume_incomplete_requested {
+            app.resume_incomplete_requested = false;
+            app.pending_resume = None;
             run_turn(
                 &mut terminal,
                 &mut input_rx,
@@ -273,6 +298,9 @@ async fn handle_idle_event(
                 }
                 return Ok(None);
             }
+            if app.handle_pending_resume_key(&key) {
+                return Ok(None);
+            }
             if super::idle::handle_picker_key(app, harness, &key) {
                 return Ok(None);
             }
@@ -320,7 +348,7 @@ async fn handle_command(
         Command::Quit => app.exit_requested = true,
         Command::Help(_) => {
             app.push(Line::styled(
-                "/login /auth /sessions /doctor /autoharnessfix /model /effort /permissions /undo /diff /retry /verify /compact /copy /usage /dashboard /status /exit  (type / for the menu)",
+                "/login /auth /sessions /doctor /autoharnessfix /model /effort /permissions /undo /diff /retry /verify /compact /jev-compact /copy /usage /dashboard /status /exit  (type / for the menu)",
                 dim(),
             ));
         }
@@ -344,12 +372,15 @@ async fn handle_command(
             app.push(Line::styled(msg, dim()));
         }
         Command::Diff => {
-            let diff = hi_tools::working_tree_diff_in(harness.workspace_root()).await;
-            if diff.trim().is_empty() {
+            let diff = hi_tools::working_tree_diff_plain_in(harness.workspace_root()).await;
+            let trimmed = diff.trim();
+            if trimmed.is_empty() || trimmed == "no changes since HEAD" {
                 app.push(Line::styled("working tree clean", dim()));
+            } else if trimmed.starts_with("not a git") || trimmed.starts_with("git not available") {
+                app.push(Line::styled(trimmed.to_string(), dim()));
             } else {
-                for line in diff.lines() {
-                    app.push(Line::from(line.to_string()));
+                for line in crate::render::diff_lines(&diff) {
+                    app.push(line);
                 }
             }
         }
@@ -457,6 +488,9 @@ async fn handle_command(
                 Err(err) => app.push(Line::styled(format!("compact failed: {err:#}"), dim())),
             }
         }
+        Command::JevCompact(arg) => {
+            app.push(Line::styled(harness.apply_jev_compact_arg(&arg), dim()));
+        }
         Command::Files => {
             let files = harness.last_changed_files();
             if files.is_empty() {
@@ -493,6 +527,7 @@ async fn handle_command(
                 ),
                 dim(),
             ));
+            app.push(Line::styled(harness.jev_compact_status_line(), dim()));
         }
         Command::Usage(arg) => apply_usage_command(app, Some(harness), &arg),
         Command::Dashboard => {
@@ -512,8 +547,8 @@ async fn handle_command(
     Ok(None)
 }
 
-async fn open_model_picker(app: &mut App, harness: &Harness) -> Result<()> {
-    match harness.list_models().await {
+async fn open_model_picker(app: &mut App, harness: &mut Harness) -> Result<()> {
+    match harness.refresh_provider_limits().await {
         Ok(models) => {
             let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
             if ids.is_empty() {
@@ -647,18 +682,33 @@ fn list_sessions_command(app: &mut App) {
         return;
     };
     let sessions = lister();
-    if sessions.is_empty() {
-        app.push(Line::styled("no saved sessions in this project", dim()));
-        return;
-    }
-    for session in sessions.into_iter().take(20) {
+    let attention: Vec<_> = sessions
+        .iter()
+        .filter(|session| session.needs_attention)
+        .cloned()
+        .collect();
+    let show = if attention.is_empty() {
         app.push(Line::styled(
-            format!("{}  {} ago", session.id, session.age),
+            "no sessions need attention (`hi sessions --all` lists everything)",
             dim(),
         ));
+        return;
+    } else {
+        attention
+    };
+    for session in show.into_iter().take(20) {
+        let mut line = format!("{}  {} ago", session.id, session.age);
+        if !session.flags.is_empty() {
+            line.push_str("  ");
+            line.push_str(&session.flags);
+        } else if !session.title.is_empty() {
+            line.push_str("  ");
+            line.push_str(&session.title);
+        }
+        app.push(Line::styled(line, dim()));
     }
     app.push(Line::styled(
-        "resume with `hi --resume <id>` (or `hi resume` for latest)",
+        "resume with `hi --resume <id>` (or `hi resume` for unfinished work here)",
         dim(),
     ));
 }
@@ -678,7 +728,7 @@ async fn paste_pipenetwork_key(
         }
     };
     harness.set_api_key(&key);
-    match harness.list_models().await {
+    match harness.refresh_provider_limits().await {
         Ok(_) => {
             let _ = hi_ai::auth_store::save(
                 hi_ai::pipenetwork_auth::PROVIDER_ID,
@@ -1104,6 +1154,7 @@ async fn drain_pending_pipenetwork_login(
 ) {
     if app.poll_pending_login().await.is_some() {
         apply_pipenetwork_session_key(app, harness, on_login);
+        let _ = harness.refresh_provider_limits().await;
     }
 }
 
@@ -1121,6 +1172,7 @@ async fn start_pipenetwork_login(
     }
     if hi_ai::pipenetwork_auth::has_credential() {
         apply_pipenetwork_session_key(app, harness, on_login);
+        let _ = harness.refresh_provider_limits().await;
         app.push(Line::styled(
             "already signed in to pipenetwork — API key applied \
              (/logout pipenetwork first to pair a different account)",
@@ -1239,6 +1291,7 @@ async fn run_turn(
         ));
         app.last_prompt = Some(prompt.to_string());
         app.last_turn_start = harness.messages().len();
+        app.dismiss_completed_plan();
     }
     app.set_working(true);
     let live = harness.live();

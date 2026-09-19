@@ -174,3 +174,38 @@ jobs:
         with:
           path: artifacts/tui-smoke-live/observation-state.json
           key: tui-live-observation-v1-${{ runner.os }}-${{ hashFiles('eval-baseline/tui-live.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # In-repo unique-file + IRC + web-register + large chat-app + Linux-subset
+  # review-and-fix against the live Pipe key. Catches silent inspect-stop /
+  # unique-path stub / post-edit wander that TUI canaries miss. Scheduled runs
+  # fail closed without a key. Chat (rusqlite + rustls) and the Linux v6.6
+  # subset (~12k files) need extra wall clock.
+  live-review-e2e:
+    name: live review-and-fix e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Live in-repo review-and-fix e2e
+        env:
+          HI_LIVE: "1"
+          HI_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          PIPENETWORK_API_KEY: ${{ secrets.HI_EVAL_API_KEY }}
+          HI_MODEL: ${{ vars.HI_EVAL_MODEL }}
+          HI_BASE_URL: ${{ vars.HI_EVAL_BASE_URL }}
+        run: |
+          if [ -z "${HI_API_KEY:-}" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+              echo "FAIL: scheduled nightly needs HI_EVAL_API_KEY" >&2
+              exit 1
+            fi
+            echo "::notice title=Live e2e skipped::no HI_EVAL_API_KEY secret" >&2
+            echo "SKIP: no HI_EVAL_API_KEY (workflow_dispatch)" >&2
+            exit 0
+          fi
+          cargo test -p hi --test live_complex_app live_e2e -- --ignored --test-threads=1 --nocapture

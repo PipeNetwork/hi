@@ -555,6 +555,9 @@ mod tests {
             title: "review layout".into(),
             age: "2h".into(),
             lines: 12,
+            flags: String::new(),
+            needs_attention: false,
+            dashboard: false,
         }];
         let home = WelcomeHome {
             location: "hi:main".into(),
@@ -605,6 +608,9 @@ mod tests {
                 title: dump.into(),
                 age: "5h".into(),
                 lines: 2,
+                flags: String::new(),
+                needs_attention: false,
+                dashboard: false,
             })
             .collect();
         let home = WelcomeHome {

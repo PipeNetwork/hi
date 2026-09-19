@@ -47,6 +47,11 @@ fn normalize_resume_command(mut args: Vec<OsString>) -> Vec<OsString> {
     if args.get(1).is_some_and(|arg| arg == "resume") {
         args.remove(1);
         args.insert(1, OsString::from("--continue"));
+        return args;
+    }
+    if args.get(1).is_some_and(|arg| arg == "sessions") {
+        args.remove(1);
+        args.insert(1, OsString::from("--list-sessions"));
     }
     args
 }
@@ -90,7 +95,7 @@ pub(crate) async fn maybe_short_circuit(cli: &Cli) -> Option<Result<()>> {
         return Some(print_show_config(cli).await);
     }
     if cli.list_sessions {
-        return Some(crate::paths::list_sessions());
+        return Some(crate::roster::print_roster(cli.all));
     }
     None
 }
@@ -179,5 +184,27 @@ mod tests {
         assert!(cli.cont);
         assert!(cli.durable);
         assert_eq!(cli.prompt.as_deref(), Some("finish"));
+    }
+
+    #[test]
+    fn sessions_command_becomes_list_sessions() {
+        let args =
+            normalize_resume_command(["hi", "sessions"].into_iter().map(OsString::from).collect());
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.list_sessions);
+        assert!(!cli.all);
+    }
+
+    #[test]
+    fn sessions_all_keeps_the_flag() {
+        let args = normalize_resume_command(
+            ["hi", "sessions", "--all"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        );
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.list_sessions);
+        assert!(cli.all);
     }
 }

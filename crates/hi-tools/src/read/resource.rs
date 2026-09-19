@@ -293,7 +293,8 @@ fn checked_window(offset: u64, limit: Option<u64>) -> Result<(Option<usize>, Opt
 }
 
 pub(crate) fn workspace_path_from_read_arguments(arguments: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    let value: serde_json::Value = serde_json::from_str(arguments.as_ref()).ok()?;
     value
         .get("path")
         .and_then(serde_json::Value::as_str)

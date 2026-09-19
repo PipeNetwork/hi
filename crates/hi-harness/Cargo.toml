@@ -12,6 +12,7 @@ blake3.workspace = true
 hi-lsp.workspace = true
 hi-dashboard-store.workspace = true
 anyhow.workspace = true
+rustix = { workspace = true, features = ["fs", "process"] }
 tokio.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true

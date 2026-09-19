@@ -4,6 +4,7 @@
 )]
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -148,15 +149,68 @@ pub fn validate_client_tool_call_with_limit(
             "model exceeded the client tool-argument size limit",
         ));
     }
-    let value = serde_json::from_str::<Value>(arguments)
+    let mut value = serde_json::from_str::<Value>(arguments)
         .map_err(|_| tool_protocol_error("invalid tool arguments: incomplete JSON object"))?;
     if !value.is_object() {
         return Err(tool_protocol_error(
             "model tool arguments were not a JSON object",
         ));
     }
+    normalize_file_tool_argument_value(&mut value);
     let value = normalize_optional_nulls(&tool.parameters, &tool.parameters, &value);
     validate_schema(&tool.parameters, &value)
+}
+
+const PATH_ALIASES: [&str; 3] = ["filePath", "file_path", "target_file"];
+const CONTENT_ALIASES: [&str; 1] = ["contents"];
+
+/// Rewrite Cursor-style aliases (`filePath`, `contents`, …) onto the hi
+/// catalog names (`path`, `content`) so schema validation and serde agree.
+pub fn normalize_file_tool_arguments(arguments: &str) -> Cow<'_, str> {
+    let Ok(mut value) = serde_json::from_str::<Value>(arguments) else {
+        return Cow::Borrowed(arguments);
+    };
+    if !normalize_file_tool_argument_value(&mut value) {
+        return Cow::Borrowed(arguments);
+    }
+    Cow::Owned(serde_json::to_string(&value).unwrap_or_else(|_| arguments.to_string()))
+}
+
+/// Returns true when `value` was mutated.
+pub fn normalize_file_tool_argument_value(value: &mut Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if !object.contains_key("path") {
+        for alias in PATH_ALIASES {
+            if let Some(path) = object.remove(alias) {
+                object.insert("path".into(), path);
+                changed = true;
+                break;
+            }
+        }
+    }
+    for alias in PATH_ALIASES {
+        if object.remove(alias).is_some() {
+            changed = true;
+        }
+    }
+    if !object.contains_key("content") {
+        for alias in CONTENT_ALIASES {
+            if let Some(content) = object.remove(alias) {
+                object.insert("content".into(), content);
+                changed = true;
+                break;
+            }
+        }
+    }
+    for alias in CONTENT_ALIASES {
+        if object.remove(alias).is_some() {
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// DeepSeek strict schemas encode formerly optional properties as nullable
@@ -419,6 +473,34 @@ mod tests {
         assert!(
             validate_client_tool_batch_limits([payload.as_str(), payload.as_str(), "{}"]).is_err()
         );
+    }
+
+    #[test]
+    fn file_path_aliases_satisfy_required_path() {
+        assert!(
+            validate_client_tool_calls(
+                &completion(r#"{"filePath":"README.md"}"#),
+                &[tool()],
+                ToolMode::Auto,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_client_tool_calls(
+                &completion(r#"{"file_path":"README.md"}"#),
+                &[tool()],
+                ToolMode::Auto,
+            )
+            .is_ok()
+        );
+        let normalized = serde_json::from_str::<Value>(
+            normalize_file_tool_arguments(r#"{"filePath":"src/web.rs","contents":"x"}"#).as_ref(),
+        )
+        .unwrap();
+        assert_eq!(normalized["path"], "src/web.rs");
+        assert_eq!(normalized["content"], "x");
+        assert!(normalized.get("filePath").is_none());
+        assert!(normalized.get("contents").is_none());
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub async fn prepare_mutation_in_with_state(
             refuse_internal_elision_placeholder(&args.content)?;
             let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
             refuse_large_write_overwrite(&target, &args.path)?;
+            refuse_snippet_write_overwrite(&target, &args.path, args.content.len())?;
             let recorded = crate::transaction::workspace_display_path(root, &target);
             let after = args.content;
             crate::read::refuse_oversized_text(&args.path, after.len())?;
@@ -250,6 +251,31 @@ fn refuse_large_write_overwrite(target: &Path, display_path: &str) -> Result<()>
         );
     }
     Ok(())
+}
+
+/// Existing files under the 16KiB `write` cap can still be destroyed by a
+/// one-line snippet (Cursor-trained models send `filePath` + a hunk as
+/// `content`). Refuse when the new body is much smaller than the file.
+const SNIPPET_WRITE_EXISTING_MIN_BYTES: u64 = 512;
+
+fn refuse_snippet_write_overwrite(target: &Path, display_path: &str, new_len: usize) -> Result<()> {
+    if !target.is_file() {
+        return Ok(());
+    }
+    let existing = std::fs::metadata(target)
+        .with_context(|| format!("statting existing file {display_path}"))?
+        .len();
+    if existing <= SNIPPET_WRITE_EXISTING_MIN_BYTES {
+        return Ok(());
+    }
+    if (new_len as u64).saturating_mul(2) >= existing {
+        return Ok(());
+    }
+    bail!(
+        "refusing to overwrite existing `{display_path}` ({existing} bytes) with a much smaller \
+         `write` ({new_len} bytes) — use `edit`, `multi_edit`, or `apply_patch` for in-place \
+         changes. `write` is for creates and full-file replacements."
+    );
 }
 
 /// Apply one edit; if the anchor miss looks like a stale disk race, re-read once

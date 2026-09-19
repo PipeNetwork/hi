@@ -9,6 +9,7 @@ mod paths;
 mod pipe_session;
 mod prompt;
 mod review_target;
+mod roster;
 mod sentinel_exec;
 mod sentinel_resume;
 mod session_files;
@@ -69,8 +70,15 @@ fn run_main() -> Result<()> {
     runtime.block_on(run())
 }
 
-fn top_level_error_code(_error: &anyhow::Error) -> i32 {
-    1
+fn top_level_error_code(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<crate::roster::AmbiguousResume>()
+        .is_some()
+    {
+        2
+    } else {
+        1
+    }
 }
 
 fn canonical_session_identity(

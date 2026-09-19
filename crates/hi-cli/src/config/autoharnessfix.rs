@@ -71,4 +71,7 @@ pub(crate) fn drop_project_overlay(overlay: &mut Config) {
     if overlay.autoharnessfix.take().is_some() {
         tracing::debug!("dropping project [autoharnessfix]; Sentinel is machine-scoped");
     }
+    if overlay.typesafe.take().is_some() {
+        tracing::debug!("dropping project [typesafe]; next-action gate is machine-scoped");
+    }
 }

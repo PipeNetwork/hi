@@ -237,6 +237,20 @@ for arg in "$@"; do
   esac
 done
 echo "plain=$plain nosave=$nosave confirm=$confirm model=$model session=$session review=$review" >> "$log/spawn-$n.env"
+if [ -f "$log/fail_always" ]; then
+  echo 'request: pipe http 429: {{"code":"capacity_unavailable","retry_after_seconds":0,"retryable":true}}'
+  echo 'retry in a moment'
+  exit 1
+fi
+if [ -f "$log/fail_hard" ]; then
+  echo 'agent panicked'
+  exit 1
+fi
+if [ -f "$log/fail_once" ] && [ "$n" -eq 1 ]; then
+  echo 'request: pipe http 429: {{"code":"capacity_unavailable","retry_after_seconds":0,"retryable":true}}'
+  echo 'retry in a moment'
+  exit 1
+fi
 if [ -n "$outside" ]; then
   if [ "${{HI_SANDBOX-}}" = "workspace" ]; then
     echo refused > "$log/outside"

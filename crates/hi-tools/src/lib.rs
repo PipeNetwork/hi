@@ -96,6 +96,7 @@ pub mod folder_trust;
 pub mod guard;
 mod hf;
 mod hf_downloader;
+mod inspect_repeat;
 mod internal_snapshot;
 mod job_lifecycle;
 mod local_server;
@@ -151,6 +152,7 @@ pub use hf_downloader::{
     HfDownloadOptions, download_progress_bytes, download_progress_bytes_for_files,
     download_total_bytes,
 };
+pub use inspect_repeat::{InspectRepeatLedger, is_inspect_tool};
 pub use job_lifecycle::*;
 pub use local_server::{
     LocalServerHandle, await_local_server_health, ensure_hi_local_mlx_binary,
@@ -368,7 +370,7 @@ pub fn bound_tool_content(content: String) -> (String, TruncationState) {
     // API keys and credentials that must never be sent to the provider.
     let content = hi_secrets::redact_secrets(&content).into_owned();
     let original_bytes = content.len() as u64;
-    // Numbered `read` pages already honor the dedicated 64k budget. Re-clipping
+    // Numbered `read` pages already honor the dedicated 16k budget. Re-clipping
     // them at the shared 5k cap (transcript ingest, session resume) hides the
     // middle of a spec-sized file, then skip-reread treats it as complete
     // because the original page had no paging footer.
@@ -452,6 +454,16 @@ impl ToolOutcome {
         }
     }
 
+    /// Body for a human UI. Prefer the richer `display` (colored diffs, ANSI
+    /// compiler output) so the transcript can paint what changed; the model
+    /// still sees the terse `content`.
+    pub fn ui_text(&self) -> &str {
+        match self.display.as_deref() {
+            Some(display) if !display.is_empty() => display,
+            _ => self.content.as_str(),
+        }
+    }
+
     /// A result that updates the user-facing plan checklist. The model sees only
     /// `content` (a terse confirmation); the steps drive the pinned tracker.
     pub(crate) fn planned(content: String, steps: Vec<PlanStep>) -> Self {
@@ -498,6 +510,43 @@ pub struct PlanStep {
     pub status: PlanStatus,
 }
 
+impl PlanStep {
+    /// True when a posted checklist exists and every step is done.
+    pub fn all_complete(steps: &[Self]) -> bool {
+        !steps.is_empty() && steps.iter().all(|step| step.status == PlanStatus::Done)
+    }
+}
+
+/// Parse `update_plan` tool arguments into checklist rows.
+///
+/// Used to rehydrate an in-progress plan from a session transcript when the
+/// process restarts and `Harness.plan` was never persisted.
+pub fn plan_steps_from_arguments(arguments: &str) -> Option<Vec<PlanStep>> {
+    #[derive(serde::Deserialize)]
+    struct StepArg {
+        title: String,
+        #[serde(default)]
+        status: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PlanArgs {
+        steps: Vec<StepArg>,
+    }
+    let args: PlanArgs = serde_json::from_str(arguments).ok()?;
+    if args.steps.is_empty() {
+        return None;
+    }
+    Some(
+        args.steps
+            .into_iter()
+            .map(|step| PlanStep {
+                title: step.title,
+                status: PlanStatus::parse(&step.status),
+            })
+            .collect(),
+    )
+}
+
 /// The progress state of a single [`PlanStep`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanStatus {
@@ -524,7 +573,46 @@ impl PlanStatus {
 mod tests {
     // Integration-style tests that exercise the public `execute` entry point
     // across the split modules (dispatch + read/grep/list/bash + edit + plan).
-    use crate::{PlanStatus, execute};
+    use crate::{PlanStatus, PlanStep, ToolOutcome, execute};
+
+    #[test]
+    fn ui_text_prefers_the_colored_display_body() {
+        let outcome = ToolOutcome::shown(
+            "Edited src/lib.rs".into(),
+            "1 addition, 0 deletions\n   1 + hi".into(),
+        );
+        assert_eq!(outcome.ui_text(), "1 addition, 0 deletions\n   1 + hi");
+        assert_eq!(ToolOutcome::plain("ok".into()).ui_text(), "ok");
+        assert_eq!(
+            ToolOutcome::shown("Edited".into(), String::new()).ui_text(),
+            "Edited"
+        );
+    }
+
+    #[test]
+    fn plan_all_complete_requires_every_step_done() {
+        assert!(!PlanStep::all_complete(&[]));
+        assert!(!PlanStep::all_complete(&[
+            PlanStep {
+                title: "one".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "two".into(),
+                status: PlanStatus::Pending,
+            }
+        ]));
+        assert!(PlanStep::all_complete(&[
+            PlanStep {
+                title: "one".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "two".into(),
+                status: PlanStatus::Done,
+            }
+        ]));
+    }
 
     #[test]
     fn only_completed_successful_processes_satisfy_validation() {

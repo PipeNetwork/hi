@@ -24,22 +24,25 @@ impl ConfirmationRequest {
     /// Conservative classifier for `/permissions auto`.
     pub fn safe_for_auto(&self) -> bool {
         match self {
-            Self::FileEdit { path, diff } => {
-                if matches!(path.trim(), "" | "." | "(unknown)" | "(multiple files)")
-                    || std::path::Path::new(path)
-                        .components()
-                        .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    return false;
-                }
-                let lower = path.to_ascii_lowercase();
-                let secretish = [".env", "credential", "secret", "token", "key.pem"]
-                    .iter()
-                    .any(|needle| lower.contains(needle));
-                let destructive = diff.lines().filter(|line| line.starts_with('-')).count() > 80;
-                !secretish && !destructive && diff.len() <= 32 * 1024
-            }
+            Self::FileEdit { path, diff } => file_edit_is_safe(path, diff),
             Self::ShellMutation { .. } => false,
+        }
+    }
+
+    /// Hard floors Jev must not auto-approve: unsafe files, denylisted shell.
+    pub fn blocks_auto_expand(&self) -> bool {
+        match self {
+            Self::FileEdit { .. } => !self.safe_for_auto(),
+            Self::ShellMutation { command, .. } => hi_tools::guard::blocked_op(command).is_some(),
+        }
+    }
+
+    /// Requests Jev may score in Auto: heuristic-safe files (withhold) or
+    /// non-denylisted mutating shell (expand).
+    pub fn jev_auto_candidate(&self) -> bool {
+        match self {
+            Self::FileEdit { .. } => self.safe_for_auto(),
+            Self::ShellMutation { command, .. } => hi_tools::guard::blocked_op(command).is_none(),
         }
     }
 
@@ -62,6 +65,19 @@ pub enum ConfirmationResult {
     Rejected,
     Cancelled,
     Unavailable,
+}
+
+/// Harness-owned Auto decision for one mutating tool call.
+///
+/// `Heuristic` keeps [`ConfirmationRequest::safe_for_auto`]. `Approve` skips
+/// the overlay only when the request does not [`ConfirmationRequest::blocks_auto_expand`].
+/// `Confirm` always shows the overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AutoHint {
+    #[default]
+    Heuristic,
+    Approve,
+    Confirm,
 }
 
 pub type ConfirmationFuture<'a> = Pin<Box<dyn Future<Output = ConfirmationResult> + Send + 'a>>;
@@ -96,7 +112,9 @@ impl PermissionMode {
     pub fn describe(self) -> &'static str {
         match self {
             Self::Ask => "ask — confirm file edits and shell mutations",
-            Self::Auto => "auto — safe file edits without asking; shell still confirms",
+            Self::Auto => {
+                "auto — safe file edits without asking; Jev may auto-approve reversible shell"
+            }
             Self::Always => "always — approve mutations this session (yolo)",
         }
     }
@@ -140,6 +158,22 @@ impl PermissionMode {
             _ => Self::Ask,
         }
     }
+}
+
+fn file_edit_is_safe(path: &str, diff: &str) -> bool {
+    if matches!(path.trim(), "" | "." | "(unknown)" | "(multiple files)")
+        || std::path::Path::new(path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    let secretish = [".env", "credential", "secret", "token", "key.pem"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let destructive = diff.lines().filter(|line| line.starts_with('-')).count() > 80;
+    !secretish && !destructive && diff.len() <= 32 * 1024
 }
 
 /// Events the turn loop emits. Frontends decide how to render them.
@@ -247,7 +281,7 @@ impl Ui for TestUi {
 
 #[cfg(test)]
 mod tests {
-    use super::PermissionMode;
+    use super::{ConfirmationRequest, PermissionMode};
 
     #[test]
     fn yolo_and_auto_toggle_back_to_ask() {
@@ -264,5 +298,27 @@ mod tests {
             Some(PermissionMode::Always)
         );
         assert_eq!(PermissionMode::from_arg("off"), Some(PermissionMode::Ask));
+    }
+
+    #[test]
+    fn secret_path_never_auto_expands() {
+        let request = ConfirmationRequest::FileEdit {
+            path: "secrets/.env".into(),
+            diff: "+TOKEN=1\n".into(),
+        };
+        assert!(!request.safe_for_auto());
+        assert!(request.blocks_auto_expand());
+        assert!(!request.jev_auto_candidate());
+    }
+
+    #[test]
+    fn force_push_never_auto_expands() {
+        let request = ConfirmationRequest::ShellMutation {
+            command: "git push --force origin main".into(),
+            cwd: "/tmp/hi".into(),
+        };
+        assert!(!request.safe_for_auto());
+        assert!(request.blocks_auto_expand());
+        assert!(!request.jev_auto_candidate());
     }
 }

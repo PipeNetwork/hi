@@ -768,5 +768,3 @@ fn member_not_found(key: &MemberKey) -> StoreError {
         kind: key.kind.as_str().to_owned(),
     }
 }
-
-

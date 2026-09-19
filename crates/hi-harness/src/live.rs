@@ -1,6 +1,6 @@
 //! Session knobs that can change while a turn is in flight.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hi_ai::ReasoningEffort;
@@ -16,6 +16,7 @@ pub struct LiveSettings {
     permission: Arc<AtomicU8>,
     reasoning: Arc<Mutex<Option<ReasoningEffort>>>,
     model: Arc<Mutex<String>>,
+    effort_pinned: Arc<AtomicBool>,
 }
 
 impl LiveSettings {
@@ -28,6 +29,7 @@ impl LiveSettings {
             permission: Arc::new(AtomicU8::new(permission.as_u8())),
             reasoning: Arc::new(Mutex::new(reasoning)),
             model: Arc::new(Mutex::new(model)),
+            effort_pinned: Arc::new(AtomicBool::new(reasoning.is_some())),
         }
     }
 
@@ -48,10 +50,19 @@ impl LiveSettings {
     }
 
     pub fn apply_effort_arg(&self, effort: EffortArg) {
+        self.pin_effort();
         self.set_reasoning_effort(match effort {
             EffortArg::Off => None,
             EffortArg::Level(level) => Some(level),
         });
+    }
+
+    pub fn pin_effort(&self) {
+        self.effort_pinned.store(true, Ordering::Release);
+    }
+
+    pub fn effort_pinned(&self) -> bool {
+        self.effort_pinned.load(Ordering::Acquire)
     }
 
     pub fn model(&self) -> String {

@@ -1,15 +1,15 @@
 use super::{
     Cli, Config, DEFAULT_MAX_TOKENS, ExecutionMode, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
     LocalRuntimeProfile, LspMode, PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName,
-    ReviewPolicy, RsiRequested, RsiSection, ToolSet, UNLIMITED_REPAIR_CYCLES, VerificationMode,
-    VerifyStage, WriteSubagentPolicy, auto_select, auto_selected_env, configured_max_tokens,
-    curate_skills_default, detect_verify_pipeline, detect_verify_pipeline_with,
-    explore_subagents_default, is_official_deepseek_url, max_tokens_is_explicit, needs_setup,
-    permits_missing_checkpoint, planner_model_default, read_config_file, resolve,
-    resolve_active_profile, resolve_fallbacks, resolve_named_profile, resolve_quality,
-    resolve_reasoning_effort, resolve_rsi, resolve_x402_settings, save_config_to, set_rsi_config,
-    suggest_next_prompt_default, upsert_profile_project_local, write_subagents_default,
-    x402_configured,
+    ReviewPolicy, RsiRequested, RsiSection, ToolSet, TypesafeSection, UNLIMITED_REPAIR_CYCLES,
+    VerificationMode, VerifyStage, WriteSubagentPolicy, auto_select, auto_selected_env,
+    configured_max_tokens, curate_skills_default, detect_verify_pipeline,
+    detect_verify_pipeline_with, explore_subagents_default, is_official_deepseek_url,
+    max_tokens_is_explicit, needs_setup, permits_missing_checkpoint, planner_model_default,
+    read_config_file, resolve, resolve_active_profile, resolve_fallbacks, resolve_named_profile,
+    resolve_quality, resolve_reasoning_effort, resolve_rsi, resolve_x402_settings, save_config_to,
+    set_rsi_config, suggest_next_prompt_default, upsert_profile_project_local,
+    write_subagents_default, x402_configured,
 };
 use clap::Parser;
 use std::path::Path;
@@ -178,6 +178,77 @@ fn pipefs_config_round_trips_and_project_overlay_can_only_disable() {
     let project_disable: Config = toml::from_str("[pipefs]\nenabled = false\n").unwrap();
     super::merge_config(&mut enabled, project_disable);
     assert!(!enabled.pipefs.is_enabled());
+}
+
+#[test]
+fn typesafe_section_round_trips_and_project_overlay_is_dropped() {
+    let configured: Config = toml::from_str(
+        "[typesafe]\nenabled = true\napi_key_ref = \"auth-store://typesafe\"\nmin_confidence = 0.6\nauto = false\neffort = true\n",
+    )
+    .unwrap();
+    let section = configured.typesafe.as_ref().expect("typesafe section");
+    assert_eq!(section.enabled, Some(true));
+    assert_eq!(
+        section.api_key_ref.as_deref(),
+        Some("auth-store://typesafe")
+    );
+    assert_eq!(section.min_confidence, Some(0.6));
+    assert_eq!(section.auto, Some(false));
+    assert_eq!(section.effort, Some(true));
+    let settings = section.to_harness_settings();
+    assert!(!settings.auto);
+    assert!(settings.effort);
+    let encoded = toml::to_string(&configured).unwrap();
+    assert!(encoded.contains("[typesafe]"));
+    assert!(encoded.contains("auth-store://typesafe"));
+
+    let mut base = configured;
+    let overlay: Config =
+        toml::from_str("[typesafe]\nenabled = true\nbase_url = \"https://evil.example\"\n")
+            .unwrap();
+    super::merge_config(&mut base, overlay);
+    assert_eq!(
+        base.typesafe
+            .as_ref()
+            .and_then(|section| section.base_url.clone()),
+        None,
+        "project [typesafe] must not replace the machine gate"
+    );
+    assert_eq!(
+        base.typesafe.as_ref().and_then(|section| section.enabled),
+        Some(true)
+    );
+}
+
+#[test]
+fn typesafe_api_key_ref_resolves_from_auth_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let previous = std::env::var_os("XDG_CONFIG_HOME");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    }
+    let result = std::panic::catch_unwind(|| {
+        hi_ai::auth_store::save(
+            hi_harness::TypesafeSettings::AUTH_STORE_ID,
+            &hi_ai::StoredToken::static_access("apikey_test_local".into()),
+        )
+        .expect("store typesafe test key");
+        let section = TypesafeSection {
+            enabled: Some(true),
+            api_key_ref: Some("auth-store://typesafe".into()),
+            ..Default::default()
+        };
+        let settings = section.to_harness_settings();
+        assert!(settings.is_enabled());
+        assert_eq!(settings.api_key.as_deref(), Some("apikey_test_local"));
+    });
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+    result.unwrap();
 }
 
 #[test]
@@ -357,6 +428,19 @@ fn managed_local_runtime_profile_round_trips_and_reaches_settings() {
     let cli = Cli::try_parse_from(["hi", "--profile", "deepseek-mlx"]).unwrap();
     let settings = resolve(&cli, &decoded).unwrap();
     assert_eq!(settings.runtime, decoded.profiles["deepseek-mlx"].runtime);
+}
+
+#[test]
+fn jev_compact_cli_flags_parse() {
+    let default = super::Cli::try_parse_from(["hi"]).unwrap();
+    assert!(!default.jev_compact);
+    assert!(default.compaction.is_none());
+
+    let flag = super::Cli::try_parse_from(["hi", "--jev-compact"]).unwrap();
+    assert!(flag.jev_compact);
+
+    let kind = super::Cli::try_parse_from(["hi", "--compaction", "jev"]).unwrap();
+    assert_eq!(kind.compaction.as_deref(), Some("jev"));
 }
 
 #[test]
@@ -3547,6 +3631,7 @@ fn top_level_help_lists_everyday_commands() {
         "trace",
         "--continue",
         "--list-sessions",
+        "sessions",
         "Sign in to pipenetwork.ai (same as `hi login`, or paste a key)",
         "auth               Paste and verify an API key (pipenetwork / openai / anthropic / xai)",
     ] {

@@ -1,0 +1,25 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2024"
+
+# Nested workspace so `cargo test` here does not join the hi repo workspace.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = { version = "0.5", features = ["rand"] }
+password-hash = { version = "0.5", features = ["getrandom"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

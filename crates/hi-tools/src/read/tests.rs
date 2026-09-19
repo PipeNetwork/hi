@@ -306,15 +306,33 @@ async fn paged_read_reports_truncated_metadata() {
     let typical = run_read(&root, &cache, r#"{"path":"typical.rs"}"#)
         .await
         .unwrap();
-    assert_eq!(
-        typical.truncation,
-        crate::TruncationState::Complete,
-        "an 800-line source file must fit in one default read"
+    assert!(
+        matches!(typical.truncation, crate::TruncationState::Truncated { .. }),
+        "an 800-line source file must page under the default 200-line/16k read: {:?}",
+        typical.truncation
     );
     assert!(
-        !crate::read_output_invites_paging(&typical.content),
-        "typical source should not ask the model to page: {}",
+        crate::read_output_invites_paging(&typical.content),
+        "800-line source should ask the model to page: {}",
         typical.content
+    );
+    let module = (1..=180)
+        .map(|n| format!("    pub fn item_{n}() {{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(root.join("module.rs"), module).unwrap();
+    let module = run_read(&root, &cache, r#"{"path":"module.rs"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        module.truncation,
+        crate::TruncationState::Complete,
+        "a ~180-line module must fit in one default read"
+    );
+    assert!(
+        !crate::read_output_invites_paging(&module.content),
+        "a typical module should not ask the model to page: {}",
+        module.content
     );
     let _ = std::fs::remove_dir_all(root);
 }

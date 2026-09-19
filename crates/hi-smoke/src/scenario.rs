@@ -896,6 +896,7 @@ fn validate_hi_args(args: &[String]) -> Result<()> {
         "--yes",
         "--durable",
         "--no-auto-compact",
+        "--jev-compact",
         "--no-finalize",
         "--no-memory",
         "--confirm-edits",

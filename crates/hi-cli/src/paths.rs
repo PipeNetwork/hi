@@ -29,13 +29,102 @@ pub fn data_root() -> Option<PathBuf> {
 
 pub fn cwd_digest() -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let key = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    path_digest(&cwd)
+}
+
+pub fn path_digest(path: &Path) -> String {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in key.as_os_str().as_encoded_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+pub fn project_dir(digest: &str) -> Option<PathBuf> {
+    data_root().map(|root| root.join("projects").join(digest))
+}
+
+pub fn write_workspace_sidecar(workspace: &Path) {
+    let Some(root) = data_root() else {
+        return;
+    };
+    let digest = path_digest(workspace);
+    let path = root.join("projects").join(digest).join("workspace");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let canonical = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let _ = fs::write(path, format!("{}\n", canonical.display()));
+}
+
+pub fn read_workspace_sidecar(digest: &str) -> Option<PathBuf> {
+    let path = project_dir(digest)?.join("workspace");
+    let text = fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(text))
+}
+
+pub fn project_digest_from_session(path: &Path) -> Option<String> {
+    let mut dir = path.parent()?;
+    if dir.file_name()?.to_str()? != "sessions" {
+        return None;
+    }
+    dir = dir.parent()?;
+    if dir.file_name()?.to_str()? == "dashboard" {
+        dir = dir.parent()?;
+    }
+    let digest = dir.file_name()?.to_str()?.to_string();
+    let projects = dir.parent()?;
+    (projects.file_name()?.to_str()? == "projects").then_some(digest)
+}
+
+/// If this JSONL lives under another project digest, bind that workspace.
+pub fn bind_workspace_for_session(
+    session: Option<&Path>,
+    workspace_root: PathBuf,
+    state_root: PathBuf,
+) -> (PathBuf, PathBuf) {
+    write_workspace_sidecar(&workspace_root);
+    let Some(session) = session else {
+        return (workspace_root, state_root);
+    };
+    let Some(digest) = project_digest_from_session(session) else {
+        return (workspace_root, state_root);
+    };
+    if digest == cwd_digest() {
+        return (workspace_root, state_root);
+    }
+    match read_workspace_sidecar(&digest) {
+        Some(path) if path.is_dir() => {
+            eprintln!(
+                "resuming session in {} (bound from workspace sidecar)",
+                path.display()
+            );
+            let state = data_root()
+                .map(|root| root.join("projects").join(&digest).join("runtime"))
+                .unwrap_or_else(|| path.join(".hi/state"));
+            let _ = fs::create_dir_all(&state);
+            let state = fs::canonicalize(&state).unwrap_or(state);
+            let path = fs::canonicalize(&path).unwrap_or(path);
+            (path, state)
+        }
+        Some(path) => {
+            eprintln!(
+                "warning: workspace sidecar {} is missing; using current directory",
+                path.display()
+            );
+            (workspace_root, state_root)
+        }
+        None => {
+            eprintln!("warning: no workspace sidecar for digest {digest}; using current directory");
+            (workspace_root, state_root)
+        }
+    }
 }
 
 pub fn latest_session() -> Option<PathBuf> {
@@ -93,6 +182,9 @@ pub fn history_path() -> Option<PathBuf> {
 pub fn new_session_path() -> Result<PathBuf> {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = sessions_dir().context("could not determine session directory")?;
+    if let Ok(cwd) = std::env::current_dir() {
+        write_workspace_sidecar(&cwd);
+    }
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -132,6 +224,10 @@ pub fn session_path(id: &str) -> Result<PathBuf> {
                 if candidate.exists() {
                     return Ok(candidate);
                 }
+                let dashboard = entry.path().join("dashboard").join("sessions").join(&name);
+                if dashboard.exists() {
+                    return Ok(dashboard);
+                }
             }
         }
     }
@@ -143,74 +239,40 @@ pub fn session_path(id: &str) -> Result<PathBuf> {
 pub struct SessionSummary {
     pub id: String,
     pub age: String,
+    pub title: String,
+    pub flags: String,
+    pub needs_attention: bool,
+    pub dashboard: bool,
 }
 
 pub fn session_summaries() -> Vec<SessionSummary> {
+    session_summaries_filtered(false)
+}
+
+fn session_summaries_filtered(needs_attention_only: bool) -> Vec<SessionSummary> {
     let Some(root) = data_root() else {
         return Vec::new();
     };
-    let projects = root.join("projects");
-    let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
-    if let Ok(buckets) = fs::read_dir(&projects) {
-        for bucket in buckets.flatten() {
-            let sess_dir = bucket.path().join("sessions");
-            let Ok(read) = fs::read_dir(&sess_dir) else {
-                continue;
-            };
-            for entry in read.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "jsonl") {
-                    let modified = fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(UNIX_EPOCH);
-                    entries.push((path, modified));
-                }
-            }
-        }
-    }
-    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
-    let now = SystemTime::now();
-    entries
+    crate::roster::scan_sessions(&root)
         .into_iter()
-        .map(|(path, modified)| {
-            let id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
-            let age = now
-                .duration_since(modified)
-                .map(|d| {
-                    let secs = d.as_secs();
-                    if secs < 60 {
-                        format!("{secs}s")
-                    } else if secs < 3600 {
-                        format!("{}m", secs / 60)
-                    } else if secs < 86400 {
-                        format!("{}h", secs / 3600)
-                    } else {
-                        format!("{}d", secs / 86400)
-                    }
-                })
-                .unwrap_or_else(|_| "?".into());
-            SessionSummary { id, age }
+        .filter(|entry| !needs_attention_only || entry.needs_attention())
+        .map(|entry| {
+            let flags = entry.reason();
+            let needs_attention = entry.needs_attention();
+            SessionSummary {
+                id: entry.id,
+                age: entry.age,
+                title: entry.title,
+                flags,
+                needs_attention,
+                dashboard: entry.dashboard,
+            }
         })
         .collect()
 }
 
 pub fn list_sessions() -> Result<()> {
-    let summaries = session_summaries();
-    if summaries.is_empty() {
-        match data_root() {
-            Some(root) => println!("no sessions in {}", root.join("projects").display()),
-            None => println!("no session directory"),
-        }
-        return Ok(());
-    }
-    for summary in summaries {
-        println!("{}  {:>6} ago", summary.id, summary.age);
-    }
-    Ok(())
+    crate::roster::print_roster(false)
 }
 
 pub fn resolve_runtime_roots() -> Result<(PathBuf, PathBuf)> {
@@ -234,6 +296,7 @@ pub fn resolve_runtime_roots() -> Result<(PathBuf, PathBuf)> {
             state_root.display()
         )
     })?;
+    write_workspace_sidecar(&workspace_root);
     Ok((workspace_root, state_root))
 }
 
@@ -244,4 +307,62 @@ pub fn absolutize_path(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()
         .context("determining current directory")?
         .join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_path_digest_walks_dashboard_and_plain() {
+        let jsonl = PathBuf::from(
+            "/Users/david/.local/share/hi/projects/abcdabcdabcdabcd/sessions/id.jsonl",
+        );
+        assert_eq!(
+            project_digest_from_session(&jsonl).as_deref(),
+            Some("abcdabcdabcdabcd")
+        );
+        let dash = PathBuf::from(
+            "/Users/david/.local/share/hi/projects/abcdabcdabcdabcd/dashboard/sessions/id.jsonl",
+        );
+        assert_eq!(
+            project_digest_from_session(&dash).as_deref(),
+            Some("abcdabcdabcdabcd")
+        );
+    }
+
+    #[test]
+    fn bind_workspace_uses_sidecar_for_foreign_digest() {
+        let _cwd = crate::CWD_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let xdg = tmp.path().join("xdg");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &xdg);
+        }
+        let other = tmp.path().join("other-ws");
+        std::fs::create_dir_all(&other).unwrap();
+        let digest = "deadbeefdeadbeef";
+        let project = xdg.join("hi").join("projects").join(digest);
+        std::fs::create_dir_all(project.join("sessions")).unwrap();
+        std::fs::write(project.join("workspace"), format!("{}\n", other.display())).unwrap();
+        let session = project.join("sessions").join("s.jsonl");
+        std::fs::write(&session, "{}\n").unwrap();
+        let cwd_ws = tmp.path().to_path_buf();
+        let cwd_state = tmp.path().join("state");
+        std::fs::create_dir_all(&cwd_state).unwrap();
+        let (bound, _) = bind_workspace_for_session(Some(&session), cwd_ws, cwd_state);
+        assert_eq!(bound, other.canonicalize().unwrap());
+        std::env::set_current_dir(prev_cwd).unwrap();
+        unsafe {
+            match prev_xdg {
+                Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+    }
 }

@@ -1,9 +1,9 @@
 //! Typed activity rows for the session transcript.
 //!
-//! Grok-build's feed is a bullet list of verbs: collapsed Read / Edit / Run
-//! rows, mixed exploration folded into one live header, and bounded colorized
-//! diff previews. This module is that vocabulary for hi — not a port of
-//! grok's pager.
+//! Grok-build's feed is a verb list, one row per burst:
+//! `Read 3 files ›`, `Run grep` plus a short hit snippet, `Edit ws.rs`.
+//! Consecutive same-verb explores coalesce; mixed verbs stay separate.
+//! Edits are a filename only until Ctrl-O / verbose.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ pub(crate) struct ActivityBlock {
 pub(crate) enum ActivityKind {
     /// Consecutive non-destructive tools folded into one header.
     VerbGroup(VerbGroup),
-    /// A file mutation. Collapsed shows `Edit path +N/-M`; expanded shows hunks.
+    /// A file mutation. Collapsed is `Edit filename`; Ctrl-O / verbose shows hunks.
     Edit {
         path: String,
         additions: u32,
@@ -101,7 +101,7 @@ impl ExploreVerb {
     pub(crate) fn from_tool(name: &str) -> Option<Self> {
         match name {
             "read" => Some(Self::Read),
-            "grep" | "web_search" | "find_symbol" => Some(Self::Search),
+            "web_search" | "find_symbol" => Some(Self::Search),
             "list" | "glob" | "repo_map" => Some(Self::List),
             "web_fetch" => Some(Self::Fetch),
             _ => None,
@@ -161,6 +161,25 @@ impl VerbGroup {
         self.open = true;
     }
 
+    /// Grok keeps `Read` bursts and `Search` bursts on separate rows.
+    pub(crate) fn accepts(&self, verb: ExploreVerb) -> bool {
+        self.primary_verb().is_none_or(|current| current == verb)
+    }
+
+    fn primary_verb(&self) -> Option<ExploreVerb> {
+        if self.reads > 0 {
+            Some(ExploreVerb::Read)
+        } else if self.searches > 0 {
+            Some(ExploreVerb::Search)
+        } else if self.lists > 0 {
+            Some(ExploreVerb::List)
+        } else if self.fetches > 0 {
+            Some(ExploreVerb::Fetch)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn total(&self) -> u32 {
         self.reads + self.searches + self.lists + self.fetches
     }
@@ -211,8 +230,15 @@ impl ActivityKind {
             Self::VerbGroup(g) => {
                 !g.thinking.trim().is_empty() || !g.steering.is_empty() || g.calls.len() > 1
             }
-            Self::Edit { diff, .. } => !diff.trim().is_empty(),
-            Self::Run { body, .. } => !body.trim().is_empty(),
+            // Grok Edit rows are filename-only; Ctrl-O / verbose still paints the diff.
+            Self::Edit { .. } => false,
+            Self::Run { command, body, .. } => {
+                if grep_snippet_fits(command, body) {
+                    false
+                } else {
+                    !body.trim().is_empty()
+                }
+            }
             Self::Other { body, .. } => !body.trim().is_empty(),
             Self::Subagent { .. } => false,
         }
@@ -304,7 +330,12 @@ impl ActivityBlock {
                 }
                 lines
             }
-            ActivityKind::Run { body, idle, .. } => {
+            ActivityKind::Run {
+                command,
+                body,
+                idle,
+                ..
+            } => {
                 let mut lines = vec![header];
                 if body.trim().is_empty() {
                     return lines;
@@ -312,6 +343,8 @@ impl ActivityBlock {
                 let show_full = density.show_tool_output(show_tool_output) || self.expanded;
                 if show_full {
                     lines.extend(output_body_lines(body));
+                } else if grep_snippet_fits(command, body) && density != Density::Compact {
+                    lines.extend(grep_snippet_lines(body));
                 } else if *idle && density != Density::Compact {
                     // Grok Truncated-while-running: keep a live tail.
                     lines.extend(live_run_tail_lines(body));
@@ -319,15 +352,11 @@ impl ActivityBlock {
                 // Grok Collapsed: finished execute is header-only.
                 lines
             }
-            ActivityKind::Edit { diff, .. } => {
+            ActivityKind::Edit { .. } => {
                 let show = density.show_tool_output(show_tool_output) || self.expanded;
                 let mut lines = vec![header];
                 if show {
                     lines.extend(self.body_lines());
-                } else if density == Density::Compact {
-                    return lines;
-                } else if !diff.trim().is_empty() {
-                    lines.extend(edit_preview_lines(diff));
                 }
                 lines
             }
@@ -362,13 +391,8 @@ impl ActivityBlock {
                 }
                 s
             }
-            ActivityKind::Edit {
-                path,
-                additions,
-                deletions,
-                diff,
-            } => {
-                let mut s = edit_header_text(path, *additions, *deletions);
+            ActivityKind::Edit { path, diff, .. } => {
+                let mut s = format!("Edit {}", display_path(path));
                 if !diff.trim().is_empty() {
                     s.push('\n');
                     s.push_str(&strip_ansi(diff));
@@ -408,48 +432,39 @@ impl ActivityBlock {
         let muted = !live && !self.expanded;
         let verb_fg = if muted { th.gray } else { th.text_primary };
         let verb_style = Style::default().fg(verb_fg).add_modifier(Modifier::BOLD);
-        let diamond_fg = if live { th.accent_running } else { th.gray_dim };
-        let mut spans = vec![Span::styled("◆ ", Style::default().fg(diamond_fg))];
+        let mut spans = Vec::new();
         match &self.kind {
             ActivityKind::VerbGroup(g) => {
-                let label = g.label();
-                let (main, detail) = split_label_detail(&label);
-                spans.push(Span::styled(main.to_string(), verb_style));
-                if let Some(detail) = detail {
-                    spans.push(Span::styled(
-                        format!(" · {detail}"),
-                        Style::default().fg(th.gray_dim),
-                    ));
+                if g.total() == 1
+                    && let Some(detail) = &g.detail
+                {
+                    let word = g
+                        .primary_verb()
+                        .map(|verb| if g.live { verb.present() } else { verb.past() });
+                    if let Some(word) = word {
+                        spans.push(Span::styled(format!("{word} "), verb_style));
+                        spans.push(Span::styled(detail.clone(), Style::default().fg(th.path)));
+                    } else {
+                        spans.push(Span::styled(g.label(), verb_style));
+                    }
+                } else {
+                    let label = g.label();
+                    let (main, detail) = split_label_detail(&label);
+                    spans.push(Span::styled(main.to_string(), verb_style));
+                    if let Some(detail) = detail {
+                        spans.push(Span::styled(
+                            format!(" · {detail}"),
+                            Style::default().fg(th.gray_dim),
+                        ));
+                    }
                 }
             }
-            ActivityKind::Edit {
-                path,
-                additions,
-                deletions,
-                ..
-            } => {
+            ActivityKind::Edit { path, .. } => {
                 spans.push(Span::styled("Edit ".to_string(), verb_style));
                 spans.push(Span::styled(
                     display_path(path).to_string(),
                     Style::default().fg(th.path),
                 ));
-                if *additions > 0 || *deletions > 0 {
-                    let stat = match (*additions, *deletions) {
-                        (a, 0) => format!(" +{a}"),
-                        (0, d) => format!(" -{d}"),
-                        (a, d) => format!(" +{a}/-{d}"),
-                    };
-                    let stat_style = if muted {
-                        Style::default().fg(th.gray_dim)
-                    } else if *deletions == 0 {
-                        Style::default().fg(th.diff_add)
-                    } else if *additions == 0 {
-                        Style::default().fg(th.diff_del)
-                    } else {
-                        Style::default().fg(th.gray)
-                    };
-                    spans.push(Span::styled(stat, stat_style));
-                }
             }
             ActivityKind::Run {
                 command,
@@ -554,16 +569,6 @@ fn output_body_lines(body: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn edit_header_text(path: &str, additions: u32, deletions: u32) -> String {
-    let name = display_path(path);
-    match (additions, deletions) {
-        (0, 0) => format!("Edit {name}"),
-        (a, 0) => format!("Edit {name} +{a}"),
-        (0, d) => format!("Edit {name} -{d}"),
-        (a, d) => format!("Edit {name} +{a}/-{d}"),
-    }
-}
-
 fn run_header_text(command: &str, idle: bool, body: &str) -> String {
     if !idle && body.trim().is_empty() {
         format!("Run {command} · (no output)")
@@ -575,8 +580,9 @@ fn run_header_text(command: &str, idle: bool, body: &str) -> String {
 /// Last lines of a still-running command, so a long `cargo test` isn't a
 /// blank header for minutes.
 const LIVE_RUN_TAIL_LINES: usize = 12;
-/// Keep the default edit row informative without turning every mutation into
-/// a full-screen diff. Ctrl-O or verbose density still shows every hunk.
+/// Hit lines shown under a collapsed `Run grep` row (grok's short snippet).
+const GREP_SNIPPET_LINES: usize = 6;
+/// Verbose / Ctrl-O edit body still uses a short preview helper in tests.
 const EDIT_PREVIEW_LINES: usize = 6;
 
 fn live_run_tail_lines(body: &str) -> Vec<Line<'static>> {
@@ -673,16 +679,19 @@ pub(crate) fn is_edit_tool(name: &str) -> bool {
 }
 
 pub(crate) fn is_run_tool(name: &str) -> bool {
-    matches!(name, "bash" | "bash_output" | "bash_kill")
+    matches!(name, "bash" | "bash_output" | "bash_kill" | "grep")
 }
 
 /// Bash start / output poll — these get a live `Run {command}` row.
 pub(crate) fn is_shell_run_tool(name: &str) -> bool {
-    matches!(name, "bash" | "bash_output")
+    matches!(name, "bash" | "bash_output" | "grep")
 }
 
 /// Command shown on a `Run` row: the salient arg, never `bash_output {id}`.
 pub(crate) fn run_command(name: &str, label: &str) -> String {
+    if name == "grep" {
+        return "grep".to_string();
+    }
     let command = label_detail(label)
         .or_else(|| label_detail(&format!("{name} {label}")))
         .unwrap_or_else(|| label.to_string());
@@ -690,6 +699,52 @@ pub(crate) fn run_command(name: &str, label: &str) -> String {
         .strip_prefix("bash ")
         .unwrap_or(command.as_str())
         .to_string()
+}
+
+fn grep_plain_hits(body: &str) -> Vec<String> {
+    strip_ansi(body)
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty() && !line.starts_with("no matches"))
+        .map(compact_grep_line)
+        .collect()
+}
+
+fn grep_snippet_fits(command: &str, body: &str) -> bool {
+    if command != "grep" {
+        return false;
+    }
+    let n = grep_plain_hits(body).len();
+    n > 0 && n <= GREP_SNIPPET_LINES
+}
+
+fn grep_snippet_lines(body: &str) -> Vec<Line<'static>> {
+    let th = theme();
+    grep_plain_hits(body)
+        .into_iter()
+        .take(GREP_SNIPPET_LINES)
+        .map(|line| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(th.gray)),
+            ])
+        })
+        .collect()
+}
+
+/// `path:12:code` → `12:code`, matching grok-build's grep snippet.
+fn compact_grep_line(line: &str) -> String {
+    if let Some((path, rest)) = line.split_once(':')
+        && path
+            .chars()
+            .any(|c| c == '/' || c == '.' || c.is_ascii_alphabetic())
+        && let Some((lineno, text)) = rest.split_once(':')
+        && !lineno.is_empty()
+        && lineno.chars().all(|c| c.is_ascii_digit())
+    {
+        return format!("{lineno}:{text}");
+    }
+    line.to_string()
 }
 
 pub(crate) fn is_parent_subagent_tool(name: &str) -> bool {
@@ -888,22 +943,50 @@ mod tests {
     }
 
     #[test]
+    fn compact_edit_display_paints_additions_when_expanded() {
+        let diff = "\x1b[1m1 addition, 0 deletions\x1b[0m\n--- /dev/null\n+++ note.txt\n\x1b[32m   1 + hello\x1b[0m\n";
+        let block = ActivityBlock {
+            kind: ActivityKind::Edit {
+                path: "note.txt".into(),
+                additions: 1,
+                deletions: 0,
+                diff: diff.into(),
+            },
+            expanded: true,
+        };
+        let lines = block.flatten(false, false, Density::Comfortable);
+        assert!(
+            lines.len() > 1,
+            "expanded Edit still paints the grok-build diff"
+        );
+        let add = crate::theme::theme().diff_add;
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(add))),
+            "expected add-colored gutter in {lines:?}"
+        );
+    }
+
+    #[test]
     fn parse_stats_from_unified_diff() {
         let s = "--- a/x\n+++ b/x\n@@ -1,1 +1,2 @@\n-old\n+new\n+also\n";
         assert_eq!(parse_diff_stats(s), (2, 1));
     }
 
     #[test]
-    fn verb_group_mixed_label() {
+    fn verb_group_same_verb_coalesces() {
         let mut g = VerbGroup::default();
         g.add(ExploreVerb::Read, Some("a.rs".into()));
-        g.add(ExploreVerb::Search, Some("TODO".into()));
+        g.add(ExploreVerb::Read, Some("b.rs".into()));
         g.live = false;
-        assert_eq!(g.label(), "Read 1 file, Searched 1 pattern");
+        assert_eq!(g.label(), "Read 2 files");
+        assert!(g.accepts(ExploreVerb::Read));
+        assert!(!g.accepts(ExploreVerb::Search));
     }
 
     #[test]
-    fn collapsed_edit_uses_diamond_and_chevron() {
+    fn collapsed_edit_is_filename_only() {
         let block = ActivityBlock {
             kind: ActivityKind::Edit {
                 path: "src/lib.rs".into(),
@@ -913,10 +996,12 @@ mod tests {
             },
             expanded: false,
         };
-        let text = crate::render::line_text(&block.flatten(false, false, Density::Comfortable)[0]);
-        assert!(text.starts_with("◆ "), "{text}");
-        assert!(text.contains("Edit"), "{text}");
-        assert!(text.contains("›"), "{text}");
+        let lines = block.flatten(false, false, Density::Comfortable);
+        let text = crate::render::line_text(&lines[0]);
+        assert_eq!(lines.len(), 1, "grok Edit rows are header-only: {lines:?}");
+        assert!(!text.contains('◆'), "{text}");
+        assert_eq!(text, "Edit lib.rs");
+        assert!(!text.contains('›'), "{text}");
     }
 
     #[test]
@@ -973,7 +1058,7 @@ mod tests {
             expanded: false,
         };
         let text = crate::render::line_text(&block.flatten(false, false, Density::Comfortable)[0]);
-        assert!(text.starts_with("◆ "), "{text}");
+        assert!(!text.contains('◆'), "{text}");
         assert!(
             text.contains('›'),
             "grok shows › on running foldable rows: {text}"
@@ -985,7 +1070,6 @@ mod tests {
         let mut block = ActivityBlock::verb_group(ExploreVerb::Read, Some("a.rs".into()));
         if let Some(group) = block.as_verb_group_mut() {
             group.add(ExploreVerb::Read, Some("b.rs".into()));
-            group.add(ExploreVerb::List, Some("src".into()));
             group.live = false;
         }
         let lines: Vec<String> = block
@@ -1086,6 +1170,61 @@ mod tests {
         assert!(
             finished.contains("completed") && finished.contains("crate boundaries"),
             "{finished}"
+        );
+    }
+
+    #[test]
+    fn short_grep_shows_hits_without_a_chevron() {
+        let body = "src/ws.rs:88:pub struct RateLimiter {\nsrc/ws.rs:95:impl RateLimiter {\n";
+        let block = ActivityBlock {
+            kind: ActivityKind::Run {
+                command: "grep".into(),
+                body: body.into(),
+                idle: false,
+                poll_count: 0,
+            },
+            expanded: false,
+        };
+        let lines: Vec<String> = block
+            .flatten(false, false, Density::Comfortable)
+            .iter()
+            .map(crate::render::line_text)
+            .collect();
+        assert_eq!(lines[0], "Run grep");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("88:pub struct RateLimiter {")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains('›')), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("src/ws.rs")), "{lines:?}");
+    }
+
+    #[test]
+    fn long_grep_collapses_with_a_chevron() {
+        let body = (1..=10)
+            .map(|i| format!("src/lib.rs:{i}:hit {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = ActivityBlock {
+            kind: ActivityKind::Run {
+                command: "grep".into(),
+                body,
+                idle: false,
+                poll_count: 0,
+            },
+            expanded: false,
+        };
+        let lines: Vec<String> = block
+            .flatten(false, false, Density::Comfortable)
+            .iter()
+            .map(crate::render::line_text)
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("Run grep") && lines[0].contains('›'),
+            "{lines:?}"
         );
     }
 }

@@ -91,9 +91,9 @@ pub use provider_capabilities::{
 pub use request_envelope::{RequestToolEnvelope, TEXT_TOOL_FALLBACK_PERMISSION};
 pub use token::{PersistableToken, StaticToken, TokenSource};
 pub use tool_validation::{
-    MAX_TOOL_ARGUMENT_BYTES, validate_client_tool_batch_limits,
-    validate_client_tool_batch_limits_with, validate_client_tool_call,
-    validate_client_tool_call_with_limit, validate_client_tool_calls,
+    MAX_TOOL_ARGUMENT_BYTES, normalize_file_tool_argument_value, normalize_file_tool_arguments,
+    validate_client_tool_batch_limits, validate_client_tool_batch_limits_with,
+    validate_client_tool_call, validate_client_tool_call_with_limit, validate_client_tool_calls,
 };
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, CostEstimate, DeepSeekCompat, Message,

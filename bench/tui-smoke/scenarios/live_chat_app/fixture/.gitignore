@@ -1,0 +1,8 @@
+/target
+
+# Local databases created by running the server (CHAT_DB).
+/chat.db
+/chat.db-shm
+/chat.db-wal
+*.db-wal
+*.db-shm

@@ -292,6 +292,14 @@ fn target_path_extracts_path_field() {
         target_path("write", r#"{"path":"b.rs","content":"x"}"#),
         Some("b.rs".into())
     );
+    assert_eq!(
+        target_path("write", r#"{"filePath":"b.rs","contents":"x"}"#),
+        Some("b.rs".into())
+    );
+    assert_eq!(
+        target_path("read", r#"{"file_path":"src/a.rs"}"#),
+        Some("src/a.rs".into())
+    );
     // list's path is optional → None when absent.
     assert_eq!(target_path("list", r#"{}"#), None);
     assert_eq!(target_path("list", r#"{"path":"sub"}"#), Some("sub".into()));

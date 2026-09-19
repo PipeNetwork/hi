@@ -728,4 +728,38 @@ impl crate::App {
         }
         self.follow();
     }
+
+    pub(crate) fn handle_pending_resume_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(card) = self.pending_resume.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                card.selected = 0;
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                card.selected = 1;
+                true
+            }
+            KeyCode::Char('y') => {
+                self.pending_resume = None;
+                self.resume_incomplete_requested = true;
+                true
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.pending_resume = None;
+                true
+            }
+            KeyCode::Enter => {
+                let continue_turn = card.selected == 0;
+                self.pending_resume = None;
+                if continue_turn {
+                    self.resume_incomplete_requested = true;
+                }
+                true
+            }
+            _ => true,
+        }
+    }
 }

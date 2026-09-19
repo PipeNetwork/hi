@@ -135,6 +135,21 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 | `HI_SCHEDULER_PRESET` | `conservative`, `balanced`, or `throughput` orchestration policy | balanced |
 | `HI_ADAPTIVE_SCHEDULER` | Set `0` to disable adaptive admission | on |
 | `HI_WARM_WORKERS` | Set `0` to disable warm worker reuse | on |
+| `TYPESAFE_API_KEY` | Optional Jev next-action / auto / effort hints, and `/jev-compact` tool prune | off |
+| `TYPESAFE_BASE_URL` | TypeSafe API origin | `https://api.typesafe.ai` |
+| `TYPESAFE_DEFAULT_MODEL` | Jev model id | `jev-latest` |
+
+Set `TYPESAFE_API_KEY` (or `[typesafe]` in `~/.config/hi/config.toml`) to let Jev flavor inspect-only review-and-fix rounds (prefer tests over more grep), score `/permissions auto` (withhold risky-looking safe files; auto-approve high-confidence reversible shell), and hint a turn-scoped reasoning effort. The gate is fail-open and machine-scoped; a timeout or error leaves the existing harness policy in place. `/jev-compact on` (alias `/compact-jev`) is a separate, session-only switch: with a TypeSafe key it scores tool calls and results, then drops or truncates stale ones while keeping everything else verbatim. It does not persist to config; `--jev-compact` or `--compaction jev` turns it on at launch. Failures fall back to cheap shrink and the model summary.
+
+```toml
+[typesafe]
+# enabled = true   # default: on when a key is present
+api_key_env = "TYPESAFE_API_KEY"
+# model = "jev-latest"
+# min_confidence = 0.55
+# auto = true      # /permissions auto hints
+# effort = true    # turn-scoped reasoning-effort hints
+```
 
 ## Local model sidecars
 
@@ -250,15 +265,29 @@ the old harness. Use `/dashboard` for concurrent sessions.
 
 ## Sessions
 
-Every session is saved as JSONL under `~/.local/share/hi/projects/<workspace>/sessions/`.
+Every session is saved as JSONL under `~/.local/share/hi/projects/<digest>/sessions/`. After a reboot nothing is restarted automatically — unfinished work stays on disk until you resume it.
 
 ```bash
-hi -c "and now add tests"          # --continue the latest session
-hi resume                           # TUI resume of the latest session here
-hi --resume <id> "..."             # resume a specific one
-hi --list-sessions                 # list saved sessions
-hi --no-save "..."                 # don't persist
+hi sessions                         # needs-attention roster (pending turn, open plan, live/stopped lock)
+hi sessions --all                   # every session, including completed plans
+hi resume                           # unfinished work in this directory (picker if several)
+hi --resume <id>                    # open that file; binds the workspace from the project sidecar
+hi -c "and now add tests"           # same as resume, then send a prompt
+hi --no-save "..."                  # don't persist
 ```
+
+`hi sessions` groups by workspace and prints a copy-paste command:
+
+```
+cd /Users/david/chat && hi --resume 1789672473100-9612198e-102fa-0
+  PLAN 1/8 · active: Forward HISTORY pagination
+```
+
+Dashboard child JSONL under `projects/<digest>/dashboard/sessions/` is tagged `dashboard`. `/sessions` in the TUI shows the same flags.
+
+If a process still holds the session (including a SIGSTOP'd sentinel), resume prints `held by pid N (stopped); kill or fg` instead of opening a second writer. A leftover pid file after reboot is ignored once the lock is free.
+
+Resuming an unmatched mid-turn shows a Continue / Dismiss card in the TUI (Sentinel still auto-continues with `HI_SENTINEL_RESUME_INCOMPLETE=1`). An open, unpaused plan sets an Enter-to-continue suggestion; it does not enqueue a turn on startup.
 
 ## In-session commands & context
 
@@ -304,7 +333,7 @@ Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to 
 
 **Auto-memory.** At the end of an interactive session, `hi` distills durable lessons into `.hi/memory.md` (and user-level `~/.config/hi/memory.md`) with stable `[#n]` bullet ids. `/remember` appends a numbered note; `memory_update` / `memory_forget` correct it; `/undo-memory` restores the previous file. Disable with `--no-memory`.
 
-**Auto-compact.** Occupancy is `max(last Pipe request tokens, local estimate)` against the active model's `/models` context window (128k if metadata is missing). Once occupancy passes ~45% of that window, `hi` stubs tool-result bodies from *earlier turns* (keeps the newest six of those verbatim) and drops stale thinking — the in-progress turn's reads stay intact so the model can still see the files. If occupancy is still ~85%, older current-turn results may be stubbed too, then the model is asked for a structured summary and the live session is rewritten to the original user query plus that summary. If the summary call fails while still over 85%, a local emergency compact runs and Sentinel may auto-repair. `--no-auto-compact` disables the automatic shrink/summary; `/compact [context]` still shrinks and always requests a summary. Tool payloads are also bounded: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
+**Auto-compact.** Occupancy is `max(last Pipe request tokens, local estimate)` against the active model's `/models` context window (128k if metadata is missing). Once occupancy passes ~45% of that window, `hi` stubs tool-result bodies from *earlier turns* (keeps the newest six of those verbatim) and drops stale thinking — the in-progress turn's reads stay intact so the model can still see the files. If occupancy is still ~85%, older current-turn results may be stubbed too, then the model is asked for a structured summary and the live session is rewritten to the original user query plus that summary. If `/jev-compact` is on (session-only; needs `TYPESAFE_API_KEY`), that 85% reclaim scores tool pairs with Jev first and prunes in place instead of summarizing when occupancy then drops below 85%. Jev failures fall back to cheap shrink + summary. If the summary call fails while still over 85%, a local emergency compact runs and Sentinel may auto-repair. `--no-auto-compact` disables the automatic shrink/summary; `/compact [context]` still shrinks and requests a summary unless Jev prune already dropped occupancy under 85%. Tool payloads are also bounded: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
 
 **Undo.** Before mutation, `hi` creates a recoverable checkpoint: a dangling
 commit with a throwaway index when Git is usable, otherwise a content-addressed
@@ -317,7 +346,7 @@ Checkpoints cannot undo non-file side effects.
 
 **No nag-prompts — but a guard for the irreversible.** Rather than asking permission for every command (the thing everyone turns off), `hi` lets the model run freely and relies on `/undo` for recovery. The one exception is a small denylist of operations a checkpoint *can't* undo — `sudo`, `rm -rf` of home/root/system paths, `git push --force`, `curl … | sh`, `dd` to a disk, `mkfs`, fork bombs, shutdown — which are refused with a reason the model can act on. It's a seatbelt against accidents, not a security boundary; set `HI_ALLOW_DANGEROUS=1` to disable it. Tool results, web/research pages, browser AX/eval output, MCP payloads, and inbound `hi mcp serve` calls are untrusted data, not instructions.
 
-**Egress confirms.** Attended default remains YOLO (`/permissions always`). In Ask and Auto, `browser_exec` and MCP `use_tool` pause on a confirm overlay; web fetch/research pause only in Ask. Session standing grants apply to an MCP `server`+`tool` pair, never to bash or the browser. Unattended goals and loop children keep Ask/Auto: confirms that cannot be answered live are parked in `/inbox` (not auto-approved). `hi mcp serve` has no human on stdio — it stays denylist + sandbox + folder trust, with no inbox.
+**Egress confirms.** Attended default remains YOLO (`/permissions always`). In Ask and Auto, `browser_exec` and MCP `use_tool` pause on a confirm overlay; web fetch/research pause only in Ask. Session standing grants apply to an MCP `server`+`tool` pair, never to bash or the browser. Unattended confirms that cannot be answered live return unavailable (denied), not auto-approved. With a TypeSafe key, `/permissions auto` may skip the overlay for high-confidence reversible shell; denylisted commands and secret-adjacent files still confirm. `hi mcp serve` has no human on stdio — it stays denylist + sandbox + folder trust.
 
 **Dry run.** Pass `--dry-run` to preview what the model *would* do without
 executing anything. Each tool call that survives policy, budget, and protocol

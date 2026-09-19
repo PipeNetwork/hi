@@ -64,13 +64,18 @@ mod tests {
         let mut store = WorkspaceStore::open(&path).unwrap();
         assert_eq!(store.schema_state(), SchemaState::Current);
         assert!(matches!(
-            store.insert_member(member("sess-a", "fix login", "/tmp/proj")).unwrap(),
+            store
+                .insert_member(member("sess-a", "fix login", "/tmp/proj"))
+                .unwrap(),
             InsertOutcome::Inserted
         ));
         let snap = store.snapshot().unwrap();
         assert_eq!(snap.members.len(), 1);
         assert_eq!(snap.members[0].title.as_deref(), Some("fix login"));
-        assert_eq!(snap.members[0].model.as_deref(), Some("pipe/deepseek-v4-flash-0731"));
+        assert_eq!(
+            snap.members[0].model.as_deref(),
+            Some("pipe/deepseek-v4-flash-0731")
+        );
         assert_eq!(snap.grouping, Grouping::State);
 
         store
@@ -108,7 +113,10 @@ mod tests {
         store.set_grouping(&Grouping::Directory).unwrap();
         assert_eq!(store.snapshot().unwrap().grouping, Grouping::Directory);
         assert_eq!(store.remove_member(&key).unwrap(), RemoveOutcome::Removed);
-        assert_eq!(store.remove_member(&key).unwrap(), RemoveOutcome::NotPresent);
+        assert_eq!(
+            store.remove_member(&key).unwrap(),
+            RemoveOutcome::NotPresent
+        );
         assert!(store.snapshot().unwrap().members.is_empty());
     }
 
@@ -120,7 +128,9 @@ mod tests {
             .insert_member(member("sess-b", "one", "/tmp/a"))
             .unwrap();
         assert!(matches!(
-            store.insert_member(member("sess-b", "two", "/tmp/a")).unwrap(),
+            store
+                .insert_member(member("sess-b", "two", "/tmp/a"))
+                .unwrap(),
             InsertOutcome::UpdatedExisting
         ));
         let snap = store.snapshot().unwrap();

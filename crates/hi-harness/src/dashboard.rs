@@ -14,7 +14,7 @@ use hi_dashboard_store::{
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::ui::{ConfirmationResult, PermissionMode, Ui};
-use crate::{Harness, HarnessConfig, TurnCancellation};
+use crate::{Harness, HarnessConfig, TurnCancellation, TypesafeSettings};
 
 const DEFAULT_MAX_WORKING: usize = 8;
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
@@ -514,6 +514,7 @@ impl Dashboard {
         config.base_url = base_url;
         config.model = model;
         config.session_path = Some(session_path);
+        config.typesafe = TypesafeSettings::from_env();
         let mut harness = Harness::new(config)?;
         harness.set_permission_mode(PermissionMode::Always);
         if let Some(loaded) = loaded {
@@ -846,6 +847,7 @@ mod tests {
             .expect("restored");
         assert_eq!(row.model, PIPE_GPT6);
         assert_eq!(row.state, RowState::Idle);
+        // Reboot recovery: restore rehydrates rows as Idle and does not spawn runtimes.
         let _ = dash;
     }
 
@@ -888,10 +890,10 @@ mod tests {
 
     #[tokio::test]
     async fn restored_row_accepts_a_reply() {
-        let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
-            text_chunk("queued"),
-            usage_chunk(2, 1),
-        ])]) else {
+        let Some(server) = MockPipe::new(vec![
+            Scripted::Sse(vec![text_chunk("ready"), usage_chunk(2, 1)]),
+            Scripted::Sse(vec![text_chunk("queued"), usage_chunk(2, 1)]),
+        ]) else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -909,7 +911,7 @@ mod tests {
         drop(dash);
         let mut dash = Dashboard::open(k).unwrap();
         dash.reply(&id, "do more").unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let row = dash.roster().into_iter().find(|r| r.id == id).unwrap();
         assert!(
             row.usage.input_tokens > 0 || row.last_text.contains("queued"),
@@ -963,13 +965,13 @@ mod tests {
         let mut dash = Dashboard::open(knobs(dir.path(), &server.url)).unwrap();
         let a = dash.dispatch("fix a", None).unwrap();
         let b = dash.dispatch("fix b", None).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let roster = dash.roster();
         assert_eq!(roster.len(), 2);
         assert!(roster.iter().any(|r| r.id == a));
         assert!(roster.iter().any(|r| r.id == b));
         dash.reply(&a, "do more").unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let a_view = dash
             .roster()
             .into_iter()

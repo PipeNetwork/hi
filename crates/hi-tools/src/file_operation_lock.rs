@@ -263,7 +263,8 @@ pub fn file_lock_need(name: &str, arguments: &str) -> FileLockNeed {
 }
 
 fn extract_lock_paths(name: &str, arguments: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments) else {
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(arguments.as_ref()) else {
         return Vec::new();
     };
     if name == "read"
@@ -399,6 +400,10 @@ mod tests {
     fn lock_need_classifies_file_tools() {
         assert_eq!(
             file_lock_need("write", r#"{"path":"a.rs","content":"x"}"#),
+            FileLockNeed::Path("a.rs".into())
+        );
+        assert_eq!(
+            file_lock_need("write", r#"{"filePath":"a.rs","contents":"x"}"#),
             FileLockNeed::Path("a.rs".into())
         );
         assert_eq!(

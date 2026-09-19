@@ -169,6 +169,15 @@ pub struct LocalSessionInfo {
     pub title: String,
     pub age: String,
     pub lines: usize,
+    pub flags: String,
+    pub needs_attention: bool,
+    pub dashboard: bool,
+}
+
+/// Continue / Dismiss card for an unmatched `pending_turn` after a reboot.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingResumeCard {
+    pub selected: usize,
 }
 
 /// Form data for creating or editing a profile, exchanged between the TUI
@@ -383,7 +392,7 @@ pub(crate) enum TranscriptEntry {
 /// How many lines of a long generic tool-output block show before it folds.
 /// Activity rows remain compact by default; this budget applies to leftover
 /// `ToolOutput` dumps. Comfortable density uses 0 so the transcript stays a
-/// verb list, with bounded Edit previews as the exception.
+/// grok-build verb list.
 pub(crate) const TOOL_OUTPUT_PREVIEW_LINES: usize = 0;
 
 /// Grok-build user prompts are a quiet `❯ ` prefix, not a `┃` accent gutter.
@@ -915,6 +924,9 @@ pub(crate) struct App {
     pub(crate) confirm_focus: crate::confirm_overlay::ConfirmFocus,
     /// Confirmations waiting behind the active overlay (`N waiting`).
     pub(crate) confirmation_waiting: usize,
+    /// Unmatched pending turn after reboot: Continue / Dismiss.
+    pub(crate) pending_resume: Option<PendingResumeCard>,
+    pub(crate) resume_incomplete_requested: bool,
     /// Last mouse cell, for hover chrome (context bar).
     pub(crate) mouse_col: u16,
     pub(crate) mouse_row: u16,
@@ -1199,8 +1211,8 @@ pub(crate) const MAX_EVENT_LOG: usize = 20_000;
 pub(crate) enum Density {
     /// Headers only for tool output and edits; explore runs stay collapsed.
     Compact,
-    /// Default: compact Edit previews and one-line Read / Run rows; expand on
-    /// Ctrl-O.
+    /// Default: one-line Read / Edit / Run rows (plus a short grep snippet);
+    /// expand on click / Ctrl-O.
     #[default]
     Comfortable,
     /// Force-expand tool output (same as Ctrl-O on).

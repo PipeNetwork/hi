@@ -263,7 +263,7 @@ pub(super) async fn run_bash_tool_with_auto_background(
     // DeepSeek Flash prefers `cat`/`sed -n`/`head` for SPEC.md. Those dumps
     // go through the 5k bash condenser and lose the middle of the spec.
     // Workspace file dumps that fit the read cache become numbered `read`
-    // pages (64k budget, paging footer, skip-reread) instead.
+    // pages (16k budget, paging footer, skip-reread) instead.
     if !args.run_in_background
         && let Some(arguments) = file_dump_read_arguments(&args.command)
         && file_dump_is_read_eligible(root, &arguments)

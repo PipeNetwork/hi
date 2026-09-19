@@ -1016,7 +1016,7 @@ impl crate::App {
         }
     }
 
-    /// Grok-build keeps consecutive reads/searches in one row even when the
+    /// Grok-build keeps consecutive same-verb explores in one row even when the
     /// model narrates between them. Skip assistant/reasoning/status lines and
     /// resume the still-open explore group from this turn. A substantial
     /// assistant answer (heading, list, long prose) starts a new burst.
@@ -1042,7 +1042,9 @@ impl crate::App {
 
     fn note_explore_call(&mut self, verb: ExploreVerb, detail: Option<String>) {
         let chrome = self.take_explore_chrome();
-        if let Some(group) = self.open_verb_group_mut() {
+        if let Some(group) = self.open_verb_group_mut()
+            && group.accepts(verb)
+        {
             absorb_explore_chrome(group, chrome);
             group.add(verb, detail);
             self.bump_transcript();

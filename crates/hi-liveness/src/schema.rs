@@ -50,8 +50,9 @@ pub enum InvariantCode {
     ConfirmUnanswered,
     IdenticalToolStorm,
     /// Model stopped after executing tools with no user-visible text. The
-    /// harness continues a bounded number of times, then reports this so
-    /// Sentinel can auto-repair instead of leaving an idle, unfinished turn.
+    /// harness continues a bounded number of times, then fails the turn.
+    /// This is model behavior, not a crash: report-only, never auto-repair.
+    /// Killing an idle TUI over an empty stop is worse than leaving `/retry`.
     EmptyAssistantAfterTools,
     /// Model compact failed while occupancy was already over the window.
     /// Identical-tool storms in that state are a symptom: the harness must
@@ -77,13 +78,14 @@ impl InvariantCode {
 /// Codes the supervisor may treat as a harness bug. A plain
 /// `IdenticalToolStorm` (agent loop under a healthy window) is excluded;
 /// the same storm after compact has already failed is `CompactFailedOverWindow`.
+/// `EmptyAssistantAfterTools` is also excluded: the turn already ended with
+/// an error the user can `/retry`. SIGTERM of that idle TUI is worse.
 pub const AUTO_REPAIR_SET: &[InvariantCode] = &[
     InvariantCode::ToolUnclosed,
     InvariantCode::TurnUnclosed,
     InvariantCode::SessionAppendFailed,
     InvariantCode::ChildLeak,
     InvariantCode::ConfirmUnanswered,
-    InvariantCode::EmptyAssistantAfterTools,
     InvariantCode::CompactFailedOverWindow,
 ];
 

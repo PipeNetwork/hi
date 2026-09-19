@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chat</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#0e1116; --bg-grad-1:#141a24; --bg-grad-2:#0e1116;
+    --panel:#161b24; --panel-2:#1b2230; --line:#262e3d; --line-soft:#1f2633;
+    --fg:#e8ecf4; --dim:#8b94a8; --faint:#5c6475;
+    --accent:#6ea8fe; --accent-2:#8b7bff; --mine:#7ee787; --err:#ff7b72;
+    --sys:#8b94a8; --action:#d2a8ff; --dm:#ffd28a;
+    --shadow:0 8px 30px rgba(0,0,0,.45);
+    --radius:12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height:100%; }
+  body {
+    margin:0; display:flex; flex-direction:column;
+    background:
+      radial-gradient(1200px 500px at 15% -10%, var(--bg-grad-1), transparent 60%),
+      radial-gradient(1000px 500px at 110% 0%, #1a1430, transparent 55%),
+      var(--bg);
+    color:var(--fg);
+    font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    padding:10px 14px; background:rgba(22,27,36,.85); backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--line); position:relative; z-index:2;
+  }
+  .brand { display:flex; align-items:center; gap:9px; margin-right:6px; }
+  .brand .logo {
+    width:26px; height:26px; border-radius:8px; flex:0 0 auto;
+    background:linear-gradient(135deg, var(--accent), var(--accent-2));
+    display:flex; align-items:center; justify-content:center;
+    font-size:14px; font-weight:800; color:#0b0d12; box-shadow:0 2px 8px rgba(110,168,254,.4);
+  }
+  .brand .name { font-weight:700; letter-spacing:.02em; font-size:15px; }
+  form { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  label { color:var(--dim); font-size:12px; display:flex; gap:5px; align-items:center; }
+  input {
+    background:#0b0e14; color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:6px 9px; font:inherit; transition:border-color .15s, box-shadow .15s;
+  }
+  input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(110,168,254,.18); }
+  input::placeholder { color:var(--faint); }
+  input.host { width:11rem; } input.channel { width:8rem; } input.user { width:8rem; } input.secret { width:9rem; }
+  button {
+    background:linear-gradient(135deg, var(--accent), var(--accent-2)); color:#0b0d12;
+    border:0; border-radius:8px; padding:7px 14px; font:inherit; font-weight:600; cursor:pointer;
+    transition:filter .15s, transform .05s;
+  }
+  button:hover:not(:disabled) { filter:brightness(1.1); }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button:disabled { background:var(--line); color:var(--dim); cursor:default; }
+  button.ghost { background:transparent; color:var(--dim); border:1px solid var(--line); font-weight:400; }
+  button.ghost:hover:not(:disabled) { background:var(--panel-2); color:var(--fg); }
+  #status {
+    margin-left:auto; color:var(--dim); font-size:12px; display:flex; align-items:center; gap:6px;
+  }
+  #status::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--faint); }
+  #status.on { color:var(--mine); }
+  #status.on::before { background:var(--mine); box-shadow:0 0 8px var(--mine); }
+  #status.wait { color:#e3b341; }
+  #status.wait::before { background:#e3b341; box-shadow:0 0 8px #e3b341; animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity:.4; } }
+  #topic {
+    padding:7px 14px; background:rgba(22,27,36,.6); border-bottom:1px solid var(--line-soft);
+    color:var(--dim); font-size:12px; min-height:1.5em; display:flex; align-items:center; gap:6px;
+  }
+  #topic b { color:var(--fg); font-weight:600; }
+  #topic .hash { color:var(--accent); font-weight:700; }
+  #body { flex:1; display:flex; min-height:0; }
+  #log { flex:1; overflow-y:auto; padding:14px 16px; scroll-behavior:smooth; }
+  #members {
+    width:13.5rem; flex:0 0 auto; border-left:1px solid var(--line);
+    background:rgba(22,27,36,.5); overflow-y:auto; padding:12px 14px;
+  }
+  #members h3 {
+    margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+    color:var(--dim); display:flex; align-items:center; gap:6px;
+  }
+  #members h3 .count { color:var(--faint); font-weight:400; }
+  #members ul { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px; }
+  #members li {
+    padding:4px 8px; color:var(--fg); display:flex; align-items:center; gap:8px;
+    border-radius:8px; transition:background .12s;
+  }
+  #members li:hover { background:var(--panel-2); }
+  #members li .dot { width:7px; height:7px; border-radius:50%; background:var(--mine); flex:0 0 auto; }
+  #members li .op { color:var(--accent); font-weight:700; }
+  #members li.me { color:var(--accent); }
+  #members li.me .dot { background:var(--accent); }
+  #members .empty { color:var(--dim); font-size:12px; padding:4px 8px; }
+  .row {
+    display:flex; gap:10px; padding:3px 8px; border-radius:8px;
+    white-space:pre-wrap; overflow-wrap:anywhere; transition:background .12s;
+  }
+  .row:hover { background:rgba(255,255,255,.03); }
+  .row .avatar {
+    width:28px; height:28px; border-radius:8px; flex:0 0 auto; margin-top:1px;
+    display:flex; align-items:center; justify-content:center;
+    font-size:12px; font-weight:700; color:#0b0d12; user-select:none;
+  }
+  .row .ts { color:var(--faint); flex:0 0 auto; font-size:11px; padding-top:3px; }
+  .row .who { color:var(--accent); flex:0 0 auto; font-weight:600; }
+  .row.mine .who { color:var(--mine); }
+  .row.sys { color:var(--sys); font-style:italic; }
+  .row.err { color:var(--err); }
+  .row.action { color:var(--action); }
+  .row.dm .who { color:var(--dm); }
+  .row .body { flex:1; }
+  .row .meta { display:flex; flex-direction:column; min-width:0; }
+  .row .meta .head { display:flex; align-items:baseline; gap:8px; }
+  footer {
+    padding:10px 14px; background:rgba(22,27,36,.85); backdrop-filter:blur(8px);
+    border-top:1px solid var(--line); position:relative; z-index:2;
+  }
+  footer form { flex-wrap:nowrap; }
+  #msg { flex:1; }
+  #msg:disabled { opacity:.5; }
+  #hint { color:var(--faint); font-size:11px; margin-left:8px; white-space:nowrap; }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:var(--line); border-radius:6px; border:2px solid transparent; background-clip:content-box; }
+  ::-webkit-scrollbar-thumb:hover { background:var(--panel-2); background-clip:content-box; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  @media (max-width: 720px) {
+    #members { display:none; }
+    input.host { width:100%; }
+    #hint { display:none; }
+    .brand .name { display:none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <form id="settings">
+    <span class="brand"><span class="logo">#</span><span class="name">chat</span></span>
+    <label>server <input id="host" class="host" placeholder="this host" autocomplete="off"></label>
+    <label>channel <input id="channel" class="channel" value="#general" autocomplete="off"></label>
+    <label>nick <input id="user" class="user" autocomplete="username"></label>
+    <label>password <input id="password" class="secret" type="password" autocomplete="current-password"></label>
+    <button id="connect" type="submit">Connect</button>
+    <button id="register" type="button" class="ghost">Create account</button>
+    <button id="disconnect" type="button" class="ghost" disabled>Disconnect</button>
+    <button id="clear" type="button" class="ghost" disabled>Clear</button>
+    <span id="status">offline</span>
+  </form>
+</header>
+<div id="topic"></div>
+<div id="body">
+  <main id="log"></main>
+  <aside id="members">
+    <h3>In channel <span class="count" id="memberCount"></span></h3>
+    <ul id="memberList"></ul>
+  </aside>
+</div>
+<footer>
+  <form id="composer">
+    <input id="msg" placeholder="message — /help for commands" autocomplete="off" disabled>
+    <button id="send" type="submit" disabled>Send</button>
+    <span id="hint">/join /part /nick /topic /history /msg /me</span>
+  </form>
+</footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+const memberList = $("memberList");
+
+// How many past messages to ask the bridge to replay on each connect. The bridge
+// is publish-only, so this is what keeps a reload from starting with a blank log.
+const BACKFILL = 50;
+// Reconnect backoff bounds, in milliseconds.
+const RETRY_MIN = 500, RETRY_MAX = 15000;
+
+let socket = null;
+let retryTimer = null;
+let attempts = 0;
+// Set when the user disconnects on purpose, so we stop retrying.
+let stopped = true;
+// Live member roster, derived from JOIN/QUIT/NICK/KICK broadcasts.
+let members = new Map(); // name -> isOp
+// Whether the user has scrolled up (pauses auto-scroll until they return to bottom).
+let pinned = false;
+// The channel we are currently connected to, for slash commands that need it.
+let currentChannel = "";
+
+function now() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+// Deterministic avatar color per name, so each user keeps a stable hue.
+const AVATAR_COLORS = ["#6ea8fe", "#7ee787", "#d2a8ff", "#ffd28a", "#ff7b72", "#79c0ff", "#f778ba", "#56d4dd"];
+function avatarColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+function avatarInitial(name) {
+  return (name[0] || "?").toUpperCase();
+}
+
+function row(text, kind, who) {
+  const line = document.createElement("div");
+  line.className = "row" + (kind ? " " + kind : "");
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = now();
+  line.append(ts);
+  if (who) {
+    const avatar = document.createElement("span");
+    avatar.className = "avatar";
+    avatar.style.background = avatarColor(who);
+    avatar.textContent = avatarInitial(who);
+    line.append(avatar);
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const head = document.createElement("span");
+    head.className = "head";
+    const whoEl = document.createElement("span");
+    whoEl.className = "who";
+    whoEl.textContent = who;
+    head.append(whoEl);
+    const body = document.createElement("span");
+    body.className = "body";
+    // Always textContent: message bodies come from other users, so never innerHTML.
+    body.textContent = text;
+    meta.append(head, body);
+    line.append(meta);
+  } else {
+    const body = document.createElement("span");
+    body.className = "body";
+    body.textContent = text;
+    line.append(body);
+  }
+  log.append(line);
+  if (!pinned) log.scrollTop = log.scrollHeight;
+}
+const sys = (text) => row(text, "sys");
+const err = (text) => row(text, "err");
+
+function setStatus(text, cls) {
+  const el = $("status");
+  el.textContent = text;
+  el.classList.toggle("on", cls === "on");
+  el.classList.toggle("wait", cls === "wait");
+}
+
+function busy(on) {
+  $("msg").disabled = !on;
+  $("send").disabled = !on;
+  $("disconnect").disabled = !on;
+  $("clear").disabled = !on;
+}
+
+function renderMembers() {
+  memberList.replaceChildren();
+  $("memberCount").textContent = members.size ? "(" + members.size + ")" : "";
+  if (members.size === 0) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "no one else here";
+    memberList.append(li);
+    return;
+  }
+  const me = $("user").value.trim();
+  const names = [...members.keys()].sort((a, b) => a.localeCompare(b));
+  for (const name of names) {
+    const li = document.createElement("li");
+    if (name === me) li.className = "me";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    li.append(dot);
+    if (members.get(name)) {
+      const op = document.createElement("span");
+      op.className = "op";
+      op.textContent = "@";
+      li.append(op);
+    }
+    li.append(document.createTextNode(name));
+    memberList.append(li);
+  }
+}
+
+function setTopic(text) {
+  const el = $("topic");
+  if (!text) {
+    el.textContent = "";
+    return;
+  }
+  el.replaceChildren();
+  const hash = document.createElement("span");
+  hash.className = "hash";
+  hash.textContent = "#";
+  el.append(hash);
+  const b = document.createElement("b");
+  b.textContent = "topic: ";
+  el.append(b);
+  el.append(document.createTextNode(text));
+}
+
+// The page exchanges credentials for a one-shot ticket instead of putting them in
+// the WebSocket URL, so nothing sensitive lands in a URL, proxy log, or devtools
+// handshake view. Bridge path: /ws/<percent-encoded channel>?ticket=&history=N.
+function bridgeUrl(ticket) {
+  const channel = $("channel").value.trim().replace(/^#*/, "#");
+  const host = $("host").value.trim() || location.host;
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  const query = new URLSearchParams({ ticket: ticket, history: String(BACKFILL) });
+  return scheme + "://" + host + "/ws/" + encodeURIComponent(channel) + "?" + query.toString();
+}
+
+async function mintTicket(user, secret) {
+  const host = $("host").value.trim();
+  const scheme = location.protocol === "https:" ? "https://" : "http://";
+  const origin = host ? scheme + host : location.origin;
+  const res = await fetch(origin + "/auth", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ user: user, password: secret }),
+  });
+  if (res.status === 401) throw new Error("invalid credentials");
+  if (!res.ok) throw new Error("login failed (HTTP " + res.status + ")");
+  const data = await res.json();
+  if (!data.ticket) throw new Error("no ticket in response");
+  return data.ticket;
+}
+
+// Send a slash command over the bridge. The server answers with `* ...` system
+// lines, which the normal showLine path renders. Returns true if the command was
+// a recognized slash command (so the composer does not also send it as a message).
+function sendSlash(text) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(text);
+  return true;
+}
+
+function showLine(raw) {
+  const line = raw.replace(/[\r\n]+$/, "");
+  if (!line) return;
+  const me = $("user").value.trim();
+  const privmsg = /^PRIVMSG (\S+) (\S+) :([\s\S]*)$/.exec(line);
+  if (privmsg) {
+    const target = privmsg[1];
+    const from = privmsg[2];
+    // A DM is a PRIVMSG whose target is a username, not a channel.
+    const isDm = !target.startsWith("#");
+    const kind = from === me ? "mine" : (isDm ? "dm" : "");
+    row(privmsg[3], kind, from);
+    return;
+  }
+  // A NICK broadcast renames a member in the roster. The old name is dropped
+  // and the new one takes its place (keeping op status), so the sidebar stays
+  // in sync with the server's membership.
+  const nick = /^NICK (\S+) (\S+)$/.exec(line);
+  if (nick) {
+    if (members.has(nick[1])) {
+      const wasOp = members.get(nick[1]);
+      members.delete(nick[1]);
+      members.set(nick[2], wasOp);
+      renderMembers();
+    }
+    return sys("* " + nick[1] + " is now known as " + nick[2]);
+  }
+  const action = /^ACTION (\S+) (\S+) :([\s\S]*)$/.exec(line);
+  if (action) {
+    row("* " + action[3], "action", action[2]);
+    return;
+  }
+  const joined = /^JOIN (\S+) (\S+)$/.exec(line);
+  if (joined) {
+    members.set(joined[2], false);
+    renderMembers();
+    return sys("* " + joined[2] + " joined " + joined[1]);
+  }
+  const quit = /^QUIT (\S+) (\S+)$/.exec(line);
+  if (quit) {
+    members.delete(quit[2]);
+    renderMembers();
+    return sys("* " + quit[2] + " left " + quit[1]);
+  }
+  const kick = /^KICK (\S+) (\S+)$/.exec(line);
+  if (kick) {
+    members.delete(kick[2]);
+    renderMembers();
+    return sys("* " + kick[2] + " was kicked from " + kick[1]);
+  }
+  const op = /^OP (\S+) (\S+)$/.exec(line);
+  if (op) {
+    members.set(op[2], true);
+    renderMembers();
+    return sys("* " + op[2] + " is now an operator of " + op[1]);
+  }
+  const deop = /^DEOP (\S+) (\S+)$/.exec(line);
+  if (deop) {
+    members.set(deop[2], false);
+    renderMembers();
+    return sys("* " + deop[2] + " is no longer an operator of " + deop[1]);
+  }
+  // Roster seed: `NAMES <channel> <user> <op>` sent on connect so the sidebar
+  // is correct before any JOIN/QUIT broadcast arrives.
+  const names = /^NAMES (\S+) (\S+) ([01])$/.exec(line);
+  if (names) {
+    members.set(names[2], names[3] === "1");
+    renderMembers();
+    return;
+  }
+  const topic = /^TOPIC (\S+) ([\s\S]*)$/.exec(line);
+  if (topic) {
+    setTopic(topic[2]);
+    return sys("* topic set to: " + topic[2]);
+  }
+  // Server control line: the bridge is being torn down server-side.
+  if (line.startsWith("KICKED")) {
+    stopped = true;
+    members.clear();
+    renderMembers();
+    return err("* " + line + " — you are no longer in this channel");
+  }
+  sys(line);
+}
+
+function scheduleRetry() {
+  if (stopped || retryTimer) return;
+  // Exponential backoff, capped, so a down server is not hammered.
+  const delay = Math.min(RETRY_MAX, RETRY_MIN * Math.pow(2, attempts));
+  attempts += 1;
+  setStatus("reconnecting in " + Math.round(delay / 1000) + "s…", "wait");
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    open();
+  }, delay);
+}
+
+async function open() {
+  const user = $("user").value.trim();
+  const secret = $("password").value;
+  if (!user || !secret) {
+    stopped = true;
+    setStatus("offline", null);
+    return err("nick and password are both required");
+  }
+
+  let ticket;
+  try {
+    setStatus(attempts ? "reconnecting…" : "authorizing…", "wait");
+    ticket = await mintTicket(user, secret);
+  } catch (e) {
+    err(String(e.message || e));
+    // Bad credentials will not get better by retrying.
+    stopped = true;
+    setStatus("offline", null);
+    return;
+  }
+  if (stopped) return;
+
+  // Replayed history arrives as ordinary message frames on connect, so start each
+  // attempt from a clean log rather than duplicating what is already on screen.
+  log.replaceChildren();
+  members.clear();
+  renderMembers();
+  setTopic("");
+  currentChannel = $("channel").value.trim().replace(/^#*/, "#");
+  sys("connecting to channel " + currentChannel + " as " + user);
+
+  try {
+    socket = new WebSocket(bridgeUrl(ticket));
+  } catch (e) {
+    return err("bad connection URL: " + e.message);
+  }
+
+  socket.onopen = () => {
+    attempts = 0;
+    setStatus("online", "on");
+    busy(true);
+    $("msg").focus();
+  };
+  socket.onmessage = (event) => showLine(String(event.data));
+  socket.onerror = () => {
+    if (!stopped) err("websocket error — is the server still up?");
+  };
+  socket.onclose = (event) => {
+    socket = null;
+    busy(false);
+    if (stopped) {
+      setStatus("offline", null);
+      sys("disconnected" + (event.code ? " (code " + event.code + ")" : ""));
+      return;
+    }
+    sys("connection lost" + (event.code ? " (code " + event.code + ")" : "") + " — retrying");
+    scheduleRetry();
+  };
+}
+
+// A ticket is single-use, so reconnecting mints a fresh one from these fields.
+function connect() {
+  stopped = false;
+  attempts = 0;
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  if (socket) {
+    socket.onclose = null;
+    socket.close();
+    socket = null;
+  }
+  open();
+}
+
+function disconnect() {
+  stopped = true;
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  if (socket) {
+    socket.onclose = null;
+    socket.close();
+    socket = null;
+  }
+  busy(false);
+  setStatus("offline", null);
+  members.clear();
+  renderMembers();
+  currentChannel = "";
+  sys("disconnected");
+}
+
+// Remember the fields (never the password) so a reload reconnects quickly.
+const remembered = ["host", "channel", "user"];
+for (const id of remembered) {
+  const saved = localStorage.getItem("chat." + id);
+  if (saved !== null) $(id).value = saved;
+}
+$("settings").addEventListener("submit", (event) => {
+  event.preventDefault();
+  for (const id of remembered) localStorage.setItem("chat." + id, $(id).value);
+  connect();
+});
+
+// Create an account, then connect with it. The server registers and logs us in
+// in one step, so a fresh nick goes straight to the channel.
+$("register").addEventListener("click", async () => {
+  const user = $("user").value.trim();
+  const secret = $("password").value;
+  if (!user || !secret) {
+    return err("nick and password are both required to create an account");
+  }
+  const host = $("host").value.trim();
+  const scheme = location.protocol === "https:" ? "https://" : "http://";
+  const origin = host ? scheme + host : location.origin;
+  const btn = $("register");
+  btn.disabled = true;
+  try {
+    const res = await fetch(origin + "/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user: user, password: secret }),
+    });
+    if (res.status === 409) throw new Error("username taken — pick another nick");
+    if (!res.ok) throw new Error("registration failed (HTTP " + res.status + ")");
+    const data = await res.json();
+    if (!data.ticket) throw new Error("no ticket in response");
+    for (const id of remembered) localStorage.setItem("chat." + id, $(id).value);
+    sys("account created — connecting as " + user);
+    connect();
+  } catch (e) {
+    err(String(e.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+});
+$("composer").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = $("msg");
+  // Inbound frames are the raw message body, not protocol lines: send "hi",
+  // never "PRIVMSG #general :hi". A leading "/" is a slash command, which the
+  // server handles and answers with "* ..." system lines.
+  const text = input.value.trim();
+  if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+  if (text.startsWith("/")) {
+    sendSlash(text);
+  } else {
+    socket.send(text);
+    row(text, "mine", $("user").value.trim());
+  }
+  input.value = "";
+  input.focus();
+});
+$("disconnect").addEventListener("click", disconnect);
+$("clear").addEventListener("click", () => {
+  log.replaceChildren();
+});
+// Pause auto-scroll while the user reads up; resume when they return to bottom.
+log.addEventListener("scroll", () => {
+  pinned = log.scrollTop + log.clientHeight < log.scrollHeight - 8;
+});
+sys("New here? Pick a nick and password, then click Create account to register and connect. Returning? Just Connect. Connecting joins the channel and replays recent history. Type /help for commands.");
+</script>
+</body>
+</html>

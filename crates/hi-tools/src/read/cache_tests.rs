@@ -131,3 +131,63 @@ async fn cached_read_rejects_replacement_with_a_fifo_without_blocking() {
         "{result:#}"
     );
 }
+
+#[tokio::test]
+async fn third_full_read_of_same_path_returns_a_reminder() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    std::fs::write(&path, "hello\n").unwrap();
+    let cache = std::sync::Mutex::new(ReadCache::new());
+    let args = r#"{"path":"source.rs"}"#;
+    let first = run_read(root.path(), &cache, args).await.unwrap();
+    let second = run_read(root.path(), &cache, args).await.unwrap();
+    let third = run_read(root.path(), &cache, args).await.unwrap();
+    assert!(first.content.contains("hello"));
+    assert!(second.content.contains("hello"));
+    assert!(
+        third.content.contains("Already returned"),
+        "third full read must not dump the file again: {}",
+        third.content
+    );
+    let paged = run_read(
+        root.path(),
+        &cache,
+        r#"{"path":"source.rs","offset":1,"limit":10}"#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        paged.content.contains("hello"),
+        "offset/limit paging must still work: {}",
+        paged.content
+    );
+}
+
+#[tokio::test]
+async fn seventeenth_paged_read_of_same_path_returns_a_reminder() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    std::fs::write(&path, "hello\n").unwrap();
+    let cache = std::sync::Mutex::new(ReadCache::new());
+    for offset in 1..=16 {
+        let args = format!(r#"{{"path":"source.rs","offset":{offset},"limit":10}}"#);
+        let page = run_read(root.path(), &cache, &args).await.unwrap();
+        assert!(
+            !page.content.contains("Already read"),
+            "page {offset} must still return the file: {}",
+            page.content
+        );
+    }
+    let seventeenth = run_read(
+        root.path(),
+        &cache,
+        r#"{"path":"source.rs","offset":17,"limit":10}"#,
+    )
+    .await
+    .unwrap();
+    assert!(
+        seventeenth.content.contains("Already read"),
+        "seventeenth page of the same path must not dump again: {}",
+        seventeenth.content
+    );
+}

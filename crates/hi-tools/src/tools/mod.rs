@@ -852,7 +852,8 @@ async fn execute_in_impl(
     name: &str,
     arguments: &str,
 ) -> ToolOutcome {
-    let mut outcome = match run(root, state_root, resources, name, arguments).await {
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    let mut outcome = match run(root, state_root, resources, name, arguments.as_ref()).await {
         Ok(output) => output,
         Err(err) => {
             let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
@@ -944,15 +945,24 @@ async fn execute_streaming_in_impl(
     arguments: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
 ) -> ToolOutcome {
-    let mut outcome =
-        match run_streaming(root, state_root, resources, name, arguments, on_line).await {
-            Ok(output) => output,
-            Err(err) => {
-                let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
-                outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
-                outcome
-            }
-        };
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    let mut outcome = match run_streaming(
+        root,
+        state_root,
+        resources,
+        name,
+        arguments.as_ref(),
+        on_line,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let mut outcome = ToolOutcome::failed(format!("Error: {err:#}"));
+            outcome.effects.mutation_attempted = mutation_attempted_by_tool(name);
+            outcome
+        }
+    };
     redact_tool_output(&mut outcome);
     outcome
 }
@@ -1521,7 +1531,8 @@ async fn run_lsp_hover(
 }
 
 pub(crate) fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> {
-    serde_json::from_str(arguments).context("invalid tool arguments")
+    let arguments = hi_ai::normalize_file_tool_arguments(arguments);
+    serde_json::from_str(arguments.as_ref()).context("invalid tool arguments")
 }
 
 #[cfg(test)]
@@ -1922,7 +1933,7 @@ mod tests {
 
     #[test]
     fn numbered_read_under_read_budget_is_not_head_tailed() {
-        // A SPEC.md-sized numbered page is well under the 64k read budget but
+        // A SPEC.md-sized numbered page is well under the 16k read budget but
         // over the shared 5k cap. Clipping it at 5k hid the middle of the spec,
         // then skip-reread treated the file as complete.
         let body: String = (1..=300)
@@ -2335,6 +2346,73 @@ mod tests {
             crate::prepare_mutation_in_with_state(&dir, &state, "write", create)
                 .await
                 .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_accepts_cursor_path_aliases() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-write-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&state).unwrap();
+        let args = r#"{"filePath":"notes.txt","contents":"hello\n"}"#;
+        crate::prepare_mutation_in_with_state(&dir, &state, "write", args)
+            .await
+            .expect("filePath/contents must parse as write");
+        let outcome = execute_in(&dir, "write", args).await;
+        assert_eq!(
+            outcome.status,
+            crate::ToolStatus::Succeeded,
+            "aliased write must execute: {}",
+            outcome.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "hello\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn write_refuses_snippet_overwrite_of_existing_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-write-snippet-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&state).unwrap();
+        let existing = "fn keep_me() {}\n".repeat(40);
+        assert!(existing.len() > 512);
+        std::fs::write(dir.join("lib.rs"), &existing).unwrap();
+        let args = serde_json::json!({
+            "filePath": "lib.rs",
+            "contents": "let x = 1;"
+        })
+        .to_string();
+        let err = crate::prepare_mutation_in_with_state(&dir, &state, "write", &args)
+            .await
+            .expect_err("snippet overwrite must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("much smaller") && msg.contains("edit"),
+            "{msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("lib.rs")).unwrap(),
+            existing
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

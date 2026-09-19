@@ -383,7 +383,9 @@ pub enum LayoutApplyOutcome {
         error: StoreError,
         snapshot: WorkspaceSnapshot,
     },
-    Failed { error: StoreError },
+    Failed {
+        error: StoreError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
