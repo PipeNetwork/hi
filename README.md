@@ -48,6 +48,10 @@ hi -m pipe/deepseek-v4-flash-0731 "…"
 
 The coding harness is `hi-harness`: stream chat completions from Pipe, execute local tools (`read`/`write`/`edit`/`bash`/`grep`/`glob`/`list` plus repo/LSP helpers), persist JSONL sessions, `/undo` via git checkpoints. Turns run until the model stops or you cancel. `/verify` is a post-turn check, not auto-repair.
 
+Selecting `pipe/auto` opts into [managed coding](docs/managed-coding.md) when your
+project is eligible: buffered verification, local tool permissions, provider-cost
+credit billing, and durable recovery with default $1 call / $20 turn budgets.
+
 ```bash
 hi --verify "cargo test" "fix the failing tests"
 hi -q "summarize src/lib.rs"

@@ -1,6 +1,6 @@
 //! Prompt → Pipe stream → tools → repeat until the model stops.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use hi_ai::{Content, Message, Role, Usage};
 use hi_liveness::{ENV_TURN_INTENT, TurnIntent};
 use hi_tools::checkpoint;
@@ -72,7 +72,18 @@ impl Harness {
         if !resume {
             self.turn_effort = None;
         }
-        let effort_join = self.spawn_turn_start_effort(resume, input);
+        let managed_turn = self.model() == "pipe/auto";
+        if let Some(pending) = &self.pending_turn {
+            self.client.validate_pending_workflow(
+                &format!("{}:{}", pending.turn_index, pending.started_unix_ms),
+                managed_turn,
+            )?;
+        }
+        let effort_join = if managed_turn {
+            None
+        } else {
+            self.spawn_turn_start_effort(resume, input)
+        };
         let pre = if resume {
             self.pending_turn
                 .as_ref()
@@ -120,6 +131,19 @@ impl Harness {
             self.messages.push(Message::user(input));
             self.begin_persisted_turn(input, pre.as_deref())
         };
+        if self.model() == "pipe/auto" {
+            let pending = self
+                .pending_turn
+                .as_ref()
+                .context("managed coding requires a persisted pending turn")?;
+            self.client.begin_managed_turn(
+                format!("{}:{}", pending.turn_index, pending.started_unix_ms),
+                resume,
+            )?;
+            if resume {
+                self.client.recover_managed_tools(&mut self.messages)?;
+            }
+        }
         let mut turn_usage = Usage::default();
         let mut changed = Vec::new();
         let mut mutated = false;
@@ -131,6 +155,13 @@ impl Harness {
         let mut typesafe_calls = 0u32;
         let intent = Intent::from_prompt(&completion::latest_prompt_text(&self.messages, input));
         let mut facts = TurnFacts::new(intent, completion::plan_is_open(&self.plan));
+        if managed_turn && resume {
+            let (was_mutated, was_verified, paths) = self.client.recovered_managed_progress()?;
+            mutated = was_mutated;
+            changed = paths;
+            facts.mutated = was_mutated;
+            facts.ran_verify = was_verified;
+        }
         let mut continue_hint: Option<&str> = None;
 
         // Continues until the completion policy says Complete/Error, the user
@@ -187,11 +218,16 @@ impl Harness {
             let mut on_event = |delta: StreamDelta| {
                 liveness.note_progress();
                 match delta {
+                    StreamDelta::Status(text) => ui.status(&text),
                     StreamDelta::Text(text) => ui.assistant_text(&text),
                     StreamDelta::Reasoning(text) => ui.assistant_reasoning(&text),
                 }
             };
             let model = self.model();
+            anyhow::ensure!(
+                (model == "pipe/auto") == managed_turn,
+                "managed workflow selection changed during an active turn; finish or cancel this turn before switching"
+            );
             let completion = match self
                 .client
                 .stream(
@@ -403,9 +439,17 @@ impl Harness {
             self.messages.push(assistant_message(&completion));
             self.liveness
                 .set_state(hi_liveness::HarnessState::ExecutingTool);
-            let auto_hints = self.score_tool_autos(&completion.tool_calls).await;
+            let auto_hints = if managed_turn {
+                Default::default()
+            } else {
+                self.score_tool_autos(&completion.tool_calls).await
+            };
             for (i, call) in completion.tool_calls.iter().enumerate() {
                 if cancel.is_cancelled() {
+                    if model == "pipe/auto" {
+                        self.client
+                            .managed_tool_complete(&call.id, &interrupted_outcome())?;
+                    }
                     self.messages.push(Message::tool_result(
                         &call.id,
                         interrupted_outcome().content,
@@ -416,17 +460,28 @@ impl Harness {
                     .get(&call.id)
                     .copied()
                     .unwrap_or(AutoHint::Heuristic);
-                let outcome = self
-                    .tools
-                    .execute_with_auto(
-                        &call.id,
-                        &call.name,
-                        &call.arguments,
-                        || self.permission_mode(),
-                        auto,
-                        ui,
-                    )
-                    .await;
+                let cached = if model == "pipe/auto" {
+                    self.client.managed_tool_start(&call.id)?
+                } else {
+                    None
+                };
+                let outcome = if let Some(outcome) = cached {
+                    outcome
+                } else {
+                    self.tools
+                        .execute_with_auto(
+                            &call.id,
+                            &call.name,
+                            &call.arguments,
+                            || self.permission_mode(),
+                            auto,
+                            ui,
+                        )
+                        .await
+                };
+                if model == "pipe/auto" {
+                    self.client.managed_tool_complete(&call.id, &outcome)?;
+                }
                 ui.tool_call_id(&call.id, &call.name, &call.arguments);
                 if looks_like_verify(&call.name, &call.arguments) {
                     facts.ran_verify = true;
@@ -464,8 +519,14 @@ impl Harness {
                     }
                 }
                 self.last_changed_files = changed.clone();
-                self.messages
-                    .push(Message::tool_result(&call.id, outcome.content.clone()));
+                self.messages.push(Message::tool_result(
+                    &call.id,
+                    if model == "pipe/auto" {
+                        crate::managed::reported_outcome(&outcome)
+                    } else {
+                        outcome.content.clone()
+                    },
+                ));
                 if hi_tools::is_probe_refusal(&outcome.content) {
                     probe_refusals = probe_refusals.saturating_add(1);
                     repeat_stop = Some(repeat_stop_summary(&outcome.content));
@@ -486,6 +547,10 @@ impl Harness {
                         "supervised sessions auto-repair when compact has failed; otherwise /retry",
                     );
                     for later in &completion.tool_calls[i + 1..] {
+                        if managed_turn {
+                            self.client
+                                .managed_tool_complete(&later.id, &interrupted_outcome())?;
+                        }
                         self.messages.push(Message::tool_result(
                             &later.id,
                             interrupted_outcome().content,
@@ -537,6 +602,7 @@ impl Harness {
             if let Decision::Continue { demand, .. } = decision
                 && matches!(demand, Demand::Edit | Demand::Verify | Demand::Verdict)
                 && stall_only
+                && !managed_turn
                 && typesafe_calls < 2
             {
                 typesafe_calls = typesafe_calls.saturating_add(1);
@@ -672,6 +738,9 @@ impl Harness {
         ui: &mut dyn Ui,
         cancel: &TurnCancellation,
     ) -> Result<bool> {
+        if self.model() == "pipe/auto" {
+            self.client.begin_managed_auxiliary()?;
+        }
         self.reclaim_context(user_context, ui, cancel, true).await
     }
 
@@ -712,7 +781,7 @@ impl Harness {
         }
         let mut changed = false;
         let mut jev_applied = false;
-        if self.jev_compact_ready() {
+        if self.model() != "pipe/auto" && self.jev_compact_ready() {
             match self.apply_jev_prune(user_context, ui, cancel).await {
                 Ok(true) => {
                     changed = true;
@@ -787,7 +856,10 @@ impl Harness {
             }
             bail!("compaction model did not return a <summary> block");
         };
-        let next = apply_summary(&self.messages, &summary);
+        let mut next = apply_summary(&self.messages, &summary);
+        if model == "pipe/auto" {
+            crate::managed::retain_execution_evidence(&self.messages, &mut next);
+        }
         if !self.replace_messages_persisting(next) {
             return Ok(changed);
         }
@@ -805,7 +877,10 @@ impl Harness {
             hi_liveness::InvariantCode::CompactFailedOverWindow,
         );
         let summary = emergency_summary(self.occupancy_percent());
-        let next = apply_summary(&self.messages, &summary);
+        let mut next = apply_summary(&self.messages, &summary);
+        if self.model() == "pipe/auto" {
+            crate::managed::retain_execution_evidence(&self.messages, &mut next);
+        }
         if !self.replace_messages_persisting(next) {
             return false;
         }
@@ -848,7 +923,10 @@ impl Harness {
         if preserve_current_turn && !self.should_cheap_shrink() {
             return false;
         }
-        let (next, shrunk) = cheap_shrink_with(&self.messages, preserve_current_turn);
+        let (mut next, shrunk) = cheap_shrink_with(&self.messages, preserve_current_turn);
+        if self.model() == "pipe/auto" {
+            crate::managed::preserve_result_receipts(&self.messages, &mut next);
+        }
         if !shrunk {
             return false;
         }
@@ -1076,7 +1154,7 @@ fn turn_intent_prompt() -> Option<String> {
     Some(intent.prompt)
 }
 
-fn assistant_message(completion: &PipeCompletion) -> Message {
+pub(crate) fn assistant_message(completion: &PipeCompletion) -> Message {
     let mut content = Vec::new();
     if !completion.reasoning.is_empty() {
         content.push(Content::Thinking {

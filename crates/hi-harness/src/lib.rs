@@ -9,6 +9,8 @@ mod dashboard;
 mod jev_auto;
 mod jev_compact;
 mod live;
+mod managed;
+pub use managed::ManagedSettings;
 mod liveness;
 mod pipe;
 mod prompt;
@@ -139,6 +141,7 @@ pub struct SessionSnapshot {
 }
 
 pub struct HarnessConfig {
+    pub managed: ManagedSettings,
     pub workspace_root: PathBuf,
     pub state_root: PathBuf,
     pub api_key: String,
@@ -164,6 +167,7 @@ impl HarnessConfig {
     pub fn pipe(workspace_root: PathBuf, api_key: impl Into<String>) -> Self {
         let state_root = workspace_root.join(".hi");
         Self {
+            managed: ManagedSettings::default(),
             workspace_root,
             state_root,
             api_key: api_key.into(),
@@ -232,7 +236,14 @@ impl Harness {
         }
         liveness.set_state(hi_liveness::HarnessState::Idle);
         Ok(Self {
-            client: Client::new(config.base_url, config.api_key),
+            client: Client::new(config.base_url, config.api_key).with_managed(
+                config
+                    .session_path
+                    .as_ref()
+                    .map(|p| p.with_extension("managed.json"))
+                    .unwrap_or_else(|| config.state_root.join("managed-turn.json")),
+                config.managed,
+            ),
             tools,
             workspace_root: config.workspace_root,
             state_root: config.state_root,
@@ -280,7 +291,14 @@ impl Harness {
         }
         liveness.set_state(hi_liveness::HarnessState::Idle);
         Ok(Self {
-            client: Client::new(config.base_url, config.api_key),
+            client: Client::new(config.base_url, config.api_key).with_managed(
+                config
+                    .session_path
+                    .as_ref()
+                    .map(|p| p.with_extension("managed.json"))
+                    .unwrap_or_else(|| config.state_root.join("managed-turn.json")),
+                config.managed,
+            ),
             tools,
             workspace_root: config.workspace_root,
             state_root: config.state_root,
@@ -638,6 +656,14 @@ impl Harness {
     }
 
     pub fn context_window(&self) -> u32 {
+        if self.model() == "pipe/auto" {
+            return self
+                .model_windows
+                .get("pipe/auto")
+                .copied()
+                .unwrap_or(64_000)
+                .min(64_000);
+        }
         self.model_windows
             .get(&self.model())
             .copied()
@@ -693,6 +719,14 @@ impl Harness {
     }
 
     pub fn max_tokens(&self) -> u32 {
+        if self.model() == "pipe/auto" {
+            return self.configured_max_tokens.min(8192).min(
+                self.model_output_caps
+                    .get("pipe/auto")
+                    .copied()
+                    .unwrap_or(8192),
+            );
+        }
         let model = self.model();
         effective_coding_agent_max_tokens(
             &model,
@@ -806,6 +840,20 @@ impl Harness {
     }
 
     pub(crate) fn current_occupancy(&self) -> u64 {
+        if self.model() == "pipe/auto" {
+            let messages = self.request_messages(None);
+            let tools = tools::advertised_tools();
+            return serde_json::to_vec(&pipe::build_body(
+                "pipe/auto",
+                &messages,
+                &tools,
+                self.max_tokens(),
+                None,
+            ))
+            .map_or(u64::MAX, |v| {
+                v.len() as u64 + self.max_tokens() as u64 + 1024
+            });
+        }
         let estimated = compact::estimate_message_tokens(&self.messages);
         self.last_context_occupancy.max(estimated)
     }

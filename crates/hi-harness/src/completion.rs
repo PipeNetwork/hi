@@ -589,6 +589,7 @@ pub fn looks_like_verify(name: &str, arguments: &str) -> bool {
         || lower.contains("npm test")
         || lower.contains("npx vitest")
         || lower.contains("pytest")
+        || lower.contains("-m unittest")
         || lower.contains("go test")
 }
 
@@ -679,6 +680,15 @@ mod tests {
 
     fn facts(intent: Intent) -> TurnFacts {
         TurnFacts::new(intent, false)
+    }
+
+    #[test]
+    fn python_unittest_satisfies_the_test_execution_gate() {
+        assert!(looks_like_verify(
+            "bash",
+            r#"{"command":"python3 -m unittest -v"}"#
+        ));
+        assert!(!looks_like_verify("read", r#"{"path":"unittest.py"}"#));
     }
 
     fn open_plan_facts(intent: Intent) -> TurnFacts {

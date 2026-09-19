@@ -29,7 +29,7 @@ pub struct PipeError {
 }
 
 impl PipeError {
-    fn cancelled() -> Self {
+    pub(crate) fn cancelled() -> Self {
         Self {
             status: None,
             message: "cancelled".into(),
@@ -58,14 +58,14 @@ impl std::fmt::Display for PipeError {
 
 impl std::error::Error for PipeError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipeCompletion {
     pub text: String,
     pub reasoning: String,
@@ -92,14 +92,16 @@ impl PipeCompletion {
 }
 
 pub struct PipeClient {
-    http: reqwest::Client,
-    base_url: String,
-    api_key: String,
+    pub(crate) managed: crate::managed::ManagedState,
+    pub(crate) http: reqwest::Client,
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
 }
 
 impl PipeClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
+            managed: Default::default(),
             http: hi_ai::inference_http_client_for_socket(None),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
@@ -156,6 +158,9 @@ impl PipeClient {
         cancel: &TurnCancellation,
     ) -> Result<PipeCompletion> {
         let body = build_body(model, messages, tools, max_tokens, reasoning_effort);
+        if model == "pipe/auto" {
+            return self.stream_managed(body, tools, on_event, cancel).await;
+        }
         let url = format!("{}/chat/completions", self.base_url);
         let mut attempts = 0u32;
         loop {
@@ -219,6 +224,7 @@ impl PipeClient {
 
 #[derive(Debug)]
 pub enum StreamDelta {
+    Status(String),
     Text(String),
     Reasoning(String),
 }
@@ -260,7 +266,7 @@ fn json_u64(value: &Value) -> Option<u64> {
         .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
 }
 
-fn build_body(
+pub(crate) fn build_body(
     model: &str,
     messages: &[Message],
     tools: &[ToolSpec],
@@ -427,12 +433,14 @@ fn parse_models(body: &str) -> Result<Vec<ServedModel>> {
             Some(ServedModel {
                 id,
                 context_window: item
-                    .get("context_window")
+                    .pointer("/managed_coding/limits/context_tokens")
+                    .or_else(|| item.get("context_window"))
                     .or_else(|| item.get("context_length"))
                     .and_then(Value::as_u64)
                     .map(|n| n as u32),
                 max_output_tokens: item
-                    .get("max_output_tokens")
+                    .pointer("/managed_coding/limits/output_tokens")
+                    .or_else(|| item.get("max_output_tokens"))
                     .and_then(Value::as_u64)
                     .map(|n| n as u32),
                 price: None,
@@ -441,9 +449,23 @@ fn parse_models(body: &str) -> Result<Vec<ServedModel>> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 status: None,
-                available: true,
-                availability_reason: None,
-                capabilities: Vec::new(),
+                available: item
+                    .get("managed_coding")
+                    .is_none_or(|c| c["available"] == true),
+                availability_reason: item
+                    .pointer("/managed_coding/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                capabilities: item
+                    .pointer("/managed_coding/capabilities")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect())
@@ -629,7 +651,7 @@ fn part_text(part: &Value) -> Option<String> {
         })
 }
 
-fn parse_usage(value: &Value) -> Usage {
+pub(crate) fn parse_usage(value: &Value) -> Usage {
     let input = value
         .get("prompt_tokens")
         .or_else(|| value.get("input_tokens"))

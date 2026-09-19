@@ -449,6 +449,8 @@ impl serde::Serialize for Config {
 // Omit unset profile fields so saving never materializes defaults.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<hi_harness::ManagedSettings>,
     /// Runtime-only provenance for an automatically merged repository profile.
     /// Such profiles may never name an ambient credential variable.
     #[serde(skip)]

@@ -53,6 +53,18 @@ pub async fn run(
     let mut config = HarnessConfig::pipe(workspace_root.clone(), route.api_key);
     config.state_root = state_root;
     config.model = route.model;
+    config.managed = cli
+        .profile
+        .as_ref()
+        .and_then(|name| file.profiles.get(name))
+        .or_else(|| {
+            file.default_profile
+                .as_ref()
+                .and_then(|name| file.profiles.get(name))
+        })
+        .or_else(|| pipenetwork_profile(file))
+        .and_then(|p| p.managed.clone())
+        .unwrap_or_default();
     config.base_url = route.base_url;
     if settings.provider == ProviderName::Pipenetwork && settings.max_tokens > 0 {
         config.max_tokens = settings.max_tokens;
@@ -109,7 +121,11 @@ pub async fn run(
         let _ = harness.refresh_provider_limits().await;
     }
 
-    if resume.run_incomplete && !use_tui {
+    let managed_resume = harness.model() == "pipe/auto"
+        && prompt.is_none()
+        && harness.can_resume_incomplete(None)
+        && (cli.cont || cli.resume.is_some() || cli.session_file.is_some());
+    if (resume.run_incomplete || managed_resume) && !use_tui {
         let mut ui = StdoutUi {
             quiet: cli.quiet,
             confirm_edits: cli.confirm_edits,
@@ -126,7 +142,7 @@ pub async fn run(
                 bail!(error);
             }
         }
-        if resume.exit_after_resume {
+        if resume.exit_after_resume || (managed_resume && cli.plain) {
             return Ok(());
         }
     }
@@ -140,7 +156,7 @@ pub async fn run(
                 model,
                 history_path: paths::history_path(),
                 startup_prompt: resume.startup_prompt,
-                resume_incomplete: resume.run_incomplete,
+                resume_incomplete: resume.run_incomplete || managed_resume,
                 on_pipenetwork_login: Some(Box::new(move || {
                     write_login_profile(login_config_path.as_deref())
                 })),
