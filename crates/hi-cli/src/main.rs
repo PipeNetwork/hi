@@ -10,6 +10,7 @@ mod pipe_session;
 mod prompt;
 mod review_target;
 mod roster;
+mod runner;
 mod sentinel_exec;
 mod sentinel_resume;
 mod session_files;
@@ -146,6 +147,7 @@ async fn run() -> Result<()> {
 
     let raw_args = std::env::args().collect::<Vec<_>>();
     match raw_args.get(1).map(String::as_str) {
+        Some("runner") if raw_args.len() == 2 => return runner::run().await,
         Some("announcements") => return announcements::run_cli(&raw_args[2..]).await,
         Some("trace") => return trace_cmd::run_cli(&raw_args[2..]),
         Some("tickets") => return tickets::run_cli(&raw_args[2..]).await,
