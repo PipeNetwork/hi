@@ -356,7 +356,7 @@ fn current_turn_kept_tokens(
 ) -> u64 {
     let mut tokens = 0u64;
     for (i, &(mi, ci)) in eligible.iter().enumerate() {
-        if stub[i] || !last_user.is_some_and(|user| mi > user) {
+        if stub[i] || last_user.is_none_or(|user| mi <= user) {
             continue;
         }
         tokens = tokens.saturating_add(tool_result_tokens(&messages[mi].content[ci]));
@@ -406,10 +406,7 @@ fn next_current_turn_stub_index(
         .rposition(|&(mi, _)| last_user.is_some_and(|user| mi > user))?;
     let keepers = unique_path_keeper_indices(messages, eligible, stub, names);
     let inspect = eligible.iter().enumerate().position(|(i, &(mi, ci))| {
-        if i == newest
-            || stub[i]
-            || keepers.contains(&i)
-            || !last_user.is_some_and(|user| mi > user)
+        if i == newest || stub[i] || keepers.contains(&i) || last_user.is_none_or(|user| mi <= user)
         {
             return false;
         }

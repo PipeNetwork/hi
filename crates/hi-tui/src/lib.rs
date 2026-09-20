@@ -55,9 +55,6 @@ use anyhow::Result;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-#[cfg(test)]
-use ratatui::Terminal;
-
 /// Info about a configured profile, for the `/provider` list and picker.
 #[derive(Clone, Debug)]
 pub struct ProfileInfo {

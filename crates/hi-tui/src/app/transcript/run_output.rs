@@ -227,6 +227,19 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
+pub(super) fn bash_output_is_idle(result: &str) -> bool {
+    result.lines().next().is_some_and(|status| {
+        status.contains("still running — no new output")
+            || status.contains("running — no new output")
+    })
+}
+
+pub(super) fn is_missing_background_process_result(result: &str) -> bool {
+    result
+        .trim_start()
+        .starts_with("Error: no background process")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,17 +255,4 @@ mod tests {
         assert!(std::str::from_utf8(body.as_bytes()).is_ok());
         let _ = body.chars().count();
     }
-}
-
-pub(super) fn bash_output_is_idle(result: &str) -> bool {
-    result.lines().next().is_some_and(|status| {
-        status.contains("still running — no new output")
-            || status.contains("running — no new output")
-    })
-}
-
-pub(super) fn is_missing_background_process_result(result: &str) -> bool {
-    result
-        .trim_start()
-        .starts_with("Error: no background process")
 }

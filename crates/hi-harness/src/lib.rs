@@ -674,7 +674,7 @@ impl Harness {
     /// window must not disable shrinking; the model still falls apart well
     /// before that.
     pub(crate) fn working_context_window(&self) -> u32 {
-        self.context_window().min(DEFAULT_CONTEXT_WINDOW).max(1)
+        self.context_window().clamp(1, DEFAULT_CONTEXT_WINDOW)
     }
 
     pub fn context_window_source(&self) -> &'static str {

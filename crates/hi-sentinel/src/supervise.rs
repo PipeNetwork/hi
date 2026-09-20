@@ -307,7 +307,7 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
                 }
                 let repair = match class.as_ref() {
                     Some(class) if class.is_harness_bug() => {
-                        maybe_run_repair(&cfg, class, incident_dir.as_deref(), &runtime, true).await
+                        maybe_run_repair(cfg, class, incident_dir.as_deref(), &runtime, true).await
                     }
                     _ => RepairReport::default(),
                 };
@@ -366,7 +366,7 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
             _ = tokio::time::sleep(cfg.monitor.poll_interval) => {
                 if ipc::take_request(&runtime, ipc::REQUEST_DIAGNOSE) {
                     match incident::write_diagnose_bundle(
-                        &cfg,
+                        cfg,
                         &runtime,
                         monitor.last_heartbeat(),
                     ) {
@@ -506,7 +506,7 @@ async fn run_generation(cfg: &SupervisorConfig) -> Result<SupervisorOutcome> {
                     );
                     let incident_dir = bundle.ok().map(|b| b.dir);
                     let repair =
-                        maybe_run_repair(&cfg, &class, incident_dir.as_deref(), &runtime, true)
+                        maybe_run_repair(cfg, &class, incident_dir.as_deref(), &runtime, true)
                             .await;
                     if repair.relaunch.is_none() {
                         report_user(&class, incident_dir.as_ref(), repair.note.as_deref());
@@ -685,6 +685,10 @@ async fn maybe_run_repair(
     report
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep verified repair inputs explicit at the apply boundary"
+)]
 fn apply_verified(
     cfg: &SupervisorConfig,
     class: &Class,
@@ -811,6 +815,10 @@ async fn run_manual_repair(
     Ok(0)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Shutdown needs the process, terminal, and in-flight repair state"
+)]
 async fn exit_user_stop(
     child: &mut Child,
     pgid: i32,

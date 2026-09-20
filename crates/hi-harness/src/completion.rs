@@ -938,7 +938,7 @@ mod tests {
                 &[read_call(
                     &format!("p{i}"),
                     "src/server.rs",
-                    Some((i as u32 + 1) * 200),
+                    Some((i + 1) * 200),
                 )],
             );
         }

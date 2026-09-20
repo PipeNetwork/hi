@@ -216,7 +216,7 @@ fn collect_jsonl(
     };
     for entry in read.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "jsonl") {
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
             continue;
         }
         let modified = fs::metadata(&path)

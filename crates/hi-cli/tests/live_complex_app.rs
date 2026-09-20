@@ -1042,22 +1042,20 @@ fn assert_live_turn(label: &str, turn: &LiveTurn, expect: LiveExpect) {
         );
     }
     let mutated = last_mutation_index(&turn.tools).is_some() || !turn.files.is_empty();
-    if expect.require_files || expect.require_post_mutation_verify {
-        if mutated {
-            let verify = last_verify_index(&turn.tools);
-            let mutation = last_mutation_index(&turn.tools);
-            assert!(
-                match (mutation, verify) {
-                    (Some(mutation), Some(verify)) => verify > mutation,
-                    (None, Some(_)) => true,
-                    _ => false,
-                },
-                "{label} patched files but did not re-run cargo test/check after the last edit: \
+    if (expect.require_files || expect.require_post_mutation_verify) && mutated {
+        let verify = last_verify_index(&turn.tools);
+        let mutation = last_mutation_index(&turn.tools);
+        assert!(
+            match (mutation, verify) {
+                (Some(mutation), Some(verify)) => verify > mutation,
+                (None, Some(_)) => true,
+                _ => false,
+            },
+            "{label} patched files but did not re-run cargo test/check after the last edit: \
                  files={:?} tools={:?}",
-                turn.files,
-                turn.names
-            );
-        }
+            turn.files,
+            turn.names
+        );
     }
     if last_mutation_index(&turn.tools).is_some() {
         let after = inspect_after_mutation(&turn.tools);
@@ -1290,10 +1288,10 @@ fn strip_chat_register_ui(html: &str) -> String {
     );
     const START: &str = "\n// Create an account, then connect with it.";
     const END: &str = "\n$(\"composer\").addEventListener";
-    if let (Some(start), Some(end)) = (out.find(START), out.find(END)) {
-        if start < end {
-            out.replace_range(start..end, "");
-        }
+    if let (Some(start), Some(end)) = (out.find(START), out.find(END))
+        && start < end
+    {
+        out.replace_range(start..end, "");
     }
     out
 }

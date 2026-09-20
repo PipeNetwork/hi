@@ -206,11 +206,7 @@ impl Harness {
                         self.compact_suppressed = true;
                     }
                 }
-                if self.should_auto_compact() {
-                    self.compact_suppressed = true;
-                } else {
-                    self.compact_suppressed = false;
-                }
+                self.compact_suppressed = self.should_auto_compact();
             }
             ui.status(&format!("pipe · {}", self.model()));
             self.liveness
