@@ -77,6 +77,9 @@ jobs:
           -p hi-liveness -p hi-sentinel
           --no-default-features
 
+      - name: Independent guest runner lease and detached-tool fence
+        run: python3 tools/test-runner-fence.py --system
+
       - name: Voice feature compile
         run: cargo check -p hi --features voice
 

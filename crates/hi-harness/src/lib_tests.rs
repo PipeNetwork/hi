@@ -17,6 +17,74 @@ fn test_harness(url: &str, workspace: PathBuf) -> Harness {
 }
 
 #[tokio::test]
+async fn supervisor_fences_dispatch_and_waits_for_checkpoint_before_another_call() {
+    struct FencedUi {
+        active: bool,
+        checkpoints: usize,
+    }
+    impl Ui for FencedUi {
+        fn dispatch_allowed(&self) -> bool {
+            self.active
+        }
+        fn mutation_batch_complete(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            self.checkpoints += 1;
+            Box::pin(async { false })
+        }
+        fn assistant_text(&mut self, _: &str) {}
+        fn assistant_reasoning(&mut self, _: &str) {}
+        fn assistant_end(&mut self) {}
+        fn tool_call(&mut self, _: &str, _: &str) {}
+        fn tool_result(&mut self, _: &str, _: &str) {}
+        fn status(&mut self, _: &str) {}
+        fn turn_end(&mut self, _: &str) {}
+        fn turn_error(&mut self, _: &str, _: &str, _: &str) {}
+    }
+    let args = serde_json::json!({"path":"receipt.txt","content":"completed mutation"}).to_string();
+    let server = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "mutation", "write", &args),
+            usage_chunk(8, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("This generation must not run"),
+            usage_chunk(4, 1),
+        ]),
+    ])
+    .expect("local fixture listener is required");
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness(&server.url, dir.path().to_owned());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = FencedUi {
+        active: false,
+        checkpoints: 0,
+    };
+    let outcome = harness
+        .run_turn_cancellable("do not dispatch", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Cancelled);
+    assert!(server.bodies.lock().unwrap().is_empty());
+    ui.active = true;
+    let outcome = harness
+        .run_turn_cancellable("write a receipt", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("receipt.txt")).unwrap(),
+        "completed mutation"
+    );
+    assert_eq!(ui.checkpoints, 1);
+    assert_eq!(outcome.stop_reason, TurnStopReason::Cancelled);
+    assert_eq!(
+        server.bodies.lock().unwrap().len(),
+        1,
+        "checkpoint rejection cannot trigger another generation"
+    );
+}
+
+#[tokio::test]
 async fn text_only_turn_completes() {
     let Some(server) = MockPipe::new(vec![Scripted::Sse(vec![
         text_chunk("all good"),

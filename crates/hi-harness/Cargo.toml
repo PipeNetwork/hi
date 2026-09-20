@@ -5,6 +5,7 @@ version.workspace = true
 description = "Pipe Network coding-agent harness: inference, tools, sessions."
 
 [dependencies]
+sha2.workspace = true
 hi-ai.workspace = true
 hi-liveness.workspace = true
 hi-tools.workspace = true

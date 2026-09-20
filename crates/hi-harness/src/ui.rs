@@ -178,6 +178,16 @@ fn file_edit_is_safe(path: &str, diff: &str) -> bool {
 
 /// Events the turn loop emits. Frontends decide how to render them.
 pub trait Ui: Send {
+    /// A supervised frontend can fence dispatch independently of its parent
+    /// process. Checked before inference and before each tool is dispatched.
+    fn dispatch_allowed(&self) -> bool {
+        true
+    }
+    /// Completed tool receipts are durable before this hook. Supervisors use
+    /// it to publish a checkpoint before the next batch or paid generation.
+    fn mutation_batch_complete(&mut self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
     fn assistant_text(&mut self, text: &str);
     fn assistant_reasoning(&mut self, text: &str);
     fn assistant_end(&mut self);

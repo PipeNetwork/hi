@@ -17,6 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+mod control;
 
 const MAX_FRAME: usize = 1_048_576;
 #[derive(Deserialize, Serialize)]
@@ -40,6 +41,11 @@ struct Start {
     /// The control plane's original deadline; never refreshed by resume.
     #[serde(default)]
     deadline_unix_ms: Option<u64>,
+    /// Absolute CLOCK_BOOTTIME milliseconds from the guest's fenced lease.
+    #[serde(default)]
+    lease_until_boot_ms: Option<u64>,
+    #[serde(default)]
+    attempt_id: Option<uuid::Uuid>,
 }
 fn base_url() -> String {
     hi_harness::DEFAULT_BASE_URL.into()
@@ -106,19 +112,121 @@ async fn frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>
 }
 struct JsonUi {
     cancel: TurnCancellation,
+    control: Option<Arc<control::Control>>,
+    terminal_path: Option<PathBuf>,
 }
 impl JsonUi {
-    fn emit(&self, event: &str, data: Value) {
-        let mut out = std::io::stdout().lock();
-        if serde_json::to_writer(&mut out, &json!({"version":1,"event":event,"data":data})).is_err()
-            || out.write_all(b"\n").is_err()
-            || out.flush().is_err()
-        {
-            self.cancel.cancel();
+    fn terminal(&self, data: Value) -> Result<()> {
+        if let Some(path) = &self.terminal_path {
+            let parent = path.parent().context("missing terminal directory")?;
+            let temp = parent.join(format!("terminal-{}.tmp", uuid::Uuid::new_v4()));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            serde_json::to_writer(&mut file, &data)?;
+            file.sync_all()?;
+            ensure!(
+                !path.exists(),
+                "execution attempt already has a terminal receipt"
+            );
+            std::fs::rename(temp, path)?;
+            std::fs::File::open(parent)?.sync_all()?;
         }
+        self.emit("terminal", data);
+        Ok(())
+    }
+    fn emit(&self, event: &str, data: Value) {
+        if self.write_event(event, data).is_err() {
+            self.cancel.cancel();
+            if let Some(control) = &self.control {
+                control.stop_scope();
+            }
+        }
+    }
+    fn write_event(&self, event: &str, data: Value) -> Result<()> {
+        static OUTPUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _output = OUTPUT.lock().unwrap();
+        let mut bytes = serde_json::to_vec(&json!({"version":1,"event":event,"data":data}))?;
+        bytes.push(b'\n');
+        ensure!(
+            bytes.len() <= MAX_FRAME,
+            "runner output exceeds frame limit"
+        );
+        #[cfg(unix)]
+        {
+            let until = control::boot_millis().saturating_add(1000);
+            let mut written = 0;
+            while written < bytes.len() {
+                // A stopped parent can fill the pipe. Check the boot-clock
+                // fence even on a single-thread Tokio runtime under backpressure.
+                ensure!(
+                    self.control
+                        .as_ref()
+                        .map_or_else(|| control::boot_millis() < until, |c| c.output_live()),
+                    "runner output lease expired"
+                );
+                let size = unsafe {
+                    libc::write(
+                        libc::STDOUT_FILENO,
+                        bytes[written..].as_ptr().cast(),
+                        bytes.len() - written,
+                    )
+                };
+                if size > 0 {
+                    written += size as usize;
+                    continue;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                ensure!(
+                    error.kind() == std::io::ErrorKind::WouldBlock,
+                    "runner output connection lost"
+                );
+                let mut fd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                unsafe {
+                    libc::poll(&mut fd, 1, 50);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::io::stdout().write_all(&bytes)?;
+        }
+        Ok(())
     }
 }
 impl Ui for JsonUi {
+    fn dispatch_allowed(&self) -> bool {
+        self.control.as_ref().is_some_and(|control| control.live())
+    }
+    fn mutation_batch_complete(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let Some(control) = &self.control else {
+                return false;
+            };
+            let Ok((id, receipt)) = control.checkpoint() else {
+                return false;
+            };
+            self.emit("checkpoint_required", json!({"checkpoint_id":id}));
+            tokio::select! {
+                _ = self.cancel.cancelled() => false,
+                result = receipt => result.is_ok() && control.live(),
+            }
+        })
+    }
     fn assistant_text(&mut self, text: &str) {
         self.emit("assistant_text", json!({"text":text}));
     }
@@ -178,6 +286,11 @@ fn validate(request: &Start) -> Result<()> {
         "invalid runner limits"
     );
     ensure!(
+        request.operation == "inspect"
+            || (request.lease_until_boot_ms.is_some() && request.attempt_id.is_some()),
+        "execution requires a local supervisor lease and attempt identity"
+    );
+    ensure!(
         (request.operation == "start"
             && request
                 .prompt
@@ -200,16 +313,33 @@ fn validate(request: &Start) -> Result<()> {
 }
 
 pub async fn run() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let flags = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL) };
+        ensure!(
+            flags >= 0
+                && unsafe {
+                    libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK)
+                } >= 0,
+            "cannot configure bounded runner output"
+        );
+    }
     let cancel = TurnCancellation::new();
     let mut ui = JsonUi {
         cancel: cancel.clone(),
+        control: None,
+        terminal_path: None,
     };
     let result = execute(&mut ui, cancel).await;
     if result.is_err() {
-        ui.emit(
-            "terminal",
+        let _ = ui.terminal(
             json!({"status":"requires_action","safe_error":"runner_protocol_or_recovery_failed"}),
         );
+    }
+    // The terminal receipt is already fsynced. Close detached descendants even
+    // if the parent supervisor was stopped after requesting cancellation.
+    if let Some(control) = &ui.control {
+        control.stop_scope();
     }
     result
 }
@@ -221,6 +351,15 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
             .context("runner start frame required")?,
     )?;
     validate(&request)?;
+    if request.operation != "inspect" {
+        ui.control = Some(control::Control::supervised(
+            request
+                .lease_until_boot_ms
+                .context("missing supervisor lease")?,
+            request.attempt_id.context("missing execution attempt")?,
+            cancel.clone(),
+        )?);
+    }
     let workspace = request.workspace.canonicalize()?;
     std::fs::create_dir_all(&request.state_dir)?;
     let state = request.state_dir.canonicalize()?;
@@ -254,6 +393,17 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
         );
         file
     };
+    if request.operation != "inspect" {
+        let attempt = request
+            .attempt_id
+            .context("execution attempt is required")?;
+        let path = state.join(format!("terminal-{attempt}.json"));
+        ensure!(
+            !path.exists(),
+            "execution attempt already completed; inspect its receipt"
+        );
+        ui.terminal_path = Some(path);
+    }
     let binding = state.join("runner.json");
     let session = state.join("session.jsonl");
     let deadline = if request.operation == "start" {
@@ -354,15 +504,29 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
     }
     ui.emit("ready",json!({"run_id":request.run_id,"model":"pipe/auto","deadline":deadline/1000,"deadline_unix_ms":deadline,"permission_policy":"vm_user_full_authority"}));
     let watcher_cancel = cancel.clone();
+    let local_control = ui.control.clone().context("missing supervisor control")?;
+    // Keep this detached timer alive through journal inspection and terminal
+    // output. The attempt cgroup is closed after the terminal receipt is durable.
+    let _lease_timer = tokio::spawn(local_control.clone().watch());
     let controls = tokio::spawn(async move {
         let events = JsonUi {
             cancel: watcher_cancel.clone(),
+            control: Some(local_control.clone()),
+            terminal_path: None,
         };
         loop {
             match frame(&mut input).await {
                 Ok(Some(bytes))=>match serde_json::from_slice::<Value>(&bytes) {
                     Ok(value) if value["version"]==1 && value["operation"]=="status"=>events.emit("status",json!({"state":if watcher_cancel.is_cancelled(){"cancelling"}else{"running"}})),
                     Ok(value) if value["version"]==1 && value["operation"]=="cancel"=>{watcher_cancel.cancel();events.emit("cancellation_requested",json!({}));break;},
+                    Ok(value) if value["version"]==1 && value["operation"]=="lease"=>{
+                        let valid = value["sequence"].as_u64().zip(value["lease_until_boot_ms"].as_u64()).is_some_and(|(sequence,until)|local_control.renew(sequence,until).is_ok());
+                        if !valid {watcher_cancel.cancel();break;}
+                    },
+                    Ok(value) if value["version"]==1 && value["operation"]=="checkpoint_ack"=>{
+                        let valid = value["checkpoint_id"].as_str().and_then(|s|uuid::Uuid::parse_str(s).ok()).zip(value["source_sha"].as_str()).is_some_and(|(id,sha)|local_control.acknowledge(id,sha).is_ok());
+                        if !valid {watcher_cancel.cancel();break;}
+                    },
                     _=>{watcher_cancel.cancel();break;}
                 },
                 _=>{watcher_cancel.cancel();break;}
@@ -417,7 +581,7 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
         key.trim(),
         &managed,
     )?;
-    ui.emit("terminal",json!({"status":match outcome.stop_reason{TurnStopReason::Completed=>"completed",TurnStopReason::Cancelled if timed_out.load(Ordering::Acquire)=>"timed_out",TurnStopReason::Cancelled=>"cancelled",TurnStopReason::Error=>"requires_action"},"tests":outcome.verification.unwrap_or_else(||"missing".into()),"changed_files":outcome.changed_files,"evidence":"client_reported","recovery":inspection}));
+    ui.terminal(json!({"status":match outcome.stop_reason{TurnStopReason::Completed=>"completed",TurnStopReason::Cancelled if timed_out.load(Ordering::Acquire)=>"timed_out",TurnStopReason::Cancelled=>"cancelled",TurnStopReason::Error=>"requires_action"},"tests":outcome.verification.unwrap_or_else(||"missing".into()),"changed_files":outcome.changed_files,"evidence":"client_reported","recovery":inspection}))?;
     Ok(())
 }
 
@@ -436,7 +600,7 @@ mod tests {
     }
     #[test]
     fn no_empty_prompt_or_budget_increase() {
-        let mut req:Start=serde_json::from_value(json!({"version":1,"operation":"start","run_id":uuid::Uuid::new_v4(),"workspace":"/workspace/repo","state_dir":"/state/run","credential_file":"/state/key","prompt":"fix tests"})).unwrap();
+        let mut req:Start=serde_json::from_value(json!({"version":1,"operation":"start","run_id":uuid::Uuid::new_v4(),"workspace":"/workspace/repo","state_dir":"/state/run","credential_file":"/state/key","prompt":"fix tests","lease_until_boot_ms":12345,"attempt_id":uuid::Uuid::new_v4()})).unwrap();
         assert!(validate(&req).is_ok());
         req.prompt = Some(String::new());
         assert!(validate(&req).is_err());

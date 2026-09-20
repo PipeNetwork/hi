@@ -1,10 +1,12 @@
 //! Read-only guest recovery inspection. This never submits or retries inference.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ManagedInspection {
     pub journal_blake3: String,
+    pub journal_sha256: String,
     pub ambiguous_tools: usize,
     pub unretained_responses: usize,
     pub unresolved_calls: usize,
@@ -73,6 +75,7 @@ pub fn inspect_managed_journal(
         .map(|o| o.key.clone());
     Ok(ManagedInspection {
         journal_blake3: blake3::hash(&bytes).to_hex().to_string(),
+        journal_sha256: format!("{:x}", Sha256::digest(&bytes)),
         ambiguous_tools,
         unretained_responses,
         unresolved_calls,

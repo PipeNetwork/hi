@@ -171,6 +171,9 @@ impl Harness {
         // consecutive stall rounds are budgeted; progress is facts (mutation,
         // verify, open plan, visible answer), not prompt-word overlays.
         loop {
+            if !ui.dispatch_allowed() {
+                cancel.cancel();
+            }
             if cancel.is_cancelled() {
                 return self
                     .finish_turn(
@@ -445,6 +448,9 @@ impl Harness {
                 self.score_tool_autos(&completion.tool_calls).await
             };
             for (i, call) in completion.tool_calls.iter().enumerate() {
+                if !ui.dispatch_allowed() {
+                    cancel.cancel();
+                }
                 if cancel.is_cancelled() {
                     if model == "pipe/auto" {
                         self.client
@@ -575,6 +581,9 @@ impl Harness {
             // assistant first leaves a truncated round on disk; resume would
             // replay it and Pipe would reject the request.
             self.persist_turn_progress(&mut persisted_before);
+            if mutated_this_round && !ui.mutation_batch_complete().await {
+                cancel.cancel();
+            }
             if verify_this_round {
                 facts.grant_verify_credit();
             }
