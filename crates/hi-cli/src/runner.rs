@@ -37,6 +37,9 @@ struct Start {
     run_micros: u64,
     #[serde(default = "execution_seconds")]
     execution_seconds: u64,
+    /// The control plane's original deadline; never refreshed by resume.
+    #[serde(default)]
+    deadline_unix_ms: Option<u64>,
 }
 fn base_url() -> String {
     hi_harness::DEFAULT_BASE_URL.into()
@@ -50,11 +53,24 @@ fn run_cap() -> u64 {
 fn execution_seconds() -> u64 {
     3600
 }
-fn seconds() -> u64 {
+fn millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+fn original_deadline(request: &Start, now: u64) -> Result<u64> {
+    let maximum = now
+        .checked_add(request.execution_seconds * 1000)
+        .context("execution deadline overflow")?;
+    let deadline = request.deadline_unix_ms.unwrap_or(maximum);
+    ensure!(
+        deadline > now && deadline <= maximum,
+        "invalid original execution deadline"
+    );
+    Ok(deadline)
 }
 fn usd(n: u64) -> String {
     format!("{}.{:06}", n / 1_000_000, n % 1_000_000)
@@ -70,6 +86,8 @@ struct Binding {
     run_micros: u64,
     deadline: u64,
     execution_seconds: u64,
+    #[serde(default)]
+    deadline_unix_ms: Option<u64>,
 }
 async fn frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
@@ -147,7 +165,8 @@ impl Ui for JsonUi {
 
 fn validate(request: &Start) -> Result<()> {
     ensure!(
-        request.version == 1 && matches!(request.operation.as_str(), "start" | "resume"),
+        request.version == 1
+            && matches!(request.operation.as_str(), "start" | "resume" | "inspect"),
         "unsupported runner protocol"
     );
     ensure!(
@@ -164,7 +183,8 @@ fn validate(request: &Start) -> Result<()> {
                 .prompt
                 .as_ref()
                 .is_some_and(|p| !p.trim().is_empty()))
-            || (request.operation == "resume" && request.prompt.is_none()),
+            || (matches!(request.operation.as_str(), "resume" | "inspect")
+                && request.prompt.is_none()),
         "start requires a prompt; resume uses the original journal"
     );
     let url = url::Url::parse(&request.base_url)?;
@@ -238,7 +258,7 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
     let session = state.join("session.jsonl");
     let deadline = if request.operation == "start" {
         ensure!(!session.exists(), "existing session requires resume");
-        let deadline = seconds() + request.execution_seconds;
+        let deadline = original_deadline(&request, millis())?;
         let record = Binding {
             run_id: request.run_id,
             workspace: workspace.clone(),
@@ -246,8 +266,9 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
             base_url: request.base_url.clone(),
             call_micros: request.call_micros,
             run_micros: request.run_micros,
-            deadline,
+            deadline: deadline / 1000,
             execution_seconds: request.execution_seconds,
+            deadline_unix_ms: Some(deadline),
         };
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -277,19 +298,46 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
                 && record.execution_seconds == request.execution_seconds,
             "resume cannot change original authority or limits"
         );
-        record.deadline
+        let deadline = record
+            .deadline_unix_ms
+            .unwrap_or(record.deadline.saturating_mul(1000));
+        ensure!(
+            request.deadline_unix_ms.is_none_or(|d| d == deadline),
+            "resume cannot change the original absolute deadline"
+        );
+        deadline
     };
-    ensure!(deadline > seconds(), "original execution deadline elapsed");
     let key = std::fs::read_to_string(credential)?;
     ensure!(!key.trim().is_empty(), "runner credential missing");
+    let managed = hi_harness::ManagedSettings {
+        call_budget_usd: usd(request.call_micros),
+        turn_budget_usd: usd(request.run_micros),
+        ..Default::default()
+    };
+    if request.operation == "inspect" {
+        // Read-only inspection is allowed after the deadline for reconciliation.
+        // It does not open a turn or query a provider.
+        let inspection = hi_harness::inspect_managed_journal(
+            &session.with_extension("managed.json"),
+            &request.base_url,
+            key.trim(),
+            &managed,
+        )?;
+        ui.emit(
+            "terminal",
+            json!({"status":"inspected","deadline_unix_ms":deadline,
+            "deadline_elapsed":deadline<=millis(),"recovery":inspection}),
+        );
+        return Ok(());
+    }
+    ensure!(deadline > millis(), "original execution deadline elapsed");
     let mut config = HarnessConfig::pipe(workspace, key.trim());
     config.model = "pipe/auto".into();
-    config.base_url = request.base_url;
+    config.base_url = request.base_url.clone();
     config.state_root = state;
     config.session_path = Some(session.clone());
     config.max_tokens = 8192;
-    config.managed.call_budget_usd = usd(request.call_micros);
-    config.managed.turn_budget_usd = usd(request.run_micros);
+    config.managed = managed.clone();
     // The default balanced managed harness requires buffered verification, disables
     // retrieval/ordinary fallback, and journals auxiliary calls in the same budget.
     config.typesafe = hi_harness::TypesafeSettings::disabled();
@@ -304,7 +352,7 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
             "session has no resumable turn"
         );
     }
-    ui.emit("ready",json!({"run_id":request.run_id,"model":"pipe/auto","deadline":deadline,"permission_policy":"vm_user_full_authority"}));
+    ui.emit("ready",json!({"run_id":request.run_id,"model":"pipe/auto","deadline":deadline/1000,"deadline_unix_ms":deadline,"permission_policy":"vm_user_full_authority"}));
     let watcher_cancel = cancel.clone();
     let controls = tokio::spawn(async move {
         let events = JsonUi {
@@ -325,8 +373,8 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
     let timed_out = Arc::new(AtomicBool::new(false));
     let deadline_reached = timed_out.clone();
     let timer = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(
-            deadline.saturating_sub(seconds()),
+        tokio::time::sleep(std::time::Duration::from_millis(
+            deadline.saturating_sub(millis()),
         ))
         .await;
         deadline_reached.store(true, Ordering::Release);
@@ -361,7 +409,15 @@ async fn execute(ui: &mut JsonUi, cancel: TurnCancellation) -> Result<()> {
     timer.abort();
     signal.abort();
     let outcome = outcome?.context("resume produced no terminal result")?;
-    ui.emit("terminal",json!({"status":match outcome.stop_reason{TurnStopReason::Completed=>"completed",TurnStopReason::Cancelled if timed_out.load(Ordering::Acquire)=>"timed_out",TurnStopReason::Cancelled=>"cancelled",TurnStopReason::Error=>"requires_action"},"tests":outcome.verification.unwrap_or_else(||"missing".into()),"changed_files":outcome.changed_files,"evidence":"client_reported"}));
+    // Release the managed journal lease before inspecting its durable receipt.
+    drop(harness);
+    let inspection = hi_harness::inspect_managed_journal(
+        &session.with_extension("managed.json"),
+        &request.base_url,
+        key.trim(),
+        &managed,
+    )?;
+    ui.emit("terminal",json!({"status":match outcome.stop_reason{TurnStopReason::Completed=>"completed",TurnStopReason::Cancelled if timed_out.load(Ordering::Acquire)=>"timed_out",TurnStopReason::Cancelled=>"cancelled",TurnStopReason::Error=>"requires_action"},"tests":outcome.verification.unwrap_or_else(||"missing".into()),"changed_files":outcome.changed_files,"evidence":"client_reported","recovery":inspection}));
     Ok(())
 }
 
@@ -389,5 +445,16 @@ mod tests {
         assert!(validate(&req).is_ok());
         req.run_micros = 20_000_001;
         assert!(validate(&req).is_err());
+    }
+    #[test]
+    fn server_deadline_can_only_shorten_the_original_window() {
+        let mut req:Start=serde_json::from_value(json!({"version":1,"operation":"start","run_id":uuid::Uuid::new_v4(),"workspace":"/workspace/repo","state_dir":"/state/run","credential_file":"/state/key","prompt":"fix tests","execution_seconds":30})).unwrap();
+        assert_eq!(original_deadline(&req, 10_000).unwrap(), 40_000);
+        req.deadline_unix_ms = Some(25_000);
+        assert_eq!(original_deadline(&req, 10_000).unwrap(), 25_000);
+        req.deadline_unix_ms = Some(40_001);
+        assert!(original_deadline(&req, 10_000).is_err());
+        req.deadline_unix_ms = Some(10_000);
+        assert!(original_deadline(&req, 10_000).is_err());
     }
 }

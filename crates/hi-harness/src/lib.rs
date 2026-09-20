@@ -10,7 +10,7 @@ mod jev_auto;
 mod jev_compact;
 mod live;
 mod managed;
-pub use managed::ManagedSettings;
+pub use managed::{ManagedInspection, ManagedSettings, inspect_managed_journal};
 mod liveness;
 mod pipe;
 mod prompt;

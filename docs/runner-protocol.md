@@ -12,6 +12,9 @@ The first input frame starts a run:
 ```
 
 Frames are at most 1 MiB including their newline. Send prompts only through stdin.
+The supervisor may supply `deadline_unix_ms`, the original server deadline. It
+must be in the future and cannot extend `execution_seconds`; resume must preserve
+it exactly. The `ready` event returns that same millisecond deadline.
 The credential file must be owned by the executing user with no group/other access.
 State and credentials must be outside the checkout. The caller keeps stdin open;
 EOF, malformed control frames, SIGINT, and SIGTERM request cancellation.
@@ -40,6 +43,17 @@ using the same state directory. The guest supervisor must separately enforce
 one run per VM, renew the fenced server lease every 15 seconds, and cancel the
 dedicated process group on lease loss. A missing or ambiguous journal requires
 reconciliation; starting another run is not automatic recovery.
+
+Use `operation: "inspect"` with the original binding and no prompt to inspect
+recovery without inference or tool dispatch. The terminal event has status
+`inspected`, the original deadline, and bounded recovery metadata: the journal's
+BLAKE3 hash, ambiguous tool count, unretained response count, unresolved call count
+and `can_resume`. An unsubmitted prepared request is safe to submit once; a
+submitted request whose response is missing requires reconciliation. Inspection
+also works after the execution deadline, but does not authorize execution.
+Completed runner output includes the same `recovery` object. Its optional
+`accepted_final_key` is the original final-answer idempotency key; the server must
+verify that key under this run's credential before accepting publication evidence.
 
 Managed requests use balanced `pipe/auto`, required buffered verification, retrieval
 off, and the existing local recovery journal. No ambient interactive configuration,

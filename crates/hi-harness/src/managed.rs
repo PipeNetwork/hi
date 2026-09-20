@@ -710,6 +710,8 @@ impl PipeClient {
 }
 
 mod evidence;
+mod inspection;
+pub use inspection::{ManagedInspection, inspect_managed_journal};
 mod response;
 #[cfg(test)]
 mod tests;

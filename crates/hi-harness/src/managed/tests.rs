@@ -52,6 +52,90 @@ fn client(path: &std::path::Path) -> PipeClient {
         .with_managed(path.to_path_buf(), ManagedSettings::default())
 }
 #[test]
+fn guest_inspection_never_replays_ambiguous_tools_or_unretained_responses() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("managed.json");
+    let first = client(&path);
+    first
+        .begin_managed_turn("original-turn".into(), false)
+        .unwrap();
+    first
+        .managed
+        .update(|j| {
+            j.operations.push(Operation {
+                auxiliary: false,
+                key: uuid::Uuid::new_v4().to_string(),
+                input_hash: "input".into(),
+                payload_hash: "payload".into(),
+                payload: "PRIVATE_PROMPT_CANARY".into(),
+                reserved: 1000000,
+                charge: Some(12),
+                unresolved: false,
+                status: "completed".into(),
+                completion: Some(PipeCompletion::default()),
+                tools: BTreeMap::from([("mutation".into(), ToolState::Started)]),
+            });
+            Ok(())
+        })
+        .unwrap();
+    drop(first);
+    let original = fs::read(&path).unwrap();
+    let inspect = || {
+        inspect_managed_journal(
+            &path,
+            "http://127.0.0.1:1/v1",
+            "fixture",
+            &ManagedSettings::default(),
+        )
+        .unwrap()
+    };
+    let unsafe_tool = inspect();
+    assert!(!unsafe_tool.can_resume);
+    assert_eq!(unsafe_tool.ambiguous_tools, 1);
+    assert!(unsafe_tool.accepted_final_key.is_none());
+    assert!(
+        !serde_json::to_string(&unsafe_tool)
+            .unwrap()
+            .contains("PRIVATE_PROMPT_CANARY")
+    );
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(
+        inspect_managed_journal(
+            &path,
+            "http://127.0.0.1:1/v1",
+            "changed",
+            &ManagedSettings::default()
+        )
+        .is_err()
+    );
+    let mut journal: Journal = serde_json::from_slice(&original).unwrap();
+    journal.operations[0].tools.clear();
+    fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let complete = inspect();
+    assert!(complete.can_resume);
+    assert_eq!(
+        complete.accepted_final_key.as_deref(),
+        Some(journal.operations[0].key.as_str())
+    );
+    journal.operations[0].completion = None;
+    fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let lost = inspect();
+    assert!(!lost.can_resume);
+    assert_eq!(lost.unretained_responses, 1);
+    assert!(lost.accepted_final_key.is_none());
+    journal.operations[0].status = "prepared".into();
+    journal.operations[0].unresolved = true;
+    fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    assert!(
+        inspect().can_resume,
+        "a fsynced request never dispatched may be submitted once"
+    );
+    journal.operations[0].status = "submitted".into();
+    fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    assert_eq!(inspect().unresolved_calls, 1);
+    assert!(!inspect().can_resume);
+}
+#[test]
 fn crash_preserves_original_budget_and_never_repeats_started_tool() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("managed.json");
