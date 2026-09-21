@@ -157,7 +157,11 @@ fn turn_report_records_silent_inspect_stop_fields() {
         error: None,
         verification: None,
     };
-    let body = turn_report_json(&outcome, &ui, 4, &[]);
+    let body = turn_report_json(&outcome, &ui, 4, &[], None);
+    assert!(
+        body.get("review").is_none(),
+        "no review key without --spec-review"
+    );
     assert_eq!(body["assistant_response"], "");
     assert_eq!(body["turn_end"], "stopped repeating the same inspect");
     assert_eq!(

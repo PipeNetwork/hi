@@ -36,18 +36,27 @@ struct GateHookJson {
 }
 
 /// Run a single hook command. Returns the result and elapsed time.
+///
+/// The spec's `timeout` wins. Without one, `HI_HOOK_TIMEOUT_SECS` applies as
+/// documented in the handbook; unset or `0` leaves the hook attached until
+/// it exits or the turn is cancelled.
 pub async fn run_hook(
     spec: &HookSpec,
     envelope: &HookEventEnvelope,
     ctx: &RunContext<'_>,
 ) -> (HookRunResult, Duration) {
-    run_hook_with_timeout(
-        spec,
-        envelope,
-        ctx,
-        spec.timeout_secs.map(Duration::from_secs),
-    )
-    .await
+    let timeout = spec
+        .timeout_secs
+        .map(Duration::from_secs)
+        .or_else(|| env_hook_timeout(std::env::var("HI_HOOK_TIMEOUT_SECS").ok().as_deref()));
+    run_hook_with_timeout(spec, envelope, ctx, timeout).await
+}
+
+fn env_hook_timeout(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
 }
 
 async fn run_hook_with_timeout(
@@ -437,6 +446,18 @@ mod tests {
                 arguments: serde_json::json!({}),
             },
         }
+    }
+
+    #[test]
+    fn env_hook_timeout_follows_handbook_semantics() {
+        assert_eq!(env_hook_timeout(None), None);
+        assert_eq!(env_hook_timeout(Some("0")), None);
+        assert_eq!(env_hook_timeout(Some("")), None);
+        assert_eq!(env_hook_timeout(Some("nope")), None);
+        assert_eq!(
+            env_hook_timeout(Some(" 30 ")),
+            Some(Duration::from_secs(30))
+        );
     }
 
     #[cfg(unix)]

@@ -162,6 +162,7 @@ impl PipeClient {
             return self.stream_managed(body, tools, on_event, cancel).await;
         }
         let url = format!("{}/chat/completions", self.base_url);
+        let idle = sse_idle_timeout();
         let mut attempts = 0u32;
         loop {
             if cancel.is_cancelled() {
@@ -173,14 +174,42 @@ impl PipeClient {
                 .bearer_auth(&self.api_key)
                 .header("Accept", "text/event-stream")
                 .json(&body);
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(err) if attempts < 1 && (err.is_connect() || err.is_timeout()) => {
+            // The inference client has no total or read timeout so long
+            // streams survive, which leaves the wait for response headers
+            // unbounded. Bound it with the same idle budget as the SSE body
+            // and keep Esc working while it waits.
+            let sent = tokio::select! {
+                _ = cancel.cancelled() => return Err(PipeError::cancelled().into()),
+                sent = tokio::time::timeout(idle, request.send()) => sent,
+            };
+            let response = match sent {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) if attempts < 1 && (err.is_connect() || err.is_timeout()) => {
                     attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    sleep_unless_cancelled(Duration::from_millis(250), cancel).await?;
                     continue;
                 }
-                Err(err) => return Err(err).context("pipe chat request"),
+                Ok(Err(err)) => return Err(err).context("pipe chat request"),
+                Err(_elapsed) if attempts < 1 => {
+                    attempts += 1;
+                    on_event(StreamDelta::Status(format!(
+                        "pipe sent no response headers for {}s; retrying",
+                        idle.as_secs()
+                    )));
+                    continue;
+                }
+                Err(_elapsed) => {
+                    return Err(PipeError {
+                        status: None,
+                        message: format!(
+                            "pipe sent no response headers within {}s (HI_PIPE_SSE_IDLE_SECS)",
+                            idle.as_secs()
+                        ),
+                        retryable: true,
+                        retry_after: None,
+                    }
+                    .into());
+                }
             };
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS && attempts < 3 {
@@ -191,12 +220,16 @@ impl PipeClient {
                     .unwrap_or(1)
                     .min(MAX_RETRY_AFTER_SECS);
                 attempts += 1;
-                tokio::time::sleep(Duration::from_secs(wait)).await;
+                on_event(StreamDelta::Status(format!(
+                    "pipe rate limited; retrying in {wait}s"
+                )));
+                sleep_unless_cancelled(Duration::from_secs(wait), cancel).await?;
                 continue;
             }
             if status.is_server_error() && attempts < 2 {
                 attempts += 1;
-                tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempts))).await;
+                sleep_unless_cancelled(Duration::from_millis(250 * 2u64.pow(attempts)), cancel)
+                    .await?;
                 continue;
             }
             if !status.is_success() {
@@ -214,11 +247,23 @@ impl PipeClient {
             let completion = read_sse(response, on_event, cancel).await?;
             if completion.is_empty() && attempts < 3 {
                 attempts += 1;
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                on_event(StreamDelta::Status(
+                    "pipe stream carried nothing; retrying".into(),
+                ));
+                sleep_unless_cancelled(Duration::from_millis(250), cancel).await?;
                 continue;
             }
             return Ok(completion);
         }
+    }
+}
+
+/// Retry backoff that still honors Esc. A plain `sleep` here made a 30s
+/// `Retry-After` uncancellable.
+async fn sleep_unless_cancelled(wait: Duration, cancel: &TurnCancellation) -> Result<()> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(PipeError::cancelled().into()),
+        _ = tokio::time::sleep(wait) => Ok(()),
     }
 }
 
@@ -507,7 +552,13 @@ async fn read_sse(
                 Ok(Some(Ok(event))) => event,
                 Ok(Some(Err(err))) => return Err(anyhow!("pipe sse: {err}")),
                 Ok(None) => break,
-                Err(_) => break,
+                Err(_) => {
+                    on_event(StreamDelta::Status(format!(
+                        "pipe stream went silent for {}s; using what arrived",
+                        idle.as_secs()
+                    )));
+                    break;
+                }
             }
         };
         if event.data.trim() == "[DONE]" {
@@ -710,6 +761,9 @@ pub mod test_support {
             body: String,
             retry_after: Option<u64>,
         },
+        /// Accept the request and hold the socket open without ever writing
+        /// a byte: a server that connected but never sends headers.
+        Silent,
     }
 
     pub struct MockPipe {
@@ -730,6 +784,9 @@ pub mod test_support {
             let thread_bodies = bodies.clone();
             let thread_scripts = scripts.clone();
             thread::spawn(move || {
+                // Silent connections stay open here so the client sees a
+                // live socket with nothing on it, not a reset.
+                let mut held = Vec::new();
                 while let Ok((mut stream, _)) = listener.accept() {
                     let mut buf = vec![0u8; 64 * 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
@@ -750,6 +807,10 @@ pub mod test_support {
                                 body: "no script".into(),
                                 retry_after: None,
                             });
+                    if matches!(script, Scripted::Silent) {
+                        held.push(stream);
+                        continue;
+                    }
                     let _ = stream.write_all(&response_bytes(&script));
                 }
             });
@@ -794,6 +855,7 @@ pub mod test_support {
                 )
                 .into_bytes()
             }
+            Scripted::Silent => Vec::new(),
         }
     }
 
@@ -839,6 +901,45 @@ mod tests {
     use super::test_support::{MockPipe, Scripted, text_chunk, tool_chunk, usage_chunk};
     use super::*;
     use hi_ai::{Content, Message};
+
+    /// A server that connects and then sends nothing used to park the turn
+    /// in `send().await` with Esc ignored. Cancel must end that wait.
+    #[tokio::test]
+    async fn esc_ends_wait_for_response_headers() {
+        let Some(server) = MockPipe::new(vec![Scripted::Silent, Scripted::Silent]) else {
+            return;
+        };
+        let client = PipeClient::new(server.url.clone(), "pk_test");
+        let cancel = TurnCancellation::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = client
+            .stream(
+                "pipe/test",
+                &[Message::user("hi")],
+                &[],
+                64,
+                None,
+                &mut |_| {},
+                &cancel,
+            )
+            .await;
+        let err = result.expect_err("a silent server must not yield a completion");
+        assert!(
+            err.downcast_ref::<PipeError>()
+                .is_some_and(PipeError::is_cancelled),
+            "{err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cancel took {:?}",
+            started.elapsed()
+        );
+    }
 
     #[tokio::test]
     async fn streams_text_and_usage() {

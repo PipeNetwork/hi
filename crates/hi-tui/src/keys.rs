@@ -371,7 +371,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::ReviewTools,
         keys: "Ctrl-D",
-        help: "diff review, split when wide (same as Ctrl-G)",
+        help: "Changes pane: the session's running diff (same as Ctrl-G)",
         in_help: true,
         action: Some(Action::ToggleDiff),
         matches: &[KeyMatch::ctrl(KeyCode::Char('d'))],
@@ -387,7 +387,7 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
     KeyBinding {
         context: BindContext::ReviewTools,
         keys: "Ctrl-G",
-        help: "diff review (split when wide; overlay when narrow)",
+        help: "Changes pane: files + hunks edited this session (split when wide; overlay when narrow)",
         in_help: true,
         action: Some(Action::ToggleReview),
         matches: &[KeyMatch::ctrl(KeyCode::Char('g'))],

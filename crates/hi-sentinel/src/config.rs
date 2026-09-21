@@ -338,7 +338,23 @@ mod tests {
 
     #[test]
     fn defaults_are_pipe_ids() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_home = tmp.path().join("config");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
         let models = resolve_repair_models(None).unwrap();
+        if let Some(previous) = previous_config {
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
         assert!(is_pipe_model(&models.diagnose));
         assert!(is_pipe_model(&models.patch));
         assert_eq!(models.diagnose, DEFAULT_DIAGNOSE_MODEL);

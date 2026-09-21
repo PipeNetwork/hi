@@ -8,7 +8,14 @@
 use hi_ai::{Content, Message};
 use hi_tools::{PlanStatus, PlanStep, is_coordination, is_inspect_tool, plan_steps_from_arguments};
 
-/// Consecutive stall-only tool rounds before the harness demands Edit / Verify / Verdict.
+/// Consecutive stall-only tool rounds before the harness demands Edit / Verify.
+///
+/// The budget only applies while the turn owes concrete work (an edit on
+/// Implement or an open plan, tests on Fix). When nothing is owed the stall
+/// demand would be a bare Verdict, and there opening new files *is* the
+/// work: a review of a 1000-file tree is many read rounds, not a stall.
+/// Those turns proceed until identical repeats hit
+/// [`Event::ToolsFinished::inspect_repeat_capped`].
 pub const STALL_ROUNDS_BEFORE_DEMAND: u32 = 2;
 /// Keep re-hinting the stall demand until this many inspect-only rounds.
 /// Identical inspect-repeat / probe refusals still error after one extra hint.
@@ -48,6 +55,8 @@ that you will not change anything. Do not grep or read the same files again.";
 
 const EMPTY_STOP_MSG: &str = "model stopped after tool work with no user-visible answer";
 const INSPECT_STOP_MSG: &str = "stopped inspecting without applying the requested changes";
+const UNVERIFIED_STOP_MSG: &str =
+    "changes were applied but the project's tests never ran after the last edit";
 const PLAN_STALL_MSG: &str = "plan still has unfinished steps but the turn stopped without an edit";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,15 +176,16 @@ impl TurnFacts {
         }
     }
 
-    /// Remaining plan steps on Implement are still an edit demand after a
-    /// partial patch. Verify wins if tests have not run since the last edit.
+    /// Remaining plan steps on Implement and Fix are still an edit demand
+    /// after a partial patch. Verify wins if tests have not run since the
+    /// last edit.
     pub fn wants_edit(&self) -> bool {
         if self.wants_verify() {
             return false;
         }
         match self.intent {
             Intent::Implement => !self.mutated || self.plan_open,
-            Intent::Fix => self.plan_open && !self.mutated,
+            Intent::Fix => self.plan_open,
             Intent::Review => false,
         }
     }
@@ -338,11 +348,19 @@ fn decide_tools_finished(facts: &mut TurnFacts, inspect_repeat_capped: bool) -> 
     if inspect_repeat_capped {
         return capped_repeat_demand(facts);
     }
+    let demand = stall_demand(facts);
+    // A bare Verdict is owed only on Review, or on Fix once tests ran with
+    // no plan open. Unique-file reads and same-file paging are then the
+    // task itself, so they never spend the stall budget. Exact repeats
+    // still arrive as `inspect_repeat_capped` above, and an empty stop
+    // after tools is still caught by `decide_model_stop`.
+    if demand == Demand::Verdict {
+        return Decision::Proceed;
+    }
     let pressure = facts.stall_pressure();
     if pressure < STALL_ROUNDS_BEFORE_DEMAND {
         return Decision::Proceed;
     }
-    let demand = stall_demand(facts);
     if pressure < STALL_ROUNDS_BEFORE_ERROR {
         return continue_demand(demand);
     }
@@ -373,6 +391,15 @@ fn unmet_error(facts: &TurnFacts) -> Decision {
         return Decision::Error {
             kind: "plan_stall",
             message: PLAN_STALL_MSG,
+        };
+    }
+    // The tree did change; only the test run is missing. Saying "without
+    // applying the requested changes" here would contradict the diff the
+    // user can see.
+    if facts.mutated && facts.wants_verify() {
+        return Decision::Error {
+            kind: "unverified_stop",
+            message: UNVERIFIED_STOP_MSG,
         };
     }
     if facts.wants_edit() || facts.wants_verify() {
@@ -481,6 +508,88 @@ pub fn latest_prompt_text(messages: &[Message], input: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Short "keep going" lines. Punctuation is ignored so
+/// [`crate::CONTINUE_PLAN_PROMPT`] matches.
+pub fn is_continuation_prompt(text: &str) -> bool {
+    let mut normalized = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_punctuation() {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !normalized.is_empty() && !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+            continue;
+        }
+        normalized.push(ch.to_ascii_lowercase());
+    }
+    matches!(
+        normalized.trim(),
+        "continue"
+            | "continue the open plan"
+            | "keep going"
+            | "go ahead"
+            | "proceed"
+            | "do it"
+            | "apply it"
+            | "apply those"
+            | "apply that"
+            | "yes"
+            | "y"
+            | "ok"
+            | "okay"
+    )
+}
+
+fn is_weak_ack(text: &str) -> bool {
+    let mut normalized = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_punctuation() || ch.is_whitespace() {
+            continue;
+        }
+        normalized.push(ch.to_ascii_lowercase());
+    }
+    matches!(normalized.as_str(), "yes" | "y" | "ok" | "okay")
+}
+
+/// Intent for this turn. A prompt that names the work itself (`fix`,
+/// `apply those`) keeps that intent. `"continue"` with an open plan is
+/// Implement so the model cannot narrate the next patch and stop. Bare
+/// continue/keep-going without a plan inherits the last Fix/Implement user
+/// line. Weak acks (`yes`) only upgrade when a plan is already open.
+pub fn intent_for_turn(messages: &[Message], input: &str, plan_open: bool) -> Intent {
+    let prompt = latest_prompt_text(messages, input);
+    let direct = Intent::from_prompt(&prompt);
+    if direct != Intent::Review || !is_continuation_prompt(&prompt) {
+        return direct;
+    }
+    if plan_open {
+        return Intent::Implement;
+    }
+    if is_weak_ack(&prompt) {
+        return Intent::Review;
+    }
+    let current = prompt.trim();
+    for message in messages.iter().rev() {
+        if message.role != hi_ai::Role::User {
+            continue;
+        }
+        let text = message.text();
+        if text.trim() == current
+            || is_continuation_prompt(&text)
+            || text.trim_start().starts_with("[hi:")
+        {
+            continue;
+        }
+        let prior = Intent::from_prompt(&text);
+        if prior != Intent::Review {
+            return prior;
+        }
+    }
+    Intent::Review
+}
+
 pub fn user_asked_to_fix(text: &str) -> bool {
     text.to_ascii_lowercase()
         .split(|ch: char| !ch.is_ascii_alphabetic())
@@ -578,19 +687,85 @@ pub fn plan_from_messages(messages: &[Message]) -> Vec<PlanStep> {
     last.unwrap_or_default()
 }
 
+/// Runner + subcommand pairs that verify the tree. Flags or lifecycle
+/// phases may sit between them (`mvn -q test`, `./gradlew clean test`,
+/// `npm run test:unit`). A Fix turn is not done until one of these ran; a
+/// project whose real runner is missing here is nagged for `cargo test`
+/// and then errors, so the table is deliberately wide.
+const VERIFY_RUNNERS: &[(&str, &[&str])] = &[
+    ("cargo", &["test", "nextest", "check", "clippy", "build"]),
+    ("npm", &["test"]),
+    ("yarn", &["test"]),
+    ("pnpm", &["test"]),
+    ("bun", &["test"]),
+    ("deno", &["test"]),
+    ("npx", &["vitest", "jest", "mocha"]),
+    ("go", &["test", "vet"]),
+    ("make", &["test", "check"]),
+    ("just", &["test"]),
+    ("mvn", &["test", "verify"]),
+    ("mvnw", &["test", "verify"]),
+    ("gradle", &["test", "check"]),
+    ("gradlew", &["test", "check"]),
+    ("sbt", &["test"]),
+    ("dotnet", &["test"]),
+    ("rake", &["test"]),
+    ("mix", &["test"]),
+    ("zig", &["test"]),
+    ("swift", &["test"]),
+    ("dart", &["test"]),
+    ("flutter", &["test"]),
+    ("bazel", &["test"]),
+    ("stack", &["test"]),
+    ("cabal", &["test"]),
+];
+
+/// Runners that are a verify on their own (`pytest -q`, `python -m unittest`).
+const VERIFY_TOKENS: &[&str] = &[
+    "pytest", "unittest", "rspec", "ctest", "phpunit", "vitest", "jest",
+];
+
 pub fn looks_like_verify(name: &str, arguments: &str) -> bool {
     if !name.eq_ignore_ascii_case("bash") {
         return false;
     }
     let lower = bash_command(arguments).to_ascii_lowercase();
-    lower.contains("cargo test")
-        || lower.contains("cargo check")
-        || lower.contains("cargo clippy")
-        || lower.contains("npm test")
-        || lower.contains("npx vitest")
-        || lower.contains("pytest")
-        || lower.contains("-m unittest")
-        || lower.contains("go test")
+    shell_segments(&lower).any(segment_is_verify)
+}
+
+fn segment_is_verify(segment: &str) -> bool {
+    let tokens: Vec<&str> = segment
+        .split_whitespace()
+        .filter(|token| *token != "sudo")
+        .map(|token| token.rsplit('/').next().unwrap_or(token))
+        .collect();
+    if tokens.iter().any(|token| VERIFY_TOKENS.contains(token)) {
+        return true;
+    }
+    VERIFY_RUNNERS.iter().any(|(runner, subcommands)| {
+        let Some(at) = tokens.iter().position(|token| token == runner) else {
+            return false;
+        };
+        tokens[at + 1..].iter().any(|token| {
+            subcommands.iter().any(|sub| {
+                *token == *sub
+                    || token
+                        .strip_prefix(*sub)
+                        .is_some_and(|rest| rest.starts_with(':'))
+            })
+        })
+    })
+}
+
+/// Pipeline segments of a shell line, so `cd build && ctest` finds the
+/// runner in its own segment and `go run x && echo test` does not pair
+/// `go` with a later `test`.
+fn shell_segments(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(['\n', ';', '|'])
+        .flat_map(|part| part.split("&&"))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
 }
 
 pub fn is_stall_tool(name: &str, arguments: &str) -> bool {
@@ -691,6 +866,79 @@ mod tests {
         assert!(!looks_like_verify("read", r#"{"path":"unittest.py"}"#));
     }
 
+    #[test]
+    fn project_test_runners_beyond_cargo_count_as_verify() {
+        for command in [
+            "make test",
+            "just test",
+            "mvn -q test",
+            "./gradlew test",
+            "dotnet test --no-build",
+            "bun test",
+            "deno test -A",
+            "pnpm test",
+            "bundle exec rspec spec/",
+            "mix test",
+            "cd build && ctest --output-on-failure",
+            "cargo nextest run",
+            "zig test src/main.zig",
+            "vendor/bin/phpunit",
+            "npm run test:unit",
+            "cargo fmt && cargo clippy -- -D warnings && cargo test",
+        ] {
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            assert!(
+                looks_like_verify("bash", &arguments),
+                "{command} must count as verification"
+            );
+            assert!(
+                !is_stall_tool("bash", &arguments),
+                "{command} is never a stall round"
+            );
+        }
+        for command in [
+            "echo ok",
+            "ls -la",
+            "cat src/main.rs",
+            "git status",
+            "go run main.go && echo test",
+            "npm run lint",
+        ] {
+            let arguments = serde_json::json!({ "command": command }).to_string();
+            assert!(!looks_like_verify("bash", &arguments), "{command}");
+        }
+    }
+
+    #[test]
+    fn edit_without_tests_ends_as_unverified_not_inspect_stop() {
+        let mut edited = facts(Intent::Fix);
+        edited.used_tools = true;
+        edited.mutated = true;
+        edited.ran_verify = false;
+        edited.visible_answer = true;
+        let first = decide(Event::ModelStop, &mut edited);
+        assert!(is_continue(&first, Demand::Verify), "{first:?}");
+        edited.note_continue(Demand::Verify);
+        let second = decide(Event::ModelStop, &mut edited);
+        assert!(
+            is_error(&second, "unverified_stop"),
+            "an applied edit must not be reported as 'without applying', got {second:?}"
+        );
+        // No mutation at all is still the inspect stop.
+        let mut untouched = facts(Intent::Fix);
+        untouched.used_tools = true;
+        untouched.visible_answer = true;
+        assert!(is_continue(
+            &decide(Event::ModelStop, &mut untouched),
+            Demand::Verify
+        ));
+        untouched.note_continue(Demand::Verify);
+        assert!(is_error(
+            &decide(Event::ModelStop, &mut untouched),
+            "inspect_stop"
+        ));
+    }
+
     fn open_plan_facts(intent: Intent) -> TurnFacts {
         TurnFacts::new(intent, true)
     }
@@ -705,6 +953,10 @@ mod tests {
 
     fn is_continue(decision: &Decision, demand: Demand) -> bool {
         matches!(decision, Decision::Continue { demand: d, .. } if *d == demand)
+    }
+
+    fn is_proceed(decision: &Decision) -> bool {
+        matches!(decision, Decision::Proceed)
     }
 
     fn tools_finished(facts: &mut TurnFacts) -> Decision {
@@ -1091,11 +1343,113 @@ mod tests {
         facts.visible_answer = true;
         facts.note_round(false, true, false);
         facts.note_round(false, true, false);
-        let demand = tools_finished(&mut facts);
-        assert!(is_continue(&demand, Demand::Verdict), "{demand:?}");
-        assert!(!is_continue(&demand, Demand::Edit));
-        facts.note_continue(Demand::Verdict);
+        let decision = tools_finished(&mut facts);
+        assert!(
+            is_proceed(&decision),
+            "a review keeps reading even with a plan open, got {decision:?}"
+        );
+        assert!(!is_continue(&decision, Demand::Edit));
         assert!(is_complete(&decide(Event::ModelStop, &mut facts)));
+    }
+
+    #[test]
+    fn review_codebase_unique_reads_are_not_a_stall() {
+        // Live ~/hi "review codebase": `list`, then `repo_map`, then the
+        // harness said "Stop inspecting" and the model gave up with "tell
+        // me what to do". Opening new files is the review.
+        let mut facts = facts(Intent::Review);
+        facts.used_tools = true;
+        let paths = [
+            "Cargo.toml",
+            "crates/hi-harness/src/turn.rs",
+            "crates/hi-harness/src/completion.rs",
+            "crates/hi-tools/src/lib.rs",
+            "crates/hi-tui/src/lib.rs",
+            "crates/hi-cli/src/main.rs",
+            "README.md",
+            "docs/handbook.md",
+            "crates/hi-harness/src/pipe.rs",
+            "crates/hi-harness/src/tools.rs",
+            "crates/hi-harness/src/ui.rs",
+            "crates/hi-harness/src/prompt.rs",
+        ];
+        for (i, path) in paths.iter().enumerate() {
+            note_reads(&mut facts, &[read_call(&format!("r{i}"), path, None)]);
+            let decision = tools_finished(&mut facts);
+            assert!(
+                is_proceed(&decision),
+                "unique read #{} of a review must proceed, got {decision:?}",
+                i + 1
+            );
+        }
+        assert!(
+            facts.stall_pressure() > STALL_ROUNDS_BEFORE_ERROR,
+            "the counter still runs; only the Verdict demand ignores it"
+        );
+        facts.visible_answer = true;
+        assert!(is_complete(&decide(Event::ModelStop, &mut facts)));
+    }
+
+    #[test]
+    fn review_paging_one_large_file_is_not_a_stall() {
+        let mut facts = facts(Intent::Review);
+        facts.used_tools = true;
+        note_reads(&mut facts, &[read_call("a", "src/turn.rs", None)]);
+        for i in 1..=(STALL_ROUNDS_BEFORE_ERROR + 4) {
+            note_reads(
+                &mut facts,
+                &[read_call(&format!("p{i}"), "src/turn.rs", Some(i * 200))],
+            );
+            let decision = tools_finished(&mut facts);
+            assert!(
+                is_proceed(&decision),
+                "page {i} of a review read must proceed, got {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_identical_repeats_still_demand_a_verdict() {
+        let mut facts = facts(Intent::Review);
+        facts.used_tools = true;
+        facts.note_round(false, true, false);
+        let capped = decide(
+            Event::ToolsFinished {
+                inspect_repeat_capped: true,
+            },
+            &mut facts,
+        );
+        assert!(is_continue(&capped, Demand::Verdict), "{capped:?}");
+    }
+
+    #[test]
+    fn fix_after_tests_without_plan_explores_freely() {
+        // "review for any major issues and fix": the Verify demand made
+        // the model run cargo test; with tests green and no plan there is
+        // nothing concrete to demand, so it may keep looking for issues.
+        let mut facts = facts(Intent::Fix);
+        facts.used_tools = true;
+        facts.ran_verify = true;
+        for i in 0..STALL_ROUNDS_BEFORE_ERROR + 2 {
+            facts.note_round(false, true, false);
+            let decision = tools_finished(&mut facts);
+            assert!(
+                is_proceed(&decision),
+                "post-test inspect #{} on a fix prompt must proceed, got {decision:?}",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn fix_before_tests_still_demands_verify_after_two_inspects() {
+        let mut facts = facts(Intent::Fix);
+        facts.used_tools = true;
+        facts.note_round(false, true, false);
+        assert!(is_proceed(&tools_finished(&mut facts)));
+        facts.note_round(false, true, false);
+        let decision = tools_finished(&mut facts);
+        assert!(is_continue(&decision, Demand::Verify), "{decision:?}");
     }
 
     #[test]
@@ -1238,6 +1592,62 @@ mod tests {
         assert!(!user_asked_to_fix(
             "Run cargo test to verify the review change didn't break anything."
         ));
+    }
+
+    #[test]
+    fn continuation_prompt_with_open_plan_is_implement() {
+        assert!(is_continuation_prompt("continue"));
+        assert!(is_continuation_prompt("Continue."));
+        assert!(is_continuation_prompt(crate::CONTINUE_PLAN_PROMPT));
+        assert!(is_continuation_prompt("keep going"));
+        assert!(!is_continuation_prompt("how can we improve this"));
+        assert!(!is_continuation_prompt("continue using solana-sdk"));
+        let older = vec![Message::user("review for any major issues and fix")];
+        assert_eq!(intent_for_turn(&older, "continue", true), Intent::Implement);
+        assert_eq!(intent_for_turn(&older, "continue", false), Intent::Fix);
+        assert_eq!(
+            intent_for_turn(&older, crate::CONTINUE_PLAN_PROMPT, true),
+            Intent::Implement
+        );
+        assert_eq!(
+            intent_for_turn(&older, "how can we improve this", true),
+            Intent::Review
+        );
+        assert_eq!(intent_for_turn(&older, "yes", true), Intent::Implement);
+        assert_eq!(intent_for_turn(&older, "yes", false), Intent::Review);
+        // An explicit implement phrase is never downgraded by the
+        // continuation path, even after a review-only prompt with no plan.
+        let review_only = vec![Message::user("how can we improve this")];
+        assert_eq!(
+            intent_for_turn(&review_only, "apply those", false),
+            Intent::Implement
+        );
+        assert_eq!(
+            intent_for_turn(&review_only, "continue", false),
+            Intent::Review
+        );
+    }
+
+    #[test]
+    fn fix_open_plan_after_edit_and_verify_still_asks_for_edit() {
+        let mut facts = open_plan_facts(Intent::Fix);
+        facts.used_tools = true;
+        facts.mutated = true;
+        facts.ran_verify = true;
+        facts.visible_answer = true;
+        let decision = decide(Event::ModelStop, &mut facts);
+        assert!(is_continue(&decision, Demand::Edit), "{decision:?}");
+        assert!(!is_complete(&decision));
+    }
+
+    #[test]
+    fn continue_open_plan_model_stop_demands_edit() {
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.used_tools = true;
+        facts.visible_answer = true;
+        let decision = decide(Event::ModelStop, &mut facts);
+        assert!(is_continue(&decision, Demand::Edit), "{decision:?}");
+        assert!(!is_complete(&decision));
     }
 
     #[test]

@@ -14,6 +14,14 @@ pub use managed::{ManagedInspection, ManagedSettings, inspect_managed_journal};
 mod liveness;
 mod pipe;
 mod prompt;
+mod review;
+mod review_citations;
+mod review_drive;
+mod review_guard;
+mod review_prompts;
+mod review_report;
+mod review_scope;
+mod review_stream;
 mod session;
 mod session_index;
 mod session_lease;
@@ -35,7 +43,7 @@ use tokio::sync::Notify;
 
 pub use command::{
     COMMANDS, CORE_COMMANDS, Command, CommandSpec, EffortArg, ModelArgs, parse as parse_command,
-    parse_effort_arg, parse_model_args, resolve_model_query,
+    parse_effort_arg, parse_model_args, resolve_model_query, trust_command,
 };
 pub use dashboard::{
     Dashboard, DashboardKnobs, DispatchOpts, PIPE_GPT6, RowState, RowView, is_openai_model,
@@ -48,6 +56,14 @@ pub use pipe::{
     DEFAULT_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, PipeClient, PipeError, default_base_url,
 };
 pub use prompt::SYSTEM_PROMPT;
+pub use review::{
+    ChecklistItem, CoverageRow, CoverageState, DEFAULT_REVIEW_PASSES, Finding, GitScope, GitSource,
+    InputKind, REVIEW_DEFECTS_FORMAT_BLOCK, REVIEW_FORMAT_BLOCK, REVIEW_FORMAT_HINT, REVIEW_PREFIX,
+    ReviewAction, ReviewArgs, ReviewInput, ReviewInputs, ReviewVerdict, Severity, check_citations,
+    discover_inputs, fingerprint as review_fingerprint, parse_checklist,
+    take_all as review_take_all, transcript_label as review_transcript_label,
+};
+pub use review_drive::{ReviewCommand, ReviewDrive, ReviewPhase, ReviewStep, ReviewTurnFacts};
 pub const CONTINUE_PLAN_PROMPT: &str = "Continue the open plan.";
 pub use completion::plan_is_open;
 pub use session::{JsonlSession, LoadedSession, PendingTurn, PlanDrive, UserTurn, list_user_turns};
@@ -221,6 +237,10 @@ pub struct Harness {
     next_action: typesafe::NextActionSource,
     /// Turn-scoped Jev effort. Never persisted.
     turn_effort: Option<ReasoningEffort>,
+    /// Intent for the next turn, armed by the review drive and consumed once
+    /// at turn start. Never persisted.
+    forced_intent: Option<completion::Intent>,
+    review_drive: ReviewDrive,
 }
 
 impl Harness {
@@ -277,6 +297,8 @@ impl Harness {
             typesafe: config.typesafe.clone(),
             next_action: config.typesafe.source(),
             turn_effort: None,
+            forced_intent: None,
+            review_drive: ReviewDrive::default(),
         })
     }
 
@@ -336,6 +358,8 @@ impl Harness {
             typesafe: config.typesafe.clone(),
             next_action: config.typesafe.source(),
             turn_effort: None,
+            forced_intent: None,
+            review_drive: ReviewDrive::default(),
         })
     }
 
@@ -362,6 +386,7 @@ impl Harness {
         }
         self.pending_turn = loaded.pending_turn;
         self.plan_drive = loaded.plan_drive;
+        self.review_drive = loaded.review_drive;
         self.plan = if loaded.plan.is_empty() {
             crate::completion::plan_from_messages(&self.messages)
         } else {
@@ -390,6 +415,7 @@ impl Harness {
             pending_turn: self.pending_turn.clone(),
             plan: self.plan.clone(),
             plan_drive: self.plan_drive.clone(),
+            review_drive: self.review_drive.clone(),
         }
     }
 
@@ -801,6 +827,8 @@ impl Harness {
         let prev_plan = std::mem::take(&mut self.plan);
         let prev_files = std::mem::take(&mut self.last_changed_files);
         let prev_pending = self.pending_turn.take();
+        self.review_drive = ReviewDrive::default();
+        self.forced_intent = None;
         if !self.persist_snapshot() {
             self.messages = previous;
             self.plan = prev_plan;
@@ -1056,3 +1084,15 @@ fn open_session(path: Option<&Path>, model: &str) -> Result<Option<SessionFile>>
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "review_harness_tests.rs"]
+mod review_harness_tests;
+
+#[cfg(test)]
+#[path = "review_guard_tests.rs"]
+mod review_guard_tests;
+
+#[cfg(test)]
+#[path = "review_harness_scope_tests.rs"]
+mod review_harness_scope_tests;

@@ -12,5 +12,4 @@ pub(crate) mod session_projection;
 mod transcript;
 pub(crate) mod voice;
 
-pub(crate) use run::review_next_hunk;
 pub use run::{SessionOptions, run_session};

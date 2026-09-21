@@ -25,7 +25,7 @@ pub(crate) fn test_app(provider: &str, model: &str) -> App {
 }
 
 #[test]
-fn write_result_stays_a_filename_row() {
+fn write_result_is_a_claude_style_edit_row() {
     let mut app = test_app("pipe", "m");
     let display = concat!(
         "\u{1b}[1m1 addition, 0 deletions\u{1b}[0m\n",
@@ -36,18 +36,56 @@ fn write_result_stays_a_filename_row() {
     let Some(TranscriptEntry::Activity(block)) = app.transcript.last() else {
         panic!("expected an Edit activity after a write result with a compact diff");
     };
-    let collapsed = block.flatten(false, false, Density::Comfortable);
-    assert_eq!(collapsed.len(), 1);
-    assert_eq!(crate::render::line_text(&collapsed[0]), "Edit note.txt");
-
-    let expanded = block.flatten(false, false, Density::Verbose);
-    assert!(expanded.len() > 1, "verbose density still paints the diff");
+    // Comfortable paints the header and the hunk inline, like Claude Code.
+    let comfortable = block.flatten(false, false, Density::Comfortable);
+    assert_eq!(
+        crate::render::line_text(&comfortable[0]),
+        "Created note.txt (+1 -0)"
+    );
+    assert_eq!(comfortable.len(), 2, "{comfortable:?}");
+    assert!(crate::render::line_text(&comfortable[1]).contains("hello"));
     let add = crate::theme::theme().diff_add;
     assert!(
-        expanded
+        comfortable[1]
+            .spans
             .iter()
-            .any(|line| line.spans.iter().any(|span| span.style.fg == Some(add))),
-        "expected add-colored gutter in {expanded:?}"
+            .any(|span| span.style.fg == Some(add)),
+        "expected add-colored gutter in {comfortable:?}"
+    );
+
+    // Compact keeps the verb list terse: header only.
+    let compact = block.flatten(false, false, Density::Compact);
+    assert_eq!(compact.len(), 1, "{compact:?}");
+    assert_eq!(
+        crate::render::line_text(&compact[0]),
+        "Created note.txt (+1 -0)"
+    );
+
+    let verbose = block.flatten(false, false, Density::Verbose);
+    assert!(verbose.len() > 1, "verbose density still paints the diff");
+    assert_eq!(
+        app.session_changed_files,
+        vec!["note.txt".to_string()],
+        "the edit joins the session's running change set"
+    );
+}
+
+#[test]
+fn edit_paths_are_workspace_relative_and_apply_patch_names_every_file() {
+    let mut app = test_app("pipe", "m");
+    app.push_result(
+        "apply_patch",
+        "--- /workspace/src/a.rs\n+++ /workspace/src/a.rs\n1 addition, 0 deletions\n   1 + a\n--- /dev/null\n+++ /workspace/src/b.rs\n1 addition, 0 deletions\n   1 + b\n",
+        "apply_patch",
+    );
+    let Some(TranscriptEntry::Activity(block)) = app.transcript.last() else {
+        panic!("expected an Edit activity");
+    };
+    let header = crate::render::line_text(&block.flatten(false, false, Density::Compact)[0]);
+    assert_eq!(header, "Updated src/a.rs, src/b.rs (+2 -0)");
+    assert_eq!(
+        app.session_changed_files,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
     );
 }
 
@@ -104,8 +142,12 @@ fn grok_feed_is_a_verb_list() {
         "short grep shows hits: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l == "Edit ws.rs"),
-        "edits are a filename: {lines:?}"
+        lines.iter().any(|l| l == "Created src/ws.rs (+1 -0)"),
+        "edits are Claude-style `Verb path (+N -M)` rows: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.trim_start().starts_with("1  hi")),
+        "the hunk paints inline under the edit header: {lines:?}"
     );
     assert!(
         !lines

@@ -1,9 +1,13 @@
 //! Typed activity rows for the session transcript.
 //!
 //! Grok-build's feed is a verb list, one row per burst:
-//! `Read 3 files ›`, `Run grep` plus a short hit snippet, `Edit ws.rs`.
-//! Consecutive same-verb explores coalesce; mixed verbs stay separate.
-//! Edits are a filename only until Ctrl-O / verbose.
+//! `Read 3 files ›`, `Run grep` plus a short hit snippet. Consecutive
+//! same-verb explores coalesce; mixed verbs stay separate.
+//!
+//! Edits follow Claude Code instead: `Updated src/ws.rs (+4 -1)` with the
+//! numbered hunks painted inline underneath. Long diffs show the first
+//! [`EDIT_PREVIEW_LINES`] rows and a `… N more lines` fold; click, Enter in
+//! block-nav, or Ctrl-O opens the rest. Compact density keeps the header only.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -28,8 +32,10 @@ pub(crate) struct ActivityBlock {
 pub(crate) enum ActivityKind {
     /// Consecutive non-destructive tools folded into one header.
     VerbGroup(VerbGroup),
-    /// A file mutation. Collapsed is `Edit filename`; Ctrl-O / verbose shows hunks.
+    /// A file mutation: `Updated path (+N -M)` plus the inline hunks.
     Edit {
+        /// Workspace-relative path (or `a.rs, b.rs` / `3 files` for a
+        /// multi-file patch).
         path: String,
         additions: u32,
         deletions: u32,
@@ -230,8 +236,8 @@ impl ActivityKind {
             Self::VerbGroup(g) => {
                 !g.thinking.trim().is_empty() || !g.steering.is_empty() || g.calls.len() > 1
             }
-            // Grok Edit rows are filename-only; Ctrl-O / verbose still paints the diff.
-            Self::Edit { .. } => false,
+            // An edit folds only when its inline preview had to cut rows.
+            Self::Edit { diff, .. } => edit_preview_truncates(diff),
             Self::Run { command, body, .. } => {
                 if grep_snippet_fits(command, body) {
                     false
@@ -352,11 +358,18 @@ impl ActivityBlock {
                 // Grok Collapsed: finished execute is header-only.
                 lines
             }
-            ActivityKind::Edit { .. } => {
-                let show = density.show_tool_output(show_tool_output) || self.expanded;
+            ActivityKind::Edit { diff, .. } => {
                 let mut lines = vec![header];
-                if show {
-                    lines.extend(self.body_lines());
+                if diff.trim().is_empty() {
+                    return lines;
+                }
+                let full = density.show_tool_output(show_tool_output) || self.expanded;
+                if full {
+                    lines.extend(edit_body_lines(diff));
+                } else if density != Density::Compact {
+                    // Claude Code paints the hunks under the header by default;
+                    // compact density keeps the verb list terse.
+                    lines.extend(edit_preview_lines(diff));
                 }
                 lines
             }
@@ -391,8 +404,13 @@ impl ActivityBlock {
                 }
                 s
             }
-            ActivityKind::Edit { path, diff, .. } => {
-                let mut s = format!("Edit {}", display_path(path));
+            ActivityKind::Edit {
+                path,
+                additions,
+                deletions,
+                diff,
+            } => {
+                let mut s = format!("{} {path} (+{additions} -{deletions})", edit_verb(diff));
                 if !diff.trim().is_empty() {
                     s.push('\n');
                     s.push_str(&strip_ansi(diff));
@@ -459,12 +477,15 @@ impl ActivityBlock {
                     }
                 }
             }
-            ActivityKind::Edit { path, .. } => {
-                spans.push(Span::styled("Edit ".to_string(), verb_style));
-                spans.push(Span::styled(
-                    display_path(path).to_string(),
-                    Style::default().fg(th.path),
-                ));
+            ActivityKind::Edit {
+                path,
+                additions,
+                deletions,
+                diff,
+            } => {
+                spans.push(Span::styled(format!("{} ", edit_verb(diff)), verb_style));
+                spans.push(Span::styled(path.clone(), Style::default().fg(th.path)));
+                spans.extend(edit_stat_spans(*additions, *deletions));
             }
             ActivityKind::Run {
                 command,
@@ -509,8 +530,9 @@ impl ActivityBlock {
         }
         // Grok `expandable_indicator` / `expandable_indicator_running`: a
         // collapsed foldable row keeps the chevron so it is clickable even
-        // while the burst is still live.
-        if self.is_foldable() && !self.expanded {
+        // while the burst is still live. Edit rows advertise the fold on
+        // their `… N more lines` row instead.
+        if self.is_foldable() && !self.expanded && !matches!(self.kind, ActivityKind::Edit { .. }) {
             spans.push(Span::styled(" ›", Style::default().fg(th.gray_dim)));
         }
         Line::from(spans)
@@ -582,8 +604,10 @@ fn run_header_text(command: &str, idle: bool, body: &str) -> String {
 const LIVE_RUN_TAIL_LINES: usize = 12;
 /// Hit lines shown under a collapsed `Run grep` row (grok's short snippet).
 const GREP_SNIPPET_LINES: usize = 6;
-/// Verbose / Ctrl-O edit body still uses a short preview helper in tests.
-const EDIT_PREVIEW_LINES: usize = 6;
+/// Diff rows painted under an `Updated …` header before the `… N more lines`
+/// fold. Enough for a typical small edit (two hunks with context) to show in
+/// full; larger rewrites fold and open on click / Ctrl-O.
+pub(crate) const EDIT_PREVIEW_LINES: usize = 12;
 
 fn live_run_tail_lines(body: &str) -> Vec<Line<'static>> {
     let mut all = output_body_lines(body);
@@ -600,49 +624,122 @@ fn live_run_tail_lines(body: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// Claude Code's inline edit: the first rows of the painted diff, then a
+/// `… N more lines` fold. The painted body already starts at the first hunk's
+/// context, so the head of the diff always contains a real change.
 fn edit_preview_lines(diff: &str) -> Vec<Line<'static>> {
-    let all = edit_body_lines(diff);
+    let mut all = edit_body_lines(diff);
     if all.len() <= EDIT_PREVIEW_LINES {
         return all;
     }
-    // Prefer a window around the first actual addition/removal. A plain
-    // unified diff often starts with file/hunk headers and context, so taking
-    // the first six rows can otherwise produce a "preview" with no change in
-    // it at all.
-    let start = all
-        .iter()
-        .position(is_diff_change_line)
-        .map(|index| index.saturating_sub(2))
-        .unwrap_or(0)
-        .min(all.len() - EDIT_PREVIEW_LINES);
-    let end = start + EDIT_PREVIEW_LINES;
-    let mut lines = Vec::with_capacity(EDIT_PREVIEW_LINES + 2);
-    if start > 0 {
-        lines.push(Line::styled(
-            format!("  … +{start} diff lines"),
-            Style::default().fg(theme().gray_dim),
-        ));
-    }
-    lines.extend(all[start..end].iter().cloned());
-    if end < all.len() {
-        lines.push(Line::styled(
-            format!("  … +{} diff lines · Ctrl-O to expand", all.len() - end),
-            Style::default().fg(theme().gray_dim),
-        ));
-    } else if start > 0 {
-        lines.push(Line::styled(
-            "  · Ctrl-O to expand",
-            Style::default().fg(theme().gray_dim),
-        ));
-    }
-    lines
+    let hidden = all.len() - EDIT_PREVIEW_LINES;
+    all.truncate(EDIT_PREVIEW_LINES);
+    all.push(Line::styled(
+        format!(
+            "  … {hidden} more line{} · click or Ctrl-O",
+            if hidden == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(theme().gray_dim),
+    ));
+    all
 }
 
-fn is_diff_change_line(line: &Line<'static>) -> bool {
+/// Whether the inline preview of `diff` has to fold rows away.
+fn edit_preview_truncates(diff: &str) -> bool {
+    !diff.trim().is_empty() && edit_body_lines(diff).len() > EDIT_PREVIEW_LINES
+}
+
+/// `Created` / `Deleted` / `Updated` from the preview's file headers: a
+/// `--- /dev/null` pair is a new file, `+++ /dev/null` a removed one.
+pub(crate) fn edit_verb(diff: &str) -> &'static str {
+    let plain = strip_ansi(diff);
+    let (mut created, mut deleted, mut modified) = (false, false, false);
+    let mut old_is_null = false;
+    for line in plain.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("--- ") {
+            old_is_null = rest.trim() == "/dev/null";
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("+++ ") {
+            if rest.trim() == "/dev/null" {
+                deleted = true;
+            } else if old_is_null {
+                created = true;
+            } else {
+                modified = true;
+            }
+            old_is_null = false;
+        }
+    }
+    match (created, deleted, modified) {
+        (true, false, false) => "Created",
+        (false, true, false) => "Deleted",
+        _ => "Updated",
+    }
+}
+
+/// ` (+N -M)` with the counts in the diff colours.
+pub(crate) fn edit_stat_spans(additions: u32, deletions: u32) -> Vec<Span<'static>> {
     let th = theme();
-    line.spans
-        .iter()
-        .any(|span| matches!(span.style.fg, Some(fg) if fg == th.diff_add || fg == th.diff_del))
+    vec![
+        Span::styled(" (", Style::default().fg(th.gray_dim)),
+        Span::styled(format!("+{additions}"), Style::default().fg(th.diff_add)),
+        Span::raw(" "),
+        Span::styled(format!("-{deletions}"), Style::default().fg(th.diff_del)),
+        Span::styled(")", Style::default().fg(th.gray_dim)),
+    ]
+}
+
+/// Paths named by a preview's `+++` headers (or `---` for deletions), in
+/// order, deduplicated. Multi-file patches (`apply_patch`) label their row
+/// from these when the tool arguments carry no single `path`.
+pub(crate) fn edit_paths_from_preview(diff: &str) -> Vec<String> {
+    let plain = strip_ansi(diff);
+    let mut paths: Vec<String> = Vec::new();
+    let mut old_path: Option<String> = None;
+    let mut push = |p: String| {
+        if !p.is_empty() && p != "/dev/null" && !paths.contains(&p) {
+            paths.push(p);
+        }
+    };
+    for line in plain.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("--- ") {
+            old_path = Some(strip_ab_prefix(rest));
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("+++ ") {
+            let new_path = strip_ab_prefix(rest);
+            if new_path == "/dev/null" {
+                if let Some(old) = old_path.take() {
+                    push(old);
+                }
+            } else {
+                push(new_path);
+            }
+            old_path = None;
+        }
+    }
+    paths
+}
+
+fn strip_ab_prefix(s: &str) -> String {
+    let s = s.trim().trim_matches('"');
+    s.strip_prefix("a/")
+        .or_else(|| s.strip_prefix("b/"))
+        .unwrap_or(s)
+        .to_string()
+}
+
+/// Header label for a set of edited paths: one path verbatim, two or three
+/// joined, more summarised as `N files`.
+pub(crate) fn edit_paths_label(paths: &[String]) -> Option<String> {
+    match paths.len() {
+        0 => None,
+        1..=3 => Some(paths.join(", ")),
+        n => Some(format!("{n} files")),
+    }
 }
 
 fn other_header_text(verb: &str, detail: &str) -> String {
@@ -661,12 +758,18 @@ fn title_case(verb: &str) -> String {
     }
 }
 
-fn display_path(path: &str) -> &str {
-    Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(path)
+/// Workspace-relative form of an edited path: absolute paths under `root`
+/// lose the prefix, `./` is dropped, anything else is kept verbatim.
+pub(crate) fn relative_edit_path(path: &str, root: &Path) -> String {
+    let p = Path::new(path);
+    if p.is_absolute()
+        && let Ok(rel) = p.strip_prefix(root)
+        && let Some(s) = rel.to_str()
+        && !s.is_empty()
+    {
+        return s.to_string();
+    }
+    path.strip_prefix("./").unwrap_or(path).to_string()
 }
 
 /// Salient argument from a `tool_label` (`read src/main.rs` → `src/main.rs`).
@@ -846,11 +949,22 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Count additions/deletions from a UI preview or unified diff.
+/// Count additions/deletions from a UI preview or unified diff. Previews
+/// carry one `N additions, M deletions` summary per file; those are summed.
+/// Plain unified diffs fall back to counting `+`/`-` rows.
 pub(crate) fn parse_diff_stats(s: &str) -> (u32, u32) {
     let plain = strip_ansi(s);
-    if let Some(adds) = number_before(&plain, " addition") {
-        let dels = number_before(&plain, " deletion").unwrap_or(0);
+    let mut summaries = plain
+        .lines()
+        .filter(|line| line.contains(" addition"))
+        .peekable();
+    if summaries.peek().is_some() {
+        let mut adds = 0u32;
+        let mut dels = 0u32;
+        for line in summaries {
+            adds = adds.saturating_add(number_before(line, " addition").unwrap_or(0));
+            dels = dels.saturating_add(number_before(line, " deletion").unwrap_or(0));
+        }
         return (adds, dels);
     }
     let mut adds = 0u32;
@@ -969,6 +1083,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_stats_sums_multi_file_preview_summaries() {
+        let s = "--- a.rs\n+++ a.rs\n\x1b[1m2 additions, 1 deletion\x1b[0m\n   1 + x\n--- b.rs\n+++ b.rs\n\x1b[1m1 addition, 4 deletions\x1b[0m\n   9 - y\n";
+        assert_eq!(parse_diff_stats(s), (3, 5));
+    }
+
+    #[test]
     fn parse_stats_from_unified_diff() {
         let s = "--- a/x\n+++ b/x\n@@ -1,1 +1,2 @@\n-old\n+new\n+also\n";
         assert_eq!(parse_diff_stats(s), (2, 1));
@@ -986,41 +1106,130 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_edit_is_filename_only() {
+    fn edit_row_is_claude_style_header_with_inline_hunks() {
         let block = ActivityBlock {
             kind: ActivityKind::Edit {
                 path: "src/lib.rs".into(),
                 additions: 4,
                 deletions: 2,
-                diff: "@@\n-old\n+new\n".into(),
+                diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n".into(),
             },
             expanded: false,
         };
         let lines = block.flatten(false, false, Density::Comfortable);
-        let text = crate::render::line_text(&lines[0]);
-        assert_eq!(lines.len(), 1, "grok Edit rows are header-only: {lines:?}");
-        assert!(!text.contains('◆'), "{text}");
-        assert_eq!(text, "Edit lib.rs");
-        assert!(!text.contains('›'), "{text}");
+        let header = crate::render::line_text(&lines[0]);
+        assert_eq!(header, "Updated src/lib.rs (+4 -2)");
+        assert!(!header.contains('›'), "{header}");
+        let body: Vec<String> = lines[1..].iter().map(crate::render::line_text).collect();
+        assert_eq!(
+            body,
+            vec!["  1  old".to_string(), "  1  new".to_string()],
+            "hunks paint inline under the header"
+        );
+        assert!(
+            !block.is_foldable(),
+            "a short edit shows in full, nothing to fold"
+        );
+
+        let compact = block.flatten(false, false, Density::Compact);
+        assert_eq!(compact.len(), 1, "compact density keeps the header only");
     }
 
     #[test]
-    fn edit_preview_keeps_an_actual_change_visible_after_diff_metadata() {
-        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,10 +1,10 @@\n context 1\n context 2\n context 3\n context 4\n context 5\n-old value\n+new value\n context 6\n context 7\n";
-        let preview = edit_preview_lines(diff);
-        let text = preview
+    fn created_and_deleted_files_get_their_own_verb() {
+        assert_eq!(
+            edit_verb("--- /dev/null\n+++ note.txt\n   1 + hi\n"),
+            "Created"
+        );
+        assert_eq!(edit_verb("--- a/gone.rs\n+++ /dev/null\n-bye\n"), "Deleted");
+        assert_eq!(edit_verb("--- a/x.rs\n+++ b/x.rs\n-a\n+b\n"), "Updated");
+        assert_eq!(edit_verb("   3 - a\n   3 + b\n"), "Updated");
+        assert_eq!(
+            edit_verb("--- /dev/null\n+++ a.rs\n+1\n--- b.rs\n+++ b.rs\n-x\n+y\n"),
+            "Updated",
+            "mixed multi-file patches read as an update"
+        );
+    }
+
+    #[test]
+    fn long_edit_folds_after_the_preview_budget() {
+        let mut diff = String::from("--- a/big.rs\n+++ b/big.rs\n@@ -1,40 +1,40 @@\n");
+        for i in 1..=40 {
+            diff.push_str(&format!("-old {i}\n+new {i}\n"));
+        }
+        let block = ActivityBlock {
+            kind: ActivityKind::Edit {
+                path: "big.rs".into(),
+                additions: 40,
+                deletions: 40,
+                diff: diff.clone(),
+            },
+            expanded: false,
+        };
+        assert!(block.is_foldable(), "a truncated preview is expandable");
+        let lines: Vec<String> = block
+            .flatten(false, false, Density::Comfortable)
             .iter()
             .map(crate::render::line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(text.contains("old value"), "{text}");
-        assert!(text.contains("new value"), "{text}");
-        assert!(!text.contains("-old value"), "{text}");
-        assert!(!text.contains("+new value"), "{text}");
+            .collect();
+        assert_eq!(lines[0], "Updated big.rs (+40 -40)");
+        assert_eq!(
+            lines.len(),
+            1 + EDIT_PREVIEW_LINES + 1,
+            "header + preview rows + fold row: {lines:?}"
+        );
+        let fold = lines.last().unwrap();
         assert!(
-            text.contains("Ctrl-O to expand"),
-            "long previews should advertise expansion: {text}"
+            fold.contains(&format!("… {} more lines", 80 - EDIT_PREVIEW_LINES))
+                && fold.contains("Ctrl-O"),
+            "{fold}"
+        );
+
+        let expanded = ActivityBlock {
+            expanded: true,
+            ..block
+        };
+        let open = expanded.flatten(false, false, Density::Comfortable);
+        assert_eq!(
+            open.len(),
+            1 + 80,
+            "expanded paints every row: {}",
+            open.len()
+        );
+        assert!(
+            !open
+                .iter()
+                .any(|l| crate::render::line_text(l).contains("more line")),
+            "no fold row once expanded"
+        );
+    }
+
+    #[test]
+    fn multi_file_preview_paths_label_the_row() {
+        let diff = "--- /dev/null\n+++ src/a.rs\n   1 + a\n--- src/b.rs\n+++ src/b.rs\n   2 - x\n   2 + y\n--- src/gone.rs\n+++ /dev/null\n   1 - z\n";
+        let paths = edit_paths_from_preview(diff);
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs", "src/gone.rs"]);
+        assert_eq!(
+            edit_paths_label(&paths).as_deref(),
+            Some("src/a.rs, src/b.rs, src/gone.rs")
+        );
+        let many: Vec<String> = (0..5).map(|i| format!("f{i}.rs")).collect();
+        assert_eq!(edit_paths_label(&many).as_deref(), Some("5 files"));
+        assert_eq!(edit_paths_label(&[]), None);
+    }
+
+    #[test]
+    fn edit_paths_relative_to_workspace() {
+        let root = Path::new("/work/repo");
+        assert_eq!(
+            relative_edit_path("/work/repo/src/lib.rs", root),
+            "src/lib.rs"
+        );
+        assert_eq!(relative_edit_path("./src/lib.rs", root), "src/lib.rs");
+        assert_eq!(relative_edit_path("src/lib.rs", root), "src/lib.rs");
+        assert_eq!(
+            relative_edit_path("/elsewhere/x.rs", root),
+            "/elsewhere/x.rs"
         );
     }
 

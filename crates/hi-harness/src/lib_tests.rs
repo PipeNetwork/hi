@@ -1282,7 +1282,9 @@ async fn inspect_repeat_after_cargo_test_asks_for_verdict() {
         tool_chunk(0, "call_t", "bash", &test_cmd),
         usage_chunk(8, 4),
     ])];
-    for i in 0..2 {
+    // The first `list .` runs; the second is refused with a reminder; the
+    // third refusal caps identical repeats and the harness demands a verdict.
+    for i in 0..3 {
         scripts.push(Scripted::Sse(vec![
             tool_chunk(0, &format!("call_g{i}"), "list", &args),
             usage_chunk(10, 4),
@@ -1315,6 +1317,85 @@ async fn inspect_repeat_after_cargo_test_asks_for_verdict() {
         ui.statuses
     );
     assert!(ui.texts.join("").contains("join flow"));
+}
+
+#[tokio::test]
+async fn review_prompt_unique_inspects_are_not_a_stall() {
+    // Live ~/hi "review codebase": `list`, `repo_map`, then the harness
+    // injected "Stop inspecting" and the model answered "tell me what to
+    // do". A review owes nothing but an answer; reading new files is the
+    // work, so no stall demand may fire and no hint may reach Pipe.
+    let dir = tempfile::tempdir().unwrap();
+    let files = [
+        "Cargo.toml",
+        "main.rs",
+        "lib.rs",
+        "web.rs",
+        "db.rs",
+        "auth.rs",
+        "ws.rs",
+        "README.md",
+    ];
+    for name in files {
+        fs::write(dir.path().join(name), format!("// {name}\nfn f() {{}}\n")).unwrap();
+    }
+    let mut scripts = vec![Scripted::Sse(vec![
+        tool_chunk(0, "call_l", "list", &serde_json::json!({}).to_string()),
+        usage_chunk(8, 4),
+    ])];
+    for (i, name) in files.iter().enumerate() {
+        let read = serde_json::json!({"path": name}).to_string();
+        scripts.push(Scripted::Sse(vec![
+            tool_chunk(0, &format!("call_r{i}"), "read", &read),
+            usage_chunk(10, 4),
+        ]));
+    }
+    scripts.push(Scripted::Sse(vec![
+        text_chunk(
+            "Review: the ws handler drops errors; db.rs has no pool. Nothing else stands out.",
+        ),
+        usage_chunk(16, 12),
+    ]));
+    let Some(server) = MockPipe::new(scripts) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("review codebase", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(
+        outcome.error.is_none(),
+        "unique reads on a review must not error, got {:?}",
+        outcome.error
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("asking for")),
+        "no stall demand may fire on unique-file review reads, got {:?}",
+        ui.statuses
+    );
+    assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+    assert!(ui.texts.join("").contains("ws handler drops errors"));
+    let requests = server.bodies.lock().unwrap().len();
+    assert_eq!(
+        requests,
+        files.len() + 2,
+        "one request per scripted round and no hint-only extra request; got {requests}"
+    );
+    assert!(
+        !server
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| body.contains("Stop inspecting")),
+        "no stop-inspecting hint may be sent on a review turn"
+    );
 }
 
 #[tokio::test]
@@ -1661,6 +1742,11 @@ async fn plan_then_verify_then_offset_reads_never_complete_silently() {
     assert!(
         !ui.texts.join("").contains("should not silently complete"),
         "must not accept a silent or cop-out close after the stall"
+    );
+    assert_eq!(
+        ui.suggested_prompts,
+        vec![crate::CONTINUE_PLAN_PROMPT.to_string()],
+        "an unfinished plan must stay one Enter from resuming"
     );
 }
 
@@ -2071,6 +2157,92 @@ async fn later_improve_prompt_does_not_inherit_fix_intent() {
     );
     assert!(ui.texts.join("").contains("/metrics endpoint"));
     assert!(!ui.texts.join("").contains("should not be requested"));
+}
+
+#[tokio::test]
+async fn continue_with_open_plan_does_not_accept_apply_later_cop_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    fs::write(&path, "fn main() {}\n").unwrap();
+    let list = serde_json::json!({"path": "."}).to_string();
+    let edit = serde_json::json!({
+        "path": "main.rs",
+        "old_string": "fn main() {}",
+        "new_string": "fn main() { println!(\"ok\"); }"
+    })
+    .to_string();
+    let test_cmd = serde_json::json!({"command": "cargo test --offline --quiet"}).to_string();
+    let done = serde_json::json!({
+        "steps": [
+            {"title": "Assess Solana 3.x migration scope in hi-x402", "status": "done"},
+            {"title": "Fix major issues found", "status": "done"}
+        ]
+    })
+    .to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_l", "list", &list),
+            usage_chunk(8, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("What to change in main.rs: add a print. Say continue and I'll apply it."),
+            usage_chunk(10, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_e", "edit", &edit),
+            usage_chunk(12, 6),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_t", "bash", &test_cmd),
+            usage_chunk(14, 6),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_p", "update_plan", &done),
+            usage_chunk(16, 4),
+        ]),
+        Scripted::Sse(vec![text_chunk("applied the print"), usage_chunk(18, 4)]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after continue cop-out"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness
+        .messages
+        .push(Message::user("review for any major issues and fix"));
+    harness.plan = vec![
+        hi_tools::PlanStep {
+            title: "Assess Solana 3.x migration scope in hi-x402".into(),
+            status: hi_tools::PlanStatus::Active,
+        },
+        hi_tools::PlanStep {
+            title: "Fix major issues found".into(),
+            status: hi_tools::PlanStatus::Pending,
+        },
+    ];
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("continue", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(
+        ui.statuses.iter().any(|status| {
+            status.contains("asking for an edit")
+                || status.contains("model described a fix without a tool call")
+        }),
+        "continue with an open plan must not accept an apply-later cop-out, got {:?}",
+        ui.statuses
+    );
+    assert!(fs::read_to_string(&path).unwrap().contains("println"));
+    assert!(
+        !ui.texts
+            .join("")
+            .contains("should not be requested after continue cop-out")
+    );
 }
 
 #[tokio::test]

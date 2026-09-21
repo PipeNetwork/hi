@@ -30,10 +30,11 @@ pub async fn run(
 ) -> Result<()> {
     let stdout_tty = std::io::stdout().is_terminal();
     let stdin_tty = std::io::stdin().is_terminal();
-    let use_tui = !cli.plain && stdout_tty && stdin_tty;
+    let headless_review = cli.spec_review.is_some();
+    let use_tui = !cli.plain && stdout_tty && stdin_tty && !headless_review;
     let resume = crate::sentinel_resume::plan(cli, prompt.as_ref());
     let prompt = if resume.ignore_prompt { None } else { prompt };
-    let interactive = prompt.is_none() && stdin_tty;
+    let interactive = prompt.is_none() && stdin_tty && !headless_review;
     let route = match resolve_pipe_route(cli, file, settings) {
         Ok(route) => route,
         Err(err) if interactive => {
@@ -116,7 +117,7 @@ pub async fn run(
     }
 
     let login_config_path = cli.config.clone();
-    harness.set_turn_intent_mode(!use_tui && prompt.is_some(), cli.plain);
+    harness.set_turn_intent_mode(!use_tui && (prompt.is_some() || headless_review), cli.plain);
     if !harness.api_key().is_empty() {
         let _ = harness.refresh_provider_limits().await;
     }
@@ -136,7 +137,7 @@ pub async fn run(
             .await?
         {
             if let Some(path) = &cli.report {
-                write_turn_report(path, &outcome, &ui, &harness)?;
+                write_turn_report(path, &outcome, &ui, &harness, None)?;
             }
             if let Some(error) = outcome.error {
                 bail!(error);
@@ -145,6 +146,34 @@ pub async fn run(
         if resume.exit_after_resume || (managed_resume && cli.plain) {
             return Ok(());
         }
+    }
+
+    if let Some(paths) = &cli.spec_review {
+        let mut ui = StdoutUi {
+            quiet: cli.quiet,
+            confirm_edits: cli.confirm_edits,
+            ..StdoutUi::default()
+        };
+        let paths: Vec<String> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let run = crate::review_cli::run_headless(
+            &mut harness,
+            &mut ui,
+            &paths,
+            cli.spec_review_passes
+                .unwrap_or(crate::review_cli::DEFAULT_PASSES),
+            cli.spec_review_audit_only,
+        )
+        .await?;
+        if let Some(path) = &cli.report
+            && let Some(outcome) = &run.last_outcome
+        {
+            let review = crate::review_cli::review_report_json(&run.drive);
+            write_turn_report(path, outcome, &ui, &harness, Some(review))?;
+        }
+        return run.into_result();
     }
 
     if use_tui {
@@ -195,7 +224,7 @@ pub async fn run(
             .run_turn_cancellable(&prompt, &mut ui, TurnCancellation::new())
             .await?;
         if let Some(path) = &cli.report {
-            write_turn_report(path, &outcome, &ui, &harness)?;
+            write_turn_report(path, &outcome, &ui, &harness, None)?;
         }
         if let Some(error) = outcome.error {
             bail!(error);
@@ -227,7 +256,7 @@ pub async fn run(
                 Command::Quit => break,
                 Command::Help(_) => {
                     println!(
-                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /compact /jev-compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
+                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /review /compact /jev-compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
                     );
                     continue;
                 }
@@ -301,6 +330,25 @@ pub async fn run(
                     }
                     continue;
                 }
+                Command::Trust(arg) => {
+                    println!(
+                        "{}",
+                        hi_harness::trust_command(harness.workspace_root(), &arg)
+                    );
+                    continue;
+                }
+                Command::Review(arg) => match harness.review_command(&arg) {
+                    hi_harness::ReviewCommand::Start { prompt, notes } => {
+                        for note in notes {
+                            println!("{note}");
+                        }
+                        turn_line = Some(prompt);
+                    }
+                    hi_harness::ReviewCommand::Message(text) => {
+                        println!("{text}");
+                        continue;
+                    }
+                },
                 Command::Compact(arg) => {
                     let mut ui = hi_harness::TestUi::default();
                     let note = arg.trim();
@@ -462,12 +510,17 @@ pub async fn run(
             confirm_edits: cli.confirm_edits,
             ..StdoutUi::default()
         };
-        if let Err(err) = harness
+        let outcome = match harness
             .run_turn_cancellable(&prompt, &mut ui, TurnCancellation::new())
             .await
         {
-            eprintln!("{err:#}");
-        }
+            Ok(outcome) => Some(outcome),
+            Err(err) => {
+                eprintln!("{err:#}");
+                None
+            }
+        };
+        crate::review_cli::chain(&mut harness, &mut ui, outcome).await;
     }
     Ok(())
 }
@@ -922,11 +975,24 @@ impl Ui for StdoutUi {
         }
         let title = request.title();
         let details = request.details();
+        // A pipe or /dev/null on stdin would block `read_line` forever (or
+        // until the parent closes it). Unattended confirms are denied, never
+        // waited on. A real terminal read still moves off the runtime worker.
+        if !std::io::stdin().is_terminal() {
+            eprintln!("{title}\n{details}\nno terminal on stdin; not applied");
+            return Box::pin(async { ConfirmationResult::Unavailable });
+        }
         Box::pin(async move {
             eprintln!("{title}\n{details}\napply? [y/N] ");
-            let mut line = String::new();
-            match std::io::stdin().read_line(&mut line) {
-                Ok(_) if matches!(line.trim(), "y" | "Y" | "yes") => ConfirmationResult::Approved,
+            let answer = tokio::task::spawn_blocking(|| {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).map(|_| line)
+            })
+            .await;
+            match answer {
+                Ok(Ok(line)) if matches!(line.trim(), "y" | "Y" | "yes") => {
+                    ConfirmationResult::Approved
+                }
                 _ => ConfirmationResult::Rejected,
             }
         })
@@ -938,6 +1004,7 @@ fn write_turn_report(
     outcome: &TurnOutcome,
     ui: &StdoutUi,
     harness: &Harness,
+    review: Option<serde_json::Value>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -947,16 +1014,18 @@ fn write_turn_report(
         .iter()
         .filter(|message| message.role == hi_ai::Role::Assistant)
         .count() as u64;
-    let body = turn_report_json(outcome, ui, model_requests, harness.current_plan());
+    let body = turn_report_json(outcome, ui, model_requests, harness.current_plan(), review);
     std::fs::write(path, serde_json::to_vec_pretty(&body)?)
         .with_context(|| format!("writing report {}", path.display()))
 }
 
+/// `review` is the `hi --spec-review` object; `None` leaves the key out.
 fn turn_report_json(
     outcome: &TurnOutcome,
     ui: &StdoutUi,
     model_requests: u64,
     plan: &[hi_tools::PlanStep],
+    review: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let status = match outcome.stop_reason {
         TurnStopReason::Completed => "completed",
@@ -970,7 +1039,7 @@ fn turn_report_json(
             "guidance": guidance,
         })
     });
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "assistant_response": ui.assistant,
         "turn_end": ui.turn_end,
         "statuses": ui.statuses,
@@ -1003,7 +1072,11 @@ fn turn_report_json(
             "output_tokens": outcome.usage.output_tokens,
             "context_occupancy": outcome.usage.context_occupancy,
         },
-    })
+    });
+    if let Some(review) = review {
+        body["review"] = review;
+    }
+    body
 }
 
 #[cfg(test)]

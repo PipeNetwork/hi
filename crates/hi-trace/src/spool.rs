@@ -66,13 +66,16 @@ impl DurableSpool {
                 continue;
             }
             let sequence = segment_sequence(&entry.path())?;
+            if sequence <= acknowledged {
+                // Leftover from a crash between the ack write and the segment
+                // removal in `acknowledge_contiguous`: the ack already covers
+                // it, so drop it rather than wedging the spool on reopen.
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
             let body = read_regular(&entry.path(), maximum_bytes.saturating_sub(bytes))?;
             let record: SpoolRecord = serde_json::from_slice(&body)?;
             validate_record(&record, sequence)?;
-            ensure!(
-                sequence > acknowledged,
-                "acknowledged spool segment was not removed"
-            );
             sequences.push(sequence);
             bytes = bytes
                 .checked_add(body.len() as u64)
@@ -151,13 +154,18 @@ impl DurableSpool {
             highest >= self.acknowledged && highest < self.next_sequence,
             "invalid spool acknowledgement"
         );
+        // Persist the ack *before* removing the segments. If we crash after
+        // removing a segment but before the ack lands, `open` would see a
+        // missing segment with a stale ack and wedge the spool; writing the
+        // ack first means a crash leaves only orphaned segments, which `open`
+        // now drops (see `open`).
+        atomic_private_write(&self.directory.join("ack"), highest.to_string().as_bytes())?;
+        sync_dir(&self.directory)?;
         for sequence in self.acknowledged + 1..=highest {
             let path = self.segment_path(sequence);
             self.bytes = self.bytes.saturating_sub(fs::metadata(&path)?.len());
             fs::remove_file(path)?;
         }
-        atomic_private_write(&self.directory.join("ack"), highest.to_string().as_bytes())?;
-        sync_dir(&self.directory)?;
         self.acknowledged = highest;
         Ok(())
     }
@@ -254,6 +262,29 @@ mod tests {
         );
         recovered.acknowledge_contiguous(1).unwrap();
         drop(recovered);
+        let recovered = DurableSpool::open(&dir, 1024 * 1024).unwrap();
+        assert_eq!(recovered.acknowledged(), 1);
+        assert_eq!(
+            recovered.pending(10).unwrap()[0].priority,
+            SpoolPriority::Critical
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn orphaned_segments_below_the_ack_are_dropped_on_reopen() {
+        // Simulate a crash between the ack write and the segment removal in
+        // `acknowledge_contiguous`: the ack is advanced but the segment file
+        // is still present. `open` must drop the orphaned segment instead of
+        // wedging the spool.
+        let dir = std::env::temp_dir().join(format!("hi-spool-orphan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut spool = DurableSpool::open(&dir, 1024 * 1024).unwrap();
+        spool.append(SpoolPriority::Normal, b"one").unwrap();
+        spool.append(SpoolPriority::Critical, b"two").unwrap();
+        // Advance the ack to 1 without removing segment 1 (the crash window).
+        std::fs::write(dir.join("ack"), b"1").unwrap();
+        drop(spool);
         let recovered = DurableSpool::open(&dir, 1024 * 1024).unwrap();
         assert_eq!(recovered.acknowledged(), 1);
         assert_eq!(

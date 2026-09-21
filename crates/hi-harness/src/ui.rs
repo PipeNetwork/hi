@@ -235,6 +235,7 @@ pub trait Ui: Send {
     fn turn_end(&mut self, summary: &str);
     fn turn_error(&mut self, error_kind: &str, message: &str, guidance: &str);
     fn changed_files(&mut self, _files: Vec<String>) {}
+    fn suggested_prompt(&mut self, _text: &str) {}
     fn confirm(&mut self, _request: ConfirmationRequest) -> ConfirmationFuture<'_> {
         Box::pin(async { ConfirmationResult::Unavailable })
     }
@@ -251,6 +252,7 @@ pub struct TestUi {
     pub errors: Vec<(String, String)>,
     pub turn_ends: Vec<String>,
     pub plans: Vec<Vec<PlanStep>>,
+    pub suggested_prompts: Vec<String>,
     pub confirm: ConfirmationResult,
 }
 
@@ -282,6 +284,9 @@ impl Ui for TestUi {
     fn turn_error(&mut self, error_kind: &str, message: &str, _guidance: &str) {
         self.errors
             .push((error_kind.to_string(), message.to_string()));
+    }
+    fn suggested_prompt(&mut self, text: &str) {
+        self.suggested_prompts.push(text.to_string());
     }
     fn confirm(&mut self, _request: ConfirmationRequest) -> ConfirmationFuture<'_> {
         let result = self.confirm.clone();

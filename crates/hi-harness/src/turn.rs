@@ -153,7 +153,33 @@ impl Harness {
         let mut truncated_continuations = 0u32;
         let mut promised_continuations = 0u32;
         let mut typesafe_calls = 0u32;
-        let intent = Intent::from_prompt(&completion::latest_prompt_text(&self.messages, input));
+        // Review-drive turns pin their intent: the audit prompt mentions
+        // fixing, so the heuristic would demand edits mid-audit. The prompt
+        // check covers resumed turns, where `forced_intent` was not re-armed.
+        let prompt_text = completion::latest_prompt_text(&self.messages, input);
+        let review_intent = self.review_drive.intent_for_prompt(&prompt_text);
+        let intent = match self.forced_intent.take().or(review_intent) {
+            Some(intent) => intent,
+            None => completion::intent_for_turn(
+                &self.messages,
+                input,
+                completion::plan_is_open(&self.plan),
+            ),
+        };
+        if review_intent.is_some() {
+            if intent == Intent::Review && !self.live.effort_pinned() {
+                self.turn_effort = Some(hi_ai::ReasoningEffort::High);
+            }
+            if let Some(status) = self.review_turn_status(&prompt_text) {
+                ui.status(&status);
+            }
+        }
+        // A review-drive audit delivers a verdict block, not work. The
+        // promised-work nudge ("let me also check…" without a tool call)
+        // would push the model into editing mid-audit; a stop without a
+        // verdict is the drive's format re-ask instead.
+        let review_audit_turn = review_intent == Some(Intent::Review);
+        let mut audit_write_denials = 0u32;
         let mut facts = TurnFacts::new(intent, completion::plan_is_open(&self.plan));
         if managed_turn && resume {
             let (was_mutated, was_verified, paths) = self.client.recovered_managed_progress()?;
@@ -214,11 +240,13 @@ impl Harness {
             let messages = self.request_messages(continue_hint);
             let tools = advertised_tools();
             let liveness = self.liveness.clone();
+            let mut verdict_filter =
+                crate::review_stream::VerdictBlockFilter::new(review_audit_turn);
             let mut on_event = |delta: StreamDelta| {
                 liveness.note_progress();
                 match delta {
                     StreamDelta::Status(text) => ui.status(&text),
-                    StreamDelta::Text(text) => ui.assistant_text(&text),
+                    StreamDelta::Text(text) => verdict_filter.text(&text, &mut *ui),
                     StreamDelta::Reasoning(text) => ui.assistant_reasoning(&text),
                 }
             };
@@ -278,6 +306,7 @@ impl Harness {
                     return Err(err);
                 }
             };
+            verdict_filter.finish(&mut *ui);
             turn_usage.add(completion.usage);
             self.record_context_occupancy(completion.usage);
             ui.usage(
@@ -332,8 +361,9 @@ impl Harness {
                     });
                 }
                 truncated_continuations = 0;
-                if (promised_unfinished_work(&completion.text)
-                    || (!mutated && claimed_unapplied_fixes(&completion.text)))
+                if !review_audit_turn
+                    && (promised_unfinished_work(&completion.text)
+                        || (!mutated && claimed_unapplied_fixes(&completion.text)))
                     && promised_continuations < PROMISED_WORK_CONTINUATIONS
                 {
                     if !completion.is_empty() {
@@ -381,25 +411,14 @@ impl Harness {
                                 hi_liveness::InvariantCode::EmptyAssistantAfterTools,
                             );
                         }
-                        ui.turn_error(
-                            kind,
-                            message,
-                            if kind == "empty_stop" {
-                                "/retry to continue this turn"
-                            } else {
-                                "/retry to continue, or name the file to edit"
-                            },
-                        );
+                        ui.turn_error(kind, message, stop_guidance(kind, false));
                         self.session_usage.add(turn_usage);
                         ui.session_usage(self.session_usage);
                         self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                         self.close_persisted_turn(persisted_before, TurnStopReason::Error);
                         ui.changed_files(changed.clone());
-                        ui.turn_end(match kind {
-                            "empty_stop" => "empty stop after tools",
-                            "plan_stall" => "plan stalled without an edit",
-                            _ => "inspect budget exhausted",
-                        });
+                        self.offer_plan_continue(ui);
+                        ui.turn_end(stop_label(kind));
                         return Ok(TurnOutcome {
                             stop_reason: TurnStopReason::Error,
                             usage: turn_usage,
@@ -419,6 +438,7 @@ impl Harness {
                 self.close_persisted_turn(persisted_before, TurnStopReason::Completed);
                 let verification = self.run_verify(ui, cancel).await;
                 ui.changed_files(changed.clone());
+                self.offer_plan_continue(ui);
                 ui.turn_end(&summary(&completion, round));
                 return Ok(TurnOutcome {
                     stop_reason: TurnStopReason::Completed,
@@ -467,17 +487,24 @@ impl Harness {
                 } else {
                     None
                 };
+                let audit_denial = review_audit_turn
+                    .then(|| crate::review_guard::audit_denial(&call.name, &call.arguments))
+                    .flatten();
                 let outcome = if let Some(outcome) = cached {
                     outcome
+                } else if let Some(reason) = &audit_denial {
+                    audit_write_denials = audit_write_denials.saturating_add(1);
+                    crate::review_guard::audit_denied_outcome(reason)
                 } else {
                     self.tools
-                        .execute_with_auto(
+                        .execute_cancellable(
                             &call.id,
                             &call.name,
                             &call.arguments,
                             || self.permission_mode(),
                             auto,
                             ui,
+                            cancel,
                         )
                         .await
                 };
@@ -533,10 +560,22 @@ impl Harness {
                     probe_refusals = probe_refusals.saturating_add(1);
                     repeat_stop = Some(repeat_stop_summary(&outcome.content));
                 }
-                if self.should_stop_for_storm() {
+                let audit_write_storm =
+                    audit_write_denials >= crate::review_guard::AUDIT_WRITE_DENIALS_BEFORE_STOP;
+                if audit_write_storm || self.should_stop_for_storm() {
                     const MSG: &str = "identical tool storm; stopping the turn";
-                    if self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT
-                        || self.compact_suppressed
+                    let (kind, msg, label) = if audit_write_storm {
+                        (
+                            crate::review_guard::AUDIT_WRITE_STORM_KIND,
+                            crate::review_guard::AUDIT_WRITE_STORM_MSG,
+                            "audit turn kept trying to edit",
+                        )
+                    } else {
+                        ("tool_storm", MSG, "identical tool storm")
+                    };
+                    if !audit_write_storm
+                        && (self.occupancy_percent() >= AUTO_COMPACT_THRESHOLD_PERCENT
+                            || self.compact_suppressed)
                     {
                         hi_liveness::report_invariant(
                             &self.liveness,
@@ -544,8 +583,8 @@ impl Harness {
                         );
                     }
                     ui.turn_error(
-                        "tool_storm",
-                        MSG,
+                        kind,
+                        msg,
                         "supervised sessions auto-repair when compact has failed; otherwise /retry",
                     );
                     for later in &completion.tool_calls[i + 1..] {
@@ -563,12 +602,12 @@ impl Harness {
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                     self.close_persisted_turn(persisted_before, TurnStopReason::Error);
                     ui.changed_files(changed.clone());
-                    ui.turn_end("identical tool storm");
+                    ui.turn_end(label);
                     return Ok(TurnOutcome {
                         stop_reason: TurnStopReason::Error,
                         usage: turn_usage,
                         changed_files: changed,
-                        error: Some(MSG.into()),
+                        error: Some(msg.into()),
                         verification: None,
                     });
                 }
@@ -662,25 +701,14 @@ impl Harness {
                             hi_liveness::InvariantCode::EmptyAssistantAfterTools,
                         );
                     }
-                    ui.turn_error(
-                        kind,
-                        message,
-                        if kind == "plan_stall" {
-                            "supervised sessions auto-repair; otherwise /retry"
-                        } else {
-                            "/retry to continue, or name the file to edit"
-                        },
-                    );
+                    ui.turn_error(kind, message, stop_guidance(kind, true));
                     self.session_usage.add(turn_usage);
                     ui.session_usage(self.session_usage);
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                     self.close_persisted_turn(persisted_before, TurnStopReason::Error);
                     ui.changed_files(changed.clone());
-                    ui.turn_end(match kind {
-                        "empty_stop" => "empty stop after tools",
-                        "plan_stall" => "plan stalled without an edit",
-                        _ => "inspect budget exhausted",
-                    });
+                    self.offer_plan_continue(ui);
+                    ui.turn_end(stop_label(kind));
                     return Ok(TurnOutcome {
                         stop_reason: TurnStopReason::Error,
                         usage: turn_usage,
@@ -695,6 +723,7 @@ impl Harness {
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                     self.close_persisted_turn(persisted_before, TurnStopReason::Completed);
                     ui.changed_files(changed.clone());
+                    self.offer_plan_continue(ui);
                     ui.turn_end(repeat_stop.unwrap_or("stopped repeating a detached binary probe"));
                     return Ok(TurnOutcome {
                         stop_reason: TurnStopReason::Completed,
@@ -707,6 +736,12 @@ impl Harness {
                 Decision::Proceed => {}
             }
             round += 1;
+        }
+    }
+
+    fn offer_plan_continue(&self, ui: &mut dyn Ui) {
+        if completion::plan_is_open(&self.plan) && !self.plan_drive.paused {
+            ui.suggested_prompt(crate::CONTINUE_PLAN_PROMPT);
         }
     }
 
@@ -994,24 +1029,34 @@ impl Harness {
             .set_state(hi_liveness::HarnessState::Verifying);
         self.liveness
             .emit(hi_liveness::EventCode::VerifyStart, None, None, None);
-        let result =
-            match hi_tools::run_check_in_with_runner(self.tools.runner_ref(), command).await {
-                Ok(execution) => {
-                    let text = execution.display_content();
-                    ui.tool_call("verify", command);
-                    ui.tool_result("verify", &text);
-                    self.liveness.note_progress();
-                    Some(if execution.status == hi_tools::ToolStatus::Succeeded {
-                        "passed".into()
-                    } else {
-                        "failed".into()
-                    })
-                }
-                Err(err) => {
-                    ui.status(&format!("verify failed to start: {err:#}"));
-                    Some("failed".into())
-                }
-            };
+        // Verify has no default wall clock, so Esc must be able to end it.
+        // Dropping the run future kills the whole process group.
+        let run = hi_tools::run_check_in_with_runner(self.tools.runner_ref(), command);
+        let ran = tokio::select! {
+            ran = run => Some(ran),
+            _ = cancel.cancelled() => None,
+        };
+        let result = match ran {
+            Some(Ok(execution)) => {
+                let text = execution.display_content();
+                ui.tool_call("verify", command);
+                ui.tool_result("verify", &text);
+                self.liveness.note_progress();
+                Some(if execution.status == hi_tools::ToolStatus::Succeeded {
+                    "passed".into()
+                } else {
+                    "failed".into()
+                })
+            }
+            Some(Err(err)) => {
+                ui.status(&format!("verify failed to start: {err:#}"));
+                Some("failed".into())
+            }
+            None => {
+                ui.status("verify cancelled");
+                Some("cancelled".into())
+            }
+        };
         self.liveness
             .emit(hi_liveness::EventCode::VerifyEnd, None, None, None);
         self.liveness.set_state(hi_liveness::HarnessState::Idle);
@@ -1041,8 +1086,17 @@ const CIRCULAR_DUMP_STUB: &str = "\
 [omitted a truncated repeating review list. Do not continue numbering. \
 Call tools to apply remaining fixes, or give a short verdict.]";
 
+/// First-person promises of a next step with no tool call behind them.
+/// Descriptive phrasing such as "what to change" is deliberately absent:
+/// [`completion::INSPECT_STOP_VERDICT_HINT`] asks for exactly that wording
+/// as a verdict, so flagging it would loop the harness against itself.
+/// Quote characters are dropped so `Say "continue"` matches.
 fn promised_unfinished_work(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let lower: String = text
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !matches!(ch, '"' | '`' | '*' | '_'))
+        .collect();
     let plans = [
         "let me fix",
         "let me also",
@@ -1062,6 +1116,10 @@ fn promised_unfinished_work(text: &str) -> bool {
         "i will implement",
         "i'll now",
         "next i'll",
+        "i'll apply",
+        "i will apply",
+        "going to apply",
+        "say continue",
     ];
     plans.iter().any(|needle| lower.contains(needle))
 }
@@ -1208,6 +1266,29 @@ fn guidance(error: &PipeError) -> &'static str {
     }
 }
 
+/// User-facing next step for a completion-policy error. `after_tools` is
+/// the tool-round path, where a plan stall is what supervised sessions
+/// auto-repair; on a model stop the same kind only offers `/retry`.
+fn stop_guidance(kind: &str, after_tools: bool) -> &'static str {
+    match kind {
+        "empty_stop" if !after_tools => "/retry to continue this turn",
+        "plan_stall" if after_tools => "supervised sessions auto-repair; otherwise /retry",
+        "unverified_stop" => {
+            "run the project's test command, or `/verify <cmd>` to check after the turn"
+        }
+        _ => "/retry to continue, or name the file to edit",
+    }
+}
+
+fn stop_label(kind: &str) -> &'static str {
+    match kind {
+        "empty_stop" => "empty stop after tools",
+        "plan_stall" => "plan stalled without an edit",
+        "unverified_stop" => "edit applied but never verified",
+        _ => "inspect budget exhausted",
+    }
+}
+
 impl ToolHost {
     pub(crate) fn runner_ref(&self) -> &hi_tools::ProcessRunner {
         self.runner_handle()
@@ -1217,11 +1298,36 @@ impl ToolHost {
 #[cfg(test)]
 mod helper_tests {
     use super::repeat_stop_summary;
-    use super::{claimed_unapplied_fixes, repeating_review_dump};
+    use super::{claimed_unapplied_fixes, promised_unfinished_work, repeating_review_dump};
     use crate::completion::{
-        Intent, latest_prompt_text, looks_like_verify, user_asked_to_fix, user_asked_to_implement,
+        Intent, intent_for_turn, latest_prompt_text, looks_like_verify, user_asked_to_fix,
+        user_asked_to_implement,
     };
     use hi_ai::Message;
+
+    #[test]
+    fn promised_unfinished_work_catches_apply_later_cop_out() {
+        assert!(promised_unfinished_work(
+            r#"**What to change in `hi-x402`:** drop solana-sdk. Say "continue" and I'll apply it."#
+        ));
+        assert!(promised_unfinished_work(
+            "I'll apply the Cargo.toml pin next."
+        ));
+        assert!(promised_unfinished_work(
+            r#"Say "continue" when you want these changes made."#
+        ));
+        assert!(!promised_unfinished_work(
+            "cargo test passed. hi-x402 now builds against the split crates."
+        ));
+        // INSPECT_STOP_VERDICT_HINT asks for "what to change" as a verdict;
+        // that wording alone must never read as a cop-out.
+        assert!(!promised_unfinished_work(
+            "What to change: nothing. The current tree already handles the retry path."
+        ));
+        assert!(!promised_unfinished_work(
+            "What to change in `server.rs`: the timeout constant should be 30s, not 3s."
+        ));
+    }
 
     #[test]
     fn user_asked_to_fix_matches_review_and_repair_prompts() {
@@ -1265,6 +1371,8 @@ mod helper_tests {
             Intent::from_prompt(&latest_prompt_text(&older, "do all of that")),
             Intent::Implement
         );
+        assert_eq!(intent_for_turn(&older, "continue", true), Intent::Implement);
+        assert_eq!(intent_for_turn(&older, "continue", false), Intent::Fix);
     }
 
     #[test]

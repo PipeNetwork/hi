@@ -307,6 +307,24 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub review_target: Option<PathBuf>,
 
+    /// Headless spec review (the `/review` slash command): audit the code
+    /// against plan.md/spec.md (or the given plan/spec files and scope
+    /// directories; with neither on a large repo, the uncommitted changes or
+    /// the last commit; `all` chunks the whole repo), fix P0/P1 defects in a
+    /// bounded loop, then exit 0 clean, 3 incomplete coverage, 4 open P0/P1,
+    /// 5 stopped early. `--report` adds a `review` object. (`--review` is the
+    /// independent-review policy.)
+    #[arg(long, value_name = "PATH", num_args = 0.., conflicts_with_all = ["prompt", "goal", "eval_input"])]
+    pub spec_review: Option<Vec<PathBuf>>,
+
+    /// Maximum fix passes for `--spec-review` (default 3).
+    #[arg(long, value_name = "N", requires = "spec_review")]
+    pub spec_review_passes: Option<u32>,
+
+    /// `--spec-review` reports coverage and defects only; no fix loop.
+    #[arg(long, requires = "spec_review")]
+    pub spec_review_audit_only: bool,
+
     /// Run this session in an isolated copy-on-write worktree of the current
     /// repo (one-shot `hi "prompt" --worktree` or interactive). The copy is
     /// removed when the process exits. Distinct from `-p`/`--profile`.

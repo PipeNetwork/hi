@@ -311,7 +311,7 @@ impl crate::App {
             .collect::<Vec<_>>()
             .join(", ");
         Some(Line::styled(
-            format!("changed: {summary}  (Ctrl-G for review)"),
+            format!("changed: {summary}  (click or Ctrl-G to review)"),
             dim(),
         ))
     }

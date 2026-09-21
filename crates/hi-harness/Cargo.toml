@@ -10,6 +10,7 @@ hi-ai.workspace = true
 hi-liveness.workspace = true
 hi-tools.workspace = true
 blake3.workspace = true
+ignore.workspace = true
 hi-lsp.workspace = true
 hi-dashboard-store.workspace = true
 anyhow.workspace = true

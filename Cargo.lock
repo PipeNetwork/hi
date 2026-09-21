@@ -3792,6 +3792,7 @@ dependencies = [
  "hi-lsp",
  "hi-test-utils",
  "hi-tools",
+ "ignore",
  "reqwest",
  "rustix",
  "serde",

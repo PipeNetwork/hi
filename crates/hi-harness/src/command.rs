@@ -19,6 +19,10 @@ pub enum Command {
     Permissions(String),
     Rewind(String),
     Verify(String),
+    Trust(String),
+    /// `/review [audit|status|stop] [all|path...]`: spec-coverage audit plus
+    /// the bounded fix loop. The raw argument string is parsed by `ReviewArgs`.
+    Review(String),
     Diff,
     Files,
     Copy(String),
@@ -94,12 +98,22 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "diff",
         args: "",
-        help: "show working-tree changes",
+        help: "show changes since HEAD (the live Changes pane in the TUI)",
     },
     CommandSpec {
         name: "verify",
         args: "[cmd|off]",
         help: "set a post-turn check command",
+    },
+    CommandSpec {
+        name: "trust",
+        args: "[on|off]",
+        help: "persist folder trust so hi.toml remote routes, hooks, and MCP load here",
+    },
+    CommandSpec {
+        name: "review",
+        args: "[audit|status|stop] [all|path...]",
+        help: "audit the code against plan.md/spec.md (or recent git work), then fix P0/P1 defects in a bounded loop",
     },
     CommandSpec {
         name: "login",
@@ -241,6 +255,7 @@ pub const CORE_COMMANDS: &[&str] = &[
     "auto",
     "yolo",
     "verify",
+    "review",
     "undo",
     "retry",
     "diff",
@@ -294,6 +309,8 @@ pub fn parse(line: &str) -> Option<Command> {
         }),
         "rewind" => Command::Rewind(arg),
         "verify" | "test" => Command::Verify(arg),
+        "trust" => Command::Trust(arg),
+        "review" => Command::Review(arg),
         "diff" | "changes" => Command::Diff,
         "files" => Command::Files,
         "copy" | "cp" => Command::Copy(arg),
@@ -317,6 +334,45 @@ pub fn parse(line: &str) -> Option<Command> {
             "unknown command /{other} — type /help for commands"
         )),
     })
+}
+
+/// `/trust [on|off]`: show or change the persisted folder-trust grant for
+/// `workspace_root`. This is the only in-product way to grant trust now that
+/// startup never prompts on stdin. Hooks and repo MCP read the store live;
+/// project `hi.toml` provider routes are merged at config load, so those
+/// apply on the next start.
+pub fn trust_command(workspace_root: &std::path::Path, arg: &str) -> String {
+    use hi_tools::folder_trust as trust;
+    let key = trust::workspace_key(workspace_root);
+    match arg.trim().to_ascii_lowercase().as_str() {
+        "" | "status" => {
+            let store = trust::trust_store_file()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable (no user profile)".into());
+            format!(
+                "folder trust: {} · {} · store {store} · /trust on|off",
+                if trust::folder_trust_granted(workspace_root) {
+                    "granted"
+                } else {
+                    "not granted"
+                },
+                key.display(),
+            )
+        }
+        "on" | "grant" | "yes" | "allow" => match trust::grant_folder_trust(workspace_root) {
+            Ok(()) => format!(
+                "folder trust granted for {} · hi.toml provider routes load on the next start",
+                key.display()
+            ),
+            Err(error) => format!("could not persist folder trust: {error}"),
+        },
+        "off" | "revoke" | "no" | "deny" => match trust::try_revoke_folder_trust(workspace_root) {
+            Ok(true) => format!("folder trust revoked for {}", key.display()),
+            Ok(false) => "folder trust was not granted here".into(),
+            Err(error) => format!("could not update folder trust: {error}"),
+        },
+        _ => "use /trust, /trust on, or /trust off".into(),
+    }
 }
 
 /// `/effort` / trailing `/model` token: a reasoning level, or off.
@@ -497,6 +553,31 @@ mod tests {
         assert!(
             matches!(unknown, Command::Unknown(ref msg) if msg.contains("unknown command /nope"))
         );
+    }
+
+    #[test]
+    fn parses_review_command_and_subcommands() {
+        assert_eq!(parse("/review"), Some(Command::Review(String::new())));
+        assert_eq!(
+            parse("/review audit"),
+            Some(Command::Review("audit".into()))
+        );
+        assert_eq!(
+            parse("/review status"),
+            Some(Command::Review("status".into()))
+        );
+        assert_eq!(parse("/review stop"), Some(Command::Review("stop".into())));
+        assert_eq!(
+            parse("/review docs/spec.md plan.md"),
+            Some(Command::Review("docs/spec.md plan.md".into()))
+        );
+        assert!(matches!(parse("/audit"), Some(Command::Unknown(_))));
+        assert_eq!(
+            parse("  /review   audit   src/  "),
+            Some(Command::Review("audit   src/".into()))
+        );
+        assert!(COMMANDS.iter().any(|s| s.name == "review"));
+        assert!(CORE_COMMANDS.contains(&"review"));
     }
 
     #[test]

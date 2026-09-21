@@ -51,13 +51,18 @@ fn wide_terminal_docks_review_beside_transcript() {
         screen.contains("hello from the transcript"),
         "transcript stays visible:\n{screen}"
     );
+    assert!(screen.contains("Changes"), "review pane title:\n{screen}");
     assert!(
-        screen.contains("Diff review"),
-        "review pane title:\n{screen}"
+        !screen.contains("Changes (Ctrl-G)"),
+        "docked pane is not the overlay title:\n{screen}"
     );
     assert!(
-        !screen.contains("Diff review (Ctrl-G)"),
-        "docked pane is not the overlay title:\n{screen}"
+        screen.contains("2 files changed  +2 -2 · working tree"),
+        "Claude-style summary row:\n{screen}"
+    );
+    assert!(
+        screen.contains("  a.rs") && screen.contains("+1 -1"),
+        "per-file counts under the summary:\n{screen}"
     );
     assert!(
         screen.contains("tab:focus diff") && screen.contains("ctrl+g:close"),
@@ -111,10 +116,126 @@ fn narrow_terminal_keeps_exclusive_overlay() {
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
-        screen.contains("Diff review (Ctrl-G)"),
+        screen.contains("Changes (Ctrl-G)"),
         "overlay title:\n{screen}"
     );
     assert!(screen.contains("n/p hunks"), "overlay footer:\n{screen}");
+}
+
+#[test]
+fn clicking_a_file_row_jumps_to_its_section() {
+    let mut app = test_app("openai", "gpt-4o");
+    open_docked(&mut app);
+    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let files = app.review_files();
+    assert_eq!(files.len(), 2);
+    let b_list_row = files[1].list_row.expect("b.rs is listed");
+    let hit = app.review.rect;
+    // Inner row r paints at screen row rect.y + 1 + r while scrolled to 0.
+    app.handle_mouse(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.x.saturating_add(4),
+        hit.y.saturating_add(1).saturating_add(b_list_row as u16),
+    ));
+    assert_eq!(
+        app.review.scroll, files[1].section_row,
+        "the pane scrolls to b.rs's section"
+    );
+    let hunks = app.review_hunks();
+    let selected = app
+        .review
+        .selected_hunk
+        .expect("b.rs's first hunk is selected");
+    assert_eq!(hunks[selected].path, "b.rs");
+    assert!(
+        app.input.text().starts_with("@b.rs:10-12"),
+        "chip: {}",
+        app.input.text()
+    );
+}
+
+#[test]
+fn refresh_keeps_scroll_and_selection_while_the_diff_still_has_them() {
+    let mut app = test_app("openai", "gpt-4o");
+    open_docked(&mut app);
+    app.review.focused = true;
+    app.dispatch_key(&key(KeyCode::Char('n')));
+    app.dispatch_key(&key(KeyCode::Char('n')));
+    let selected = app.review.selected_hunk.expect("a hunk is selected");
+    let scroll = app.review.scroll;
+    assert!(selected < app.review_hunks().len());
+    // `/workspace` is not a repository, so the reload yields an empty diff:
+    // the selection must be dropped rather than point past the end, while
+    // the reader's scroll position survives.
+    app.refresh_review_if_open();
+    assert!(app.review.open);
+    assert_eq!(app.review.scope, crate::review::ReviewScope::Session);
+    assert_eq!(
+        app.review.scroll, scroll,
+        "scroll position survives a refresh"
+    );
+    assert_eq!(app.review.selected_hunk, None);
+    assert!(app.review_hunks().is_empty());
+}
+
+#[test]
+fn slash_files_lists_the_session_summary() {
+    let mut app = test_app("openai", "gpt-4o");
+    let empty: Vec<String> = app
+        .session_files_lines()
+        .iter()
+        .map(crate::render::line_text)
+        .collect();
+    assert_eq!(empty, vec!["(no changes this session yet)".to_string()]);
+
+    // Paths the session touched that no longer differ from HEAD are still
+    // reported, so the list matches what the model did.
+    app.session_changed_files = vec!["src/reverted.rs".into()];
+    let lines: Vec<String> = app
+        .session_files_lines()
+        .iter()
+        .map(crate::render::line_text)
+        .collect();
+    assert_eq!(lines[0], "(no changes this session yet)");
+    assert_eq!(lines[1], "  no pending changes:");
+    assert_eq!(lines[2], "    src/reverted.rs");
+}
+
+#[test]
+fn slash_diff_opens_the_pane_and_refocuses_it() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.frame_width = 120;
+    app.show_changes();
+    assert!(app.review.open);
+    assert!(!app.review.focused, "opening leaves the composer focused");
+    assert_eq!(app.review.scope, crate::review::ReviewScope::Session);
+    app.show_changes();
+    assert!(app.review.open, "a second /diff keeps the pane open");
+    assert!(app.review.focused, "…and hands it focus");
+}
+
+#[test]
+fn edit_results_refresh_an_open_pane() {
+    let mut app = test_app("openai", "gpt-4o");
+    open_docked(&mut app);
+    assert_eq!(app.review.source, crate::review::ReviewSource::WorkingTree);
+    assert_eq!(app.review_files().len(), 2);
+    app.push_result(
+        "write",
+        "1 addition, 0 deletions\n--- /dev/null\n+++ note.txt\n   1 + hello\n",
+        "write note.txt",
+    );
+    assert_eq!(app.session_changed_files, vec!["note.txt".to_string()]);
+    assert_eq!(
+        app.review.source,
+        crate::review::ReviewSource::Session,
+        "after the first edit the pane follows the session, not the tree"
+    );
+    assert!(
+        app.review_files().is_empty(),
+        "the pane re-diffed (no repository at /workspace, so nothing to list)"
+    );
 }
 
 #[test]

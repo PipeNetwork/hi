@@ -80,6 +80,7 @@ impl crate::App {
             finished_at: None,
             current_tool: None,
             current_tool_started: None,
+            last_turn_event_at: None,
             queue: VecDeque::new(),
             queue_paused: false,
             mid_turn_offered: VecDeque::new(),
@@ -155,6 +156,7 @@ impl crate::App {
             suggested_prompt: None,
             suggested_prompt_dismissed: false,
             review: crate::review::ReviewState::default(),
+            spec_review_status: None,
             auto_approve_session: false,
             auto_approve_paths: Vec::new(),
             auto_approve_mcp: Vec::new(),
@@ -274,6 +276,7 @@ impl crate::App {
         }
         self.working = working;
         self.started = working.then(Instant::now);
+        self.last_turn_event_at = self.started;
         self.current_tool = None;
         self.current_tool_started = None;
         self.run_streamed_this_call = false;

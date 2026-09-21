@@ -298,14 +298,15 @@ Slash commands (TUI or plain REPL):
 | `/help` | list slash commands |
 | `/model [id]` | set by id, or — with no id — open an interactive picker over the live model list (type to filter, ↑/↓, Enter). |
 | `/verify [cmd\|off]` | post-turn check command (does not auto-repair) |
-| `/files` | list files changed this session |
+| `/files` | files changed this session, with the Changes pane's `N files changed +A -D` summary and per-file counts |
 | `/config [reasoning <level>]` | show or set request settings |
 | `/mouse [on\|off]` | click-to-expand vs terminal highlight-to-copy |
-| `/diff` | show working-tree changes |
+| `/diff` (`/changes`) | open the Changes pane (same as `Ctrl-G`): the session's running diff |
 | `/copy` | copy the last assistant reply |
 | `/compact [context]` | summarize the conversation to reclaim context |
 | `/context` | context-window breakdown (`/usage` Context tab) |
 | `/retry` | re-run the last prompt |
+| `/review [audit\|status\|stop] [all\|path…]` | spec review: audit the code against `plan.md`/`spec.md` (or, on a large repo without one, the uncommitted changes or the last commit; `all` chunks the whole repo), report coverage and defects, then fix P0/P1s in a bounded loop; headless `hi --spec-review` ([docs](review-command.md)) |
 | `/undo` | restore files from the last turn checkpoint |
 | `/status` | session status |
 | `/usage` (`/cost`) | credit/token usage modal; `/usage manage` opens billing |
@@ -334,6 +335,22 @@ Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to 
 **Auto-memory.** At the end of an interactive session, `hi` distills durable lessons into `.hi/memory.md` (and user-level `~/.config/hi/memory.md`) with stable `[#n]` bullet ids. `/remember` appends a numbered note; `memory_update` / `memory_forget` correct it; `/undo-memory` restores the previous file. Disable with `--no-memory`.
 
 **Auto-compact.** Occupancy is `max(last Pipe request tokens, local estimate)` against the active model's `/models` context window (128k if metadata is missing). Once occupancy passes ~45% of that window, `hi` stubs tool-result bodies from *earlier turns* (keeps the newest six of those verbatim) and drops stale thinking — the in-progress turn's reads stay intact so the model can still see the files. If occupancy is still ~85%, older current-turn results may be stubbed too, then the model is asked for a structured summary and the live session is rewritten to the original user query plus that summary. If `/jev-compact` is on (session-only; needs `TYPESAFE_API_KEY`), that 85% reclaim scores tool pairs with Jev first and prunes in place instead of summarizing when occupancy then drops below 85%. Jev failures fall back to cheap shrink + summary. If the summary call fails while still over 85%, a local emergency compact runs and Sentinel may auto-repair. `--no-auto-compact` disables the automatic shrink/summary; `/compact [context]` still shrinks and requests a summary unless Jev prune already dropped occupancy under 85%. Tool payloads are also bounded: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
+
+**Changes pane.** Every edit paints as a Claude Code-style row in the
+transcript — `Updated src/ws.rs (+4 -1)` (or `Created` / `Deleted`) with the
+numbered green/red hunks inline underneath; diffs longer than a dozen rows fold
+to `… N more lines` and open on click or `Ctrl-O`. `Ctrl-G` (or `/diff`) opens
+the running diff of the whole session: a `8 files changed +394 -46` summary,
+one row per file with its own counts (`new` / `deleted` flagged), then each
+file's hunks under a bold path header. The pane follows the session — it
+re-diffs as each edit lands, at turn end, and after `/undo` — and files the
+model creates appear even before git tracks them. Until the session has edited
+anything it shows the whole working tree. Wide terminals dock it beside the
+transcript (`Tab` focuses it, drag the `│` to resize); narrow ones use a
+full-screen overlay. Click a file row to jump to its section; click a hunk or
+press `n`/`p` to select one, which writes an `@path:N-M` chip into the prompt
+so the next message quotes that hunk for the model. Clicking the `changed: …`
+line above the prompt opens the pane pinned to the last turn's files.
 
 **Undo.** Before mutation, `hi` creates a recoverable checkpoint: a dangling
 commit with a throwaway index when Git is usable, otherwise a content-addressed

@@ -325,24 +325,40 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
     parse_version(latest) > parse_version(current)
 }
 
-/// Parse a version string into a tuple of (major, minor, patch, is_release).
-fn parse_version(v: &str) -> (u32, u32, u32, bool) {
+/// Parse a version string into a tuple of (major, minor, patch, is_release,
+/// prerelease_rank). `prerelease_rank` orders prereleases of the same
+/// `major.minor.patch` numerically (`1.0.0-rc.2` > `1.0.0-rc.1`); a release
+/// has rank `u64::MAX` so it always sorts after its own prereleases.
+fn parse_version(v: &str) -> (u32, u32, u32, bool, u64) {
     let v = v.trim_start_matches('v');
     // Build metadata does not participate in ordering; without stripping it,
     // "1.2.3+build" parses as (1, 2, 0) and the identical release looks newer
     // forever.
     let v = v.split('+').next().unwrap_or(v);
-    let (core, is_release) = match v.split_once('-') {
-        Some((core, _)) => (core, false),
-        None => (v, true),
+    let (core, prerelease) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
     };
     let mut iter = core.split('.').map(|p| p.parse().unwrap_or(0));
-    (
+    let (major, minor, patch) = (
         iter.next().unwrap_or(0),
         iter.next().unwrap_or(0),
         iter.next().unwrap_or(0),
-        is_release,
-    )
+    );
+    let (is_release, prerelease_rank) = match prerelease {
+        None => (true, u64::MAX),
+        Some(pre) => {
+            // Rank by the first numeric identifier in the suffix (e.g. the
+            // `2` in `rc.2`). Non-numeric suffixes all rank 0, so they compare
+            // equal to each other but still sort after a release.
+            let rank = pre
+                .split('.')
+                .find_map(|part| part.parse::<u64>().ok())
+                .unwrap_or(0);
+            (false, rank)
+        }
+    };
+    (major, minor, patch, is_release, prerelease_rank)
 }
 
 /// Print an [`UpdateStatus`] to stdout in human-readable format.
@@ -411,20 +427,20 @@ mod tests {
 
     #[test]
     fn parse_version_handles_missing_parts() {
-        assert_eq!(parse_version("1"), (1, 0, 0, true));
-        assert_eq!(parse_version("1.2"), (1, 2, 0, true));
-        assert_eq!(parse_version("1.2.3"), (1, 2, 3, true));
+        assert_eq!(parse_version("1"), (1, 0, 0, true, u64::MAX));
+        assert_eq!(parse_version("1.2"), (1, 2, 0, true, u64::MAX));
+        assert_eq!(parse_version("1.2.3"), (1, 2, 3, true, u64::MAX));
     }
 
     #[test]
     fn parse_version_handles_invalid_parts() {
-        assert_eq!(parse_version("a.b.c"), (0, 0, 0, true));
-        assert_eq!(parse_version("1.x.3"), (1, 0, 3, true));
+        assert_eq!(parse_version("a.b.c"), (0, 0, 0, true, u64::MAX));
+        assert_eq!(parse_version("1.x.3"), (1, 0, 3, true, u64::MAX));
     }
 
     #[test]
     fn build_metadata_does_not_affect_ordering() {
-        assert_eq!(parse_version("1.2.3+build.5"), (1, 2, 3, true));
+        assert_eq!(parse_version("1.2.3+build.5"), (1, 2, 3, true, u64::MAX));
         // Without stripping metadata, the identical release looked newer than
         // the running "1.2.3+build" binary forever.
         assert!(!is_newer("1.2.3", "1.2.3+build.5"));
@@ -434,6 +450,14 @@ mod tests {
     fn release_is_newer_than_its_own_prerelease() {
         assert!(is_newer("1.0.0", "1.0.0-rc.1"));
         assert!(!is_newer("1.0.0-rc.1", "1.0.0"));
+    }
+
+    #[test]
+    fn prereleases_of_the_same_version_order_numerically() {
+        assert!(is_newer("1.0.0-rc.2", "1.0.0-rc.1"));
+        assert!(!is_newer("1.0.0-rc.1", "1.0.0-rc.2"));
+        assert!(is_newer("1.0.0-beta.2", "1.0.0-alpha.1"));
+        assert!(!is_newer("1.0.0-rc.1", "1.0.0-rc.1"));
     }
 
     #[test]

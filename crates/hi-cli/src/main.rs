@@ -8,6 +8,7 @@ mod liveness;
 mod paths;
 mod pipe_session;
 mod prompt;
+mod review_cli;
 mod review_target;
 mod roster;
 mod runner;
@@ -35,6 +36,11 @@ use review_target::chdir_to_review_target;
 
 fn main() {
     if let Err(error) = run_main() {
+        // `hi --spec-review` outcomes are results, not failures: plain line, no red.
+        if let Some(exit) = error.downcast_ref::<review_cli::ReviewExit>() {
+            eprintln!("{exit}");
+            std::process::exit(exit.code);
+        }
         eprintln!("\x1b[31merror: {error:#}\x1b[0m");
         std::process::exit(top_level_error_code(&error));
     }

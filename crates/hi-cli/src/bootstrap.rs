@@ -80,7 +80,8 @@ pub(crate) fn validate_tui_event_trace_request(
         || cli.eval_input.is_some()
         || cli.eval_output.is_some()
         || cli.quiet
-        || cli.skeptic_review;
+        || cli.skeptic_review
+        || cli.spec_review.is_some();
     if headless_mode || !stdin_is_tty || !stdout_is_tty {
         anyhow::bail!("usage: --tui-events-jsonl is valid only for a full interactive TUI session");
     }

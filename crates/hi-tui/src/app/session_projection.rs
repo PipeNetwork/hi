@@ -34,6 +34,9 @@ impl App {
     }
 
     pub(crate) fn apply(&mut self, event: UiEvent) {
+        if self.working {
+            self.last_turn_event_at = Some(std::time::Instant::now());
+        }
         self.apply_legacy(event);
     }
 

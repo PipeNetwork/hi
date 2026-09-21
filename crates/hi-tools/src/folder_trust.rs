@@ -10,12 +10,17 @@
 //! 2. Store (self/ancestor recorded trusted) → trusted.
 //! 3. No repo-local code-exec configs present → trusted (nothing to gate).
 //! 4. Key unrecordable (over-broad root like `$HOME`) → untrusted.
-//! 5. Interactive TTY → prompt the user (y/N).
+//! 5. Interactive TTY → `Prompt`: the frontend may ask through its own UI.
 //! 6. Otherwise (headless) → untrusted.
+//!
+//! Nothing in this module reads stdin. A blocking prompt during startup or
+//! mid-turn is indistinguishable from a hang once a TUI owns the terminal, so
+//! `Prompt` resolves to untrusted here and grants come from
+//! [`grant_folder_trust`].
 //!
 //! Trust state is persisted in `~/.hi/trusted_folders.toml` (or the explicit
 //! `HI_TRUST_STORE` path). All frontends use this store; a second independent
-//! trust database would make `/trust on` disagree with MCP/hook admission.
+//! trust database would make a frontend grant disagree with MCP/hook admission.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -579,32 +584,16 @@ pub fn folder_trust_granted(cwd: &Path) -> bool {
 /// endpoint. Unlike the ordinary code-exec gate, this intentionally does not
 /// honor the local-build feature shortcut: remote data routing always needs a
 /// durable, explicit grant.
+///
+/// This runs during config load at startup and never prompts on stdin: an
+/// untrusted route fails closed and the profile resolver reports how to
+/// persist the grant when that route is actually selected.
 pub fn resolve_sensitive_config_trust(cwd: &Path) -> TrustOutcome {
     let key = workspace_key(cwd);
     if !is_unsafe_trust_root(&key) && TrustStore::load().is_trusted(&key) {
         return TrustOutcome::Trusted;
     }
-    if is_unsafe_trust_root(&key) || !is_interactive() {
-        return TrustOutcome::Untrusted;
-    }
-    eprintln!(
-        "This workspace's hi.toml configures a remote provider route that can receive \
-         prompts or repository data — trust it and persist that authorization? [y/N]"
-    );
-    let _ = std::io::stderr().flush();
-    let mut answer = String::new();
-    match std::io::stdin().read_line(&mut answer) {
-        Ok(_) if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") => {
-            match grant_folder_trust(cwd) {
-                Ok(()) => TrustOutcome::Trusted,
-                Err(error) => {
-                    eprintln!("Could not persist folder trust: {error}");
-                    TrustOutcome::Untrusted
-                }
-            }
-        }
-        _ => TrustOutcome::Untrusted,
-    }
+    TrustOutcome::Untrusted
 }
 
 /// Grant trust for `cwd` and persist to the store.
@@ -637,35 +626,19 @@ pub fn revoke_folder_trust(cwd: &Path) -> bool {
     try_revoke_folder_trust(cwd).unwrap_or(false)
 }
 
-/// Resolve trust for `cwd`: gather inputs, decide, and if `Prompt`, ask the
-/// user via stderr. Returns `Trusted` or `Untrusted` (never `Prompt`).
+/// Resolve trust for `cwd`: gather inputs and decide. Returns `Trusted` or
+/// `Untrusted` (never `Prompt`).
+///
+/// A `Prompt` decision resolves to `Untrusted`. This must not read stdin:
+/// once the TUI owns the terminal a blocking `read_line` competes with the
+/// event reader for keystrokes and the process appears frozen. Frontends
+/// that can ask the user do so through their own UI and then call
+/// [`grant_folder_trust`].
 pub fn resolve_trust(cwd: &Path) -> TrustOutcome {
     let key = workspace_key(cwd);
     let inputs = decide_inputs(cwd, &key);
     match decide(feature_enabled(), &inputs) {
-        TrustOutcome::Prompt => {
-            // Prompt the user via stderr.
-            eprintln!(
-                "This workspace contains repo-local hooks or MCP configuration — trust it and allow repo-local code execution? [y/N]"
-            );
-            let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() {
-                let answer = input.trim().to_ascii_lowercase();
-                if answer == "y" || answer == "yes" {
-                    match grant_folder_trust(cwd) {
-                        Ok(()) => TrustOutcome::Trusted,
-                        Err(error) => {
-                            eprintln!("Could not persist folder trust: {error}");
-                            TrustOutcome::Untrusted
-                        }
-                    }
-                } else {
-                    TrustOutcome::Untrusted
-                }
-            } else {
-                TrustOutcome::Untrusted
-            }
-        }
+        TrustOutcome::Prompt => TrustOutcome::Untrusted,
         other => other,
     }
 }

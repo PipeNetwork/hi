@@ -405,6 +405,11 @@ impl Ui for ChannelUi {
     fn session_usage(&mut self, usage: hi_ai::Usage) {
         self.send(UiEvent::SessionUsage { usage });
     }
+    fn suggested_prompt(&mut self, text: &str) {
+        self.send(UiEvent::SuggestedPrompt {
+            text: text.to_string(),
+        });
+    }
     fn turn_end(&mut self, summary: &str) {
         self.send(UiEvent::TurnEnd {
             summary: summary.to_string(),

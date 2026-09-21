@@ -14,6 +14,7 @@ use hi_tools::{
     prepare_mutation_in_with_state,
 };
 
+use crate::TurnCancellation;
 use crate::liveness::tool_fingerprint;
 use crate::ui::{AutoHint, ConfirmationRequest, ConfirmationResult, PermissionMode, Ui};
 
@@ -206,8 +207,36 @@ impl ToolHost {
         auto: AutoHint,
         ui: &mut dyn Ui,
     ) -> ToolOutcome {
+        let never = TurnCancellation::new();
+        self.execute_cancellable(id, name, arguments, permission, auto, ui, &never)
+            .await
+    }
+
+    /// [`Self::execute_with_auto`] that stops at `cancel`.
+    ///
+    /// Esc used to reach only `ProcessRunner` children through
+    /// [`ToolInterrupt`]. An MCP call, hook, LSP request, or web fetch kept
+    /// the turn attached until the remote side answered, which users saw as
+    /// a stall that ignored Esc. Dropping the tool future ends those awaits;
+    /// process groups still die through their drop guards. The liveness
+    /// record closes normally so a user interrupt never reads as
+    /// `ToolUnclosed` or `ConfirmUnanswered` to the supervisor.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_cancellable(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        permission: impl Fn() -> PermissionMode,
+        auto: AutoHint,
+        ui: &mut dyn Ui,
+        cancel: &TurnCancellation,
+    ) -> ToolOutcome {
+        if cancel.is_cancelled() {
+            return interrupted_outcome();
+        }
         if let Some(denied) = self
-            .confirm_if_needed(name, arguments, permission, auto, ui)
+            .confirm_if_needed(name, arguments, permission, auto, ui, cancel)
             .await
         {
             return denied;
@@ -223,34 +252,40 @@ impl ToolHost {
             return failed_outcome(message);
         }
         self.liveness.note_tool_fingerprint(&fingerprint);
-        let outcome = if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
-            match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
-                .await
-            {
-                Ok(prepared) => {
-                    execute_prepared_in_runtime(&self.lsp, &self.read_cache, prepared).await
+        let run = async {
+            if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
+                match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
+                    .await
+                {
+                    Ok(prepared) => {
+                        execute_prepared_in_runtime(&self.lsp, &self.read_cache, prepared).await
+                    }
+                    Err(error) => failed_outcome(format!("Error: {error:#}")),
                 }
-                Err(error) => failed_outcome(format!("Error: {error:#}")),
+            } else {
+                let liveness = self.liveness.clone();
+                let mut on_line = |line: &str| {
+                    liveness.note_progress();
+                    ui.tool_stream(name, line);
+                };
+                execute_streaming_in_runtime_with_runner(
+                    &self.runner,
+                    &self.root,
+                    &self.state_root,
+                    &self.lsp,
+                    self.background.as_ref(),
+                    &self.read_cache,
+                    &self.repo_map,
+                    name,
+                    arguments,
+                    &mut on_line,
+                )
+                .await
             }
-        } else {
-            let liveness = self.liveness.clone();
-            let mut on_line = |line: &str| {
-                liveness.note_progress();
-                ui.tool_stream(name, line);
-            };
-            execute_streaming_in_runtime_with_runner(
-                &self.runner,
-                &self.root,
-                &self.state_root,
-                &self.lsp,
-                self.background.as_ref(),
-                &self.read_cache,
-                &self.repo_map,
-                name,
-                arguments,
-                &mut on_line,
-            )
-            .await
+        };
+        let outcome = tokio::select! {
+            outcome = run => outcome,
+            _ = cancel.cancelled() => interrupted_outcome(),
         };
         if outcome.effects.mutation_applied {
             // Exact grep/read repeats are stale once the tree changed.
@@ -308,6 +343,7 @@ impl ToolHost {
         permission: impl Fn() -> PermissionMode,
         auto: AutoHint,
         ui: &mut dyn Ui,
+        cancel: &TurnCancellation,
     ) -> Option<ToolOutcome> {
         if permission() == PermissionMode::Always {
             return None;
@@ -337,7 +373,12 @@ impl ToolHost {
             liveness: self.liveness.clone(),
             answered: false,
         };
-        let result = ui.confirm(request).await;
+        // A turn cancelled while the overlay is up counts as answered:
+        // the user chose to stop, which is not an unanswered confirm.
+        let result = tokio::select! {
+            result = ui.confirm(request) => result,
+            _ = cancel.cancelled() => ConfirmationResult::Cancelled,
+        };
         guard.answered = true;
         self.liveness
             .emit(hi_liveness::EventCode::ConfirmAnswered, None, None, None);
@@ -349,6 +390,7 @@ impl ToolHost {
                     .set_state(hi_liveness::HarnessState::AwaitingModel);
                 match denied {
                     ConfirmationResult::Rejected => Some(denied_outcome("rejected by user")),
+                    ConfirmationResult::Cancelled => Some(interrupted_outcome()),
                     _ => Some(denied_outcome("confirmation unavailable")),
                 }
             }
@@ -567,6 +609,103 @@ mod tests {
             "list after write should include the new file: {}",
             again.content
         );
+    }
+
+    /// Esc mid-tool must end the await, not just signal a process group,
+    /// and the liveness record must close so the supervisor never reads a
+    /// user interrupt as `ToolUnclosed`.
+    #[tokio::test]
+    async fn cancel_mid_tool_returns_interrupted_and_closes_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let args = serde_json::json!({"command": "sleep 30"}).to_string();
+        let mut ui = TestUi::default();
+        let cancel = TurnCancellation::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let out = host
+            .execute_cancellable(
+                "c1",
+                "bash",
+                &args,
+                || PermissionMode::Always,
+                AutoHint::Heuristic,
+                &mut ui,
+                &cancel,
+            )
+            .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancel must end the tool await promptly"
+        );
+        assert_eq!(out.status, ToolStatus::Denied);
+        assert!(
+            out.content.contains("interrupted by user"),
+            "{}",
+            out.content
+        );
+        let beat = host.liveness().snapshot();
+        assert_eq!(beat.invariant, None, "{:?}", beat.invariant);
+        // The next tool must not trip ToolUnclosed on the interrupted one.
+        let echo = serde_json::json!({"command": "echo after"}).to_string();
+        let next = host
+            .execute("c2", "bash", &echo, || PermissionMode::Always, &mut ui)
+            .await;
+        assert_eq!(next.status, ToolStatus::Succeeded, "{}", next.content);
+        let beat = host.liveness().snapshot();
+        assert_eq!(beat.invariant, None, "{:?}", beat.invariant);
+    }
+
+    /// A confirm overlay abandoned by turn cancellation counts as answered.
+    #[tokio::test]
+    async fn cancel_during_confirm_is_interrupted_not_unanswered() {
+        struct NeverAnswers;
+        impl Ui for NeverAnswers {
+            fn assistant_text(&mut self, _: &str) {}
+            fn assistant_reasoning(&mut self, _: &str) {}
+            fn assistant_end(&mut self) {}
+            fn tool_call(&mut self, _: &str, _: &str) {}
+            fn tool_result(&mut self, _: &str, _: &str) {}
+            fn status(&mut self, _: &str) {}
+            fn turn_end(&mut self, _: &str) {}
+            fn turn_error(&mut self, _: &str, _: &str, _: &str) {}
+            fn confirm(&mut self, _: ConfirmationRequest) -> crate::ConfirmationFuture<'_> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let args = serde_json::json!({"command": "touch never"}).to_string();
+        let mut ui = NeverAnswers;
+        let cancel = TurnCancellation::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let out = host
+            .execute_cancellable(
+                "c1",
+                "bash",
+                &args,
+                || PermissionMode::Ask,
+                AutoHint::Confirm,
+                &mut ui,
+                &cancel,
+            )
+            .await;
+        assert!(
+            out.content.contains("interrupted by user"),
+            "{}",
+            out.content
+        );
+        assert!(!dir.path().join("never").exists());
+        let beat = host.liveness().snapshot();
+        assert_eq!(beat.invariant, None, "{:?}", beat.invariant);
     }
 
     #[tokio::test]

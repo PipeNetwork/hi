@@ -127,12 +127,34 @@ impl crate::App {
                 _ => "Working",
             }
         };
-        if self.current_tool.is_none()
+        let mut line = if self.current_tool.is_none()
             && let Some(activity) = self.provider_activity.label()
         {
-            return format!("{verb}… {} · {activity}", fmt_elapsed(secs));
+            format!("{verb}… {} · {activity}", fmt_elapsed(secs))
+        } else {
+            format!("{verb}… {}", fmt_elapsed(secs))
+        };
+        if let Some(hint) = self.silence_hint() {
+            line.push_str(" · ");
+            line.push_str(&hint);
         }
-        format!("{verb}… {}", fmt_elapsed(secs))
+        line
+    }
+
+    /// Seconds of turn silence before the status row says so. Long enough
+    /// that ordinary thinking and cold builds do not trip it.
+    const SILENCE_HINT_AFTER_SECS: u64 = 30;
+
+    /// `no output 45s · Esc stops` once nothing has arrived from the harness
+    /// for a while. A stalled model or tool then looks stalled, and the way
+    /// out is on screen, rather than a spinner that could mean anything.
+    pub(crate) fn silence_hint(&self) -> Option<String> {
+        if !self.working || self.turn_stop_requested {
+            return None;
+        }
+        let quiet = self.last_turn_event_at?.elapsed().as_secs();
+        (quiet >= Self::SILENCE_HINT_AFTER_SECS)
+            .then(|| format!("no output {} · Esc stops", fmt_elapsed(quiet)))
     }
 
     /// The `Working` lead rendered as a rolling wave: every letter starts gray,

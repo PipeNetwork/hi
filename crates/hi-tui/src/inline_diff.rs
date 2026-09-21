@@ -70,13 +70,16 @@ fn parse_diff(body: &str) -> Vec<DiffItem> {
 
     for line in body.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("diff --git ")
-            || trimmed.starts_with("index ")
+        // Git's `diff --git` / `index` headers are never indented; a context
+        // line such as `    index = 3` must keep painting.
+        if line.starts_with("diff --git ")
+            || line.starts_with("index ")
             || trimmed.starts_with("---")
             || trimmed.starts_with("+++")
             || trimmed.starts_with('\\')
             || trimmed.contains(" addition")
             || trimmed.contains(" deletion")
+            || is_git_meta_line(line)
         {
             continue;
         }
@@ -159,6 +162,26 @@ fn parse_diff(body: &str) -> Vec<DiffItem> {
         }
     }
     items
+}
+
+/// Extended git headers between `diff --git` and the first `@@`. Real unified
+/// context lines start with a space, so an unindented match is unambiguous.
+pub(crate) fn is_git_meta_line(line: &str) -> bool {
+    const PREFIXES: [&str; 12] = [
+        "new file mode ",
+        "deleted file mode ",
+        "old mode ",
+        "new mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+        "Binary files ",
+        "GIT binary patch",
+    ];
+    PREFIXES.iter().any(|prefix| line.starts_with(prefix))
 }
 
 fn hunk_starts(header: &str) -> (Option<u32>, Option<u32>) {
@@ -339,6 +362,19 @@ mod tests {
         assert!(!t.contains("-old"), "{t}");
         assert!(t.contains("old"), "{t}");
         assert!(t.contains("new"), "{t}");
+    }
+
+    #[test]
+    fn skips_git_extended_headers() {
+        let body = "diff --git a/n.rs b/n.rs\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/n.rs\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+        assert_eq!(
+            texts(body),
+            vec!["  1  one".to_string(), "  2  two".to_string()]
+        );
+        let renamed = "diff --git a/x.rs b/y.rs\nsimilarity index 90%\nrename from x.rs\nrename to y.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        let t = texts(renamed).join("\n");
+        assert!(!t.contains("rename"), "{t}");
+        assert!(t.contains("a") && t.contains("b"), "{t}");
     }
 
     #[test]

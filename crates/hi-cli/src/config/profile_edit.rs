@@ -572,9 +572,10 @@ fn validate_mcp_url(
         && !hi_provider_config::is_loopback_endpoint(&url)
     {
         bail!(
-            "project-local remote MCP endpoints require persisted folder trust. Run hi \
-             interactively and approve the startup trust prompt, or pass both --mcp-url \
-             and --api-key explicitly"
+            "project-local remote MCP endpoints require persisted folder trust. Add this \
+             workspace to {} (or the HI_TRUST_STORE file), or pass both --mcp-url and \
+             --api-key explicitly",
+            trust_store_hint()
         );
     }
     if is_official_provider_service_url(provider, &url) {
@@ -703,12 +704,21 @@ fn ensure_project_endpoint_trusted(
         && profile.is_some_and(|profile| profile.project_local && !profile.project_trusted)
     {
         bail!(
-            "project-local remote provider routes require persisted folder trust. \
-             Run hi interactively and approve the startup trust prompt, or select the \
-             endpoint and credential explicitly with --base-url and --api-key"
+            "project-local remote provider routes require persisted folder trust. Add this \
+             workspace to {} (or the HI_TRUST_STORE file), or select the endpoint and \
+             credential explicitly with --base-url and --api-key",
+            trust_store_hint()
         );
     }
     Ok(())
+}
+
+/// Where a folder-trust grant is persisted. Startup never prompts for it, so
+/// error guidance names the file instead of a prompt.
+fn trust_store_hint() -> String {
+    hi_tools::folder_trust::trust_store_file()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "~/.hi/trusted_folders.toml".to_string())
 }
 
 fn resolve_profile_api_key(profile: Option<&Profile>) -> Result<Option<String>> {

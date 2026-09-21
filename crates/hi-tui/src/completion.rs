@@ -251,6 +251,19 @@ fn arg_values(cmd: &str) -> &'static [(&'static str, &'static str)] {
             ("off", "use cheap shrink and summary"),
         ],
         "verify" => &[("off", "disable post-turn check")],
+        "trust" => &[
+            ("on", "persist folder trust for this workspace"),
+            ("off", "revoke folder trust for this workspace"),
+        ],
+        "review" => &[
+            ("audit", "report coverage and defects only; no fix loop"),
+            (
+                "all",
+                "audit the whole repo in chunks, one turn per top-level directory",
+            ),
+            ("status", "show the spec-review phase, pass, and findings"),
+            ("stop", "end the spec-review loop and clear its plan"),
+        ],
         "config" => &[("reasoning", "set reasoning effort")],
         "effort" | "model effort" => &[
             ("low", "less reasoning"),

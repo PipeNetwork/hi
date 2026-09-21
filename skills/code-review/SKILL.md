@@ -9,6 +9,8 @@ scope: global
 ## When to use
 `/review <topic>`, `/security`, `/gaps`, `/roadmap`, `/status`, a bare "review the codebase", `/loop review` (PR comments), or a post-verify completion/skeptic/trio gate. Not for implementation turns.
 
+The `/review` slash command's spec audit and re-audit turns (`[hi:review]` prompts) use this findings format inside a `<review>` block; its P0/P1 findings seed the fix loop's plan, and those fix turns are implementation turns, not reviews. See `docs/review-command.md`.
+
 ## Procedure
 1. Resolve the target: working-tree diff for an open review; `git merge-base` then `git diff <merge-base>` for a branch; `gh pr diff <n>` for a PR. Do not review a branch tip against itself.
 2. Read the changed paths plus call sites and tests that the diff actually affects.

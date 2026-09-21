@@ -65,6 +65,9 @@ pub(crate) enum SessionMeta {
         #[serde(default)]
         stall: u32,
     },
+    ReviewDrive {
+        drive: Box<crate::review_drive::ReviewDrive>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +90,7 @@ pub struct LoadedSession {
     pub pending_turn: Option<PendingTurn>,
     pub plan: Vec<hi_tools::PlanStep>,
     pub plan_drive: PlanDrive,
+    pub review_drive: crate::review_drive::ReviewDrive,
 }
 
 pub struct JsonlSession {
@@ -187,6 +191,7 @@ impl JsonlSession {
                             stall,
                         };
                     }
+                    SessionMeta::ReviewDrive { drive } => loaded.review_drive = *drive,
                 }
                 continue;
             }
@@ -252,6 +257,12 @@ impl JsonlSession {
             index.drive_paused = drive.paused;
         });
         Ok(())
+    }
+
+    pub fn record_review_drive(&mut self, drive: &crate::review_drive::ReviewDrive) -> Result<()> {
+        self.write_meta_sync(&SessionMeta::ReviewDrive {
+            drive: Box::new(drive.clone()),
+        })
     }
 
     /// User line + `PendingTurn` in one append/fsync so success/failure is one unit.
@@ -419,6 +430,14 @@ impl JsonlSession {
                     stall: state.plan_drive.stall,
                 },
             )?;
+            if state.review_drive.phase != crate::review_drive::ReviewPhase::Idle {
+                write_meta_to(
+                    &mut file,
+                    &SessionMeta::ReviewDrive {
+                        drive: Box::new(state.review_drive.clone()),
+                    },
+                )?;
+            }
             file.flush()?;
             file.sync_all()?;
             drop(file);

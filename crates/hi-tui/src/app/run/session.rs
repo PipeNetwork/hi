@@ -130,6 +130,11 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"));
         if harness.can_resume_incomplete(None) && !options.resume_incomplete && !sentinel_resume {
             app.pending_resume = Some(crate::PendingResumeCard { selected: 0 });
+        } else if harness.review_drive().is_active() {
+            let status = harness.review_drive().status_line();
+            app.push(Line::styled(format!("{status} · /review resumes"), dim()));
+            app.spec_review_status = Some(status);
+            app.suggested_prompt = Some("/review".to_string());
         } else if hi_harness::plan_is_open(harness.current_plan()) && !app.plan_drive_paused {
             app.suggested_prompt = Some(hi_harness::CONTINUE_PLAN_PROMPT.to_string());
         }
@@ -153,9 +158,11 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         if app.exit_requested {
             break;
         }
-        if resume_incomplete {
+        if resume_incomplete || app.resume_incomplete_requested {
             resume_incomplete = false;
-            run_turn(
+            app.resume_incomplete_requested = false;
+            app.pending_resume = None;
+            let outcome = run_turn(
                 &mut terminal,
                 &mut input_rx,
                 &mut ticker,
@@ -165,19 +172,13 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
                 true,
             )
             .await?;
-            continue;
-        }
-        if app.resume_incomplete_requested {
-            app.resume_incomplete_requested = false;
-            app.pending_resume = None;
-            run_turn(
+            super::review_cmd::chain(
                 &mut terminal,
                 &mut input_rx,
                 &mut ticker,
                 &mut app,
                 harness,
-                "",
-                true,
+                outcome,
             )
             .await?;
             continue;
@@ -348,7 +349,7 @@ async fn handle_command(
         Command::Quit => app.exit_requested = true,
         Command::Help(_) => {
             app.push(Line::styled(
-                "/login /auth /sessions /doctor /autoharnessfix /model /effort /permissions /undo /diff /retry /verify /compact /jev-compact /copy /usage /dashboard /status /exit  (type / for the menu)",
+                "/login /auth /sessions /doctor /autoharnessfix /model /effort /permissions /undo /diff /retry /verify /review /compact /jev-compact /copy /usage /dashboard /status /exit  (type / for the menu)",
                 dim(),
             ));
         }
@@ -370,20 +371,11 @@ async fn handle_command(
                 Err(err) => format!("undo failed: {err:#}"),
             };
             app.push(Line::styled(msg, dim()));
+            // The restored files are still "touched this session"; the pane
+            // just needs to re-diff so their hunks disappear.
+            app.refresh_review_if_open();
         }
-        Command::Diff => {
-            let diff = hi_tools::working_tree_diff_plain_in(harness.workspace_root()).await;
-            let trimmed = diff.trim();
-            if trimmed.is_empty() || trimmed == "no changes since HEAD" {
-                app.push(Line::styled("working tree clean", dim()));
-            } else if trimmed.starts_with("not a git") || trimmed.starts_with("git not available") {
-                app.push(Line::styled(trimmed.to_string(), dim()));
-            } else {
-                for line in crate::render::diff_lines(&diff) {
-                    app.push(line);
-                }
-            }
-        }
+        Command::Diff => app.show_changes(),
         Command::Retry => match app.last_prompt.clone() {
             Some(prompt) => {
                 harness.truncate_messages(app.last_turn_start);
@@ -467,6 +459,11 @@ async fn handle_command(
             apply_permissions_command(app, &harness.live(), &arg);
             harness.persist_live_knobs();
         }
+        Command::Trust(arg) => {
+            let message = hi_harness::trust_command(harness.workspace_root(), &arg);
+            app.push(Line::styled(message, dim()));
+        }
+        Command::Review(arg) => return Ok(super::review_cmd::handle(app, harness, &arg)),
         Command::Compact(arg) => {
             app.push(Line::styled("compacting conversation…", dim()));
             let mut ui = hi_harness::TestUi::default();
@@ -491,16 +488,7 @@ async fn handle_command(
         Command::JevCompact(arg) => {
             app.push(Line::styled(harness.apply_jev_compact_arg(&arg), dim()));
         }
-        Command::Files => {
-            let files = harness.last_changed_files();
-            if files.is_empty() {
-                app.push(Line::styled("no files changed this session", dim()));
-            } else {
-                for file in files {
-                    app.push(Line::from(file.clone()));
-                }
-            }
-        }
+        Command::Files => app.show_session_files(),
         Command::Status => {
             let usage = harness.session_usage();
             let occupancy = usage.context_occupancy.max(usage.input_tokens);
@@ -937,8 +925,16 @@ fn handle_running_key(
                     let _ = pending.response.send(ConfirmationResult::Rejected);
                 }
                 ConfirmDecision::Cancel => {
+                    // Ctrl-C on the overlay means stop the turn, the same as
+                    // Ctrl-C anywhere else while running. Answering the
+                    // confirm alone only denied one tool and the model kept
+                    // going, which read as "it will not stop".
                     app.confirmation = None;
                     let _ = pending.response.send(ConfirmationResult::Cancelled);
+                    cancel.cancel();
+                    if let Some(flag) = app.interrupt.as_ref() {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 ConfirmDecision::RejectFollowup(text) => {
                     app.confirmation = None;
@@ -1036,6 +1032,13 @@ fn apply_running_line(
                     dim(),
                 ));
             }
+            Command::Review(arg) if arg.trim().eq_ignore_ascii_case("status") => {
+                app.push(Line::styled(super::review_cmd::running_status(app), dim()));
+            }
+            Command::Review(_) => app.push(Line::styled(
+                "spec review: Esc pauses the running turn; then /review resumes or /review stop ends it",
+                dim(),
+            )),
             Command::Usage(arg) => apply_usage_command(app, None, &arg),
             Command::Dashboard => {
                 if let Err(err) = crate::dashboard::open_from_app(app) {
@@ -1252,7 +1255,10 @@ async fn run_prompt(
     restore: &mut Option<Restore>,
     termios: Option<&libc::termios>,
 ) -> Result<()> {
-    run_turn(terminal, input_rx, ticker, app, harness, prompt, false).await?;
+    let outcome = run_turn(terminal, input_rx, ticker, app, harness, prompt, false).await?;
+    // Spec-review chaining: audit -> fix -> re-audit until the drive is done,
+    // stopped, or paused by Esc. Queued prompts run after the loop.
+    super::review_cmd::chain(terminal, input_rx, ticker, app, harness, outcome).await?;
     while let Some(next) = app.queue.pop_front() {
         app.clamp_queue_selection();
         if let Some(command) = parse_command(&next) {
@@ -1268,7 +1274,7 @@ async fn run_prompt(
     Ok(())
 }
 
-async fn run_turn(
+pub(super) async fn run_turn(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input_rx: &mut mpsc::UnboundedReceiver<Event>,
     ticker: &mut tokio::time::Interval,
@@ -1276,7 +1282,7 @@ async fn run_turn(
     harness: &mut Harness,
     prompt: &str,
     resume: bool,
-) -> Result<()> {
+) -> Result<Option<hi_harness::TurnOutcome>> {
     if resume {
         app.last_prompt = harness
             .messages()
@@ -1286,7 +1292,7 @@ async fn run_turn(
         app.last_turn_start = super::hydrate::resume_last_turn_start(harness.messages());
     } else {
         app.push_user_prompt(Line::styled(
-            format!("❯ {prompt}"),
+            format!("❯ {}", super::review_cmd::transcript_echo(prompt)),
             Style::default().fg(crate::theme::theme().accent_user),
         ));
         app.last_prompt = Some(prompt.to_string());
@@ -1306,18 +1312,18 @@ async fn run_turn(
         event_sink: app.event_sink.clone(),
         approval_store: app.approval_store.clone(),
     };
+    let mut outcome = None;
     {
         let turn = async {
             if resume {
                 harness
                     .resume_incomplete_turn(&mut sink, cancel.clone())
                     .await
-                    .map(|_| ())
             } else {
                 harness
                     .run_turn_cancellable(prompt, &mut sink, cancel.clone())
                     .await
-                    .map(|_| ())
+                    .map(Some)
             }
         };
         let mut fut = std::pin::pin!(turn);
@@ -1329,8 +1335,15 @@ async fn run_turn(
                     while let Ok(event) = rx.try_recv() {
                         app.apply(event);
                     }
-                    if let Err(err) = result {
-                        app.push(Line::styled(format!("{err:#}"), dim()));
+                    match result {
+                        Ok(turn_outcome) => outcome = turn_outcome,
+                        Err(err) => app.push(Line::styled(format!("{err:#}"), dim())),
+                    }
+                    // The harness answers a confirm itself when the turn is
+                    // cancelled underneath it; drop the stale overlay rather
+                    // than leaving a prompt nobody is waiting on.
+                    if pending_confirm.take().is_some() {
+                        app.confirmation = None;
                     }
                     break;
                 }
@@ -1387,5 +1400,5 @@ async fn run_turn(
     harness.persist_live_knobs();
     app.plan = harness.current_plan().to_vec();
     app.last_changed_files = harness.last_changed_files().to_vec();
-    Ok(())
+    Ok(outcome)
 }

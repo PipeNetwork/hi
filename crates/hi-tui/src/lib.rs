@@ -38,6 +38,7 @@ mod provider_form;
 mod provider_picker;
 mod render;
 mod review;
+mod session_diff;
 mod theme;
 mod thinking;
 mod timeline;
@@ -226,33 +227,7 @@ pub(crate) const PICKER_ROWS: usize = 12;
 /// line up instead of starting at a ragged edge. Sized for "Base URL".
 pub(crate) const FORM_LABEL_WIDTH: usize = 9;
 
-/// A synchronous, plain (uncolored) `git diff` of the working tree, for the
-/// full-screen review overlay (Ctrl-G / Ctrl-D). The TUI applies its own
-/// highlighting via `diff_lines`, so we want the raw diff without ANSI codes.
-/// Returns empty when not a git repo or there are no changes. Synchronous
-/// because the key handler isn't async and `git diff` is fast/user-initiated.
-pub(crate) fn working_tree_diff_sync(root: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["--no-pager", "diff", "--no-color", "HEAD"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        // Not a git repo / no HEAD: fall back to an untracked+unstaged diff.
-        Ok(_) => {
-            let untracked = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["--no-pager", "diff", "--no-color"])
-                .output();
-            untracked
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                .unwrap_or_default()
-        }
-        Err(_) => String::new(),
-    }
-}
+pub(crate) use session_diff::{session_diff_sync, working_tree_diff_sync};
 
 /// Cheap session-start ghost text from `git status --porcelain` (no model call).
 /// Mirrors Claude Code's "example from recent work" landing suggestion.
@@ -295,28 +270,6 @@ pub(crate) fn startup_prompt_suggestion(root: &std::path::Path) -> Option<String
         [one] => Some(format!("Continue working on {one}")),
         [a, b] => Some(format!("Review uncommitted changes in {a} and {b}")),
         [a, b, ..] => Some(format!("Review uncommitted changes in {a}, {b}, and more")),
-    }
-}
-
-/// Working-tree diff filtered to `files` (paths relative to `root`), via
-/// `git diff HEAD -- <files>`. Used by the deep-link from a `✎ files changed`
-/// transcript line to the full-screen diff review — opens the review showing
-/// only the files the agent edited in that turn. Empty on failure or when no
-/// paths match.
-pub(crate) fn diff_for_files_sync(root: &std::path::Path, files: &[String]) -> String {
-    if files.is_empty() {
-        return String::new();
-    }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["--no-pager", "diff", "--no-color", "HEAD", "--"])
-        .args(files)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Ok(_) => String::new(),
-        Err(_) => String::new(),
     }
 }
 
@@ -861,6 +814,11 @@ pub(crate) struct App {
     /// workspace settlement. `None` while the model is the active party.
     pub(crate) current_tool: Option<String>,
     pub(crate) current_tool_started: Option<Instant>,
+    /// Last harness event during the running turn. Long silence past this
+    /// point is surfaced on the status row so a stalled model or tool is
+    /// visibly stalled, with the Esc hint, instead of a spinner that could
+    /// mean anything.
+    pub(crate) last_turn_event_at: Option<Instant>,
     /// Streamed stdout already landed on the live `Run` row for this tool call.
     pub(crate) run_streamed_this_call: bool,
     /// Lines typed during a turn, preserved FIFO for later execution.
@@ -1038,6 +996,9 @@ pub(crate) struct App {
     pub(crate) suggested_prompt_dismissed: bool,
     /// Docked or overlay working-tree diff review (Ctrl-G).
     pub(crate) review: crate::review::ReviewState,
+    /// `/review` spec-review status line while the audit/fix loop is active,
+    /// so `/review status` can answer mid-turn without the harness.
+    pub(crate) spec_review_status: Option<String>,
     /// When true, all confirmation requests are auto-approved for the rest of
     /// the session without showing the modal. Set by pressing `a` on an
     /// approval prompt ("always allow this session"). Cleared only by quitting

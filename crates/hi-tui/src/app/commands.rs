@@ -3,7 +3,7 @@
 #[cfg(test)]
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 #[cfg(test)]
 use ratatui::text::Text;
@@ -576,27 +576,12 @@ impl crate::App {
         }
     }
 
-    /// Show all files touched this session (`/files`): a header with the count,
-    /// then one line per file. If nothing has changed yet, says so.
+    /// Show all files touched this session (`/files`): the Changes pane's
+    /// `N files changed +A -D` summary and per-file counts, as transcript
+    /// lines. If nothing has changed yet, says so.
     pub(crate) fn show_session_files(&mut self) {
-        if self.session_changed_files.is_empty() {
-            self.push(Line::styled("no files changed this session yet", dim()));
-            return;
-        }
-        let count = self.session_changed_files.len();
-        let files: Vec<String> = self.session_changed_files.clone();
-        self.push(Line::styled(
-            format!(
-                "── {} file{} changed this session ──",
-                count,
-                if count == 1 { "" } else { "s" }
-            ),
-            Style::default()
-                .fg(crate::theme::theme().accent_goal)
-                .add_modifier(Modifier::BOLD),
-        ));
-        for f in &files {
-            self.push(Line::styled(format!("  {f}"), dim()));
+        for line in self.session_files_lines() {
+            self.push(line);
         }
         self.follow();
     }

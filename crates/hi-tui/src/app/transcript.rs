@@ -713,6 +713,7 @@ impl crate::App {
                     .push(format!("changed_files {}", files.len()));
                 self.last_changed_files = files;
                 self.accumulate_session_files();
+                self.refresh_review_if_open();
                 self.changed_files_rect = ratatui::layout::Rect::default();
                 self.follow();
             }
@@ -925,7 +926,6 @@ impl crate::App {
             return;
         }
         if activity_feed::is_edit_tool(name) {
-            let path = label_detail(label).unwrap_or_else(|| name.to_string());
             let (additions, deletions) = activity_feed::parse_diff_stats(&display_result);
             let diff = if display_result.contains('\u{1b}')
                 || crate::render::looks_like_diff(&display_result)
@@ -936,6 +936,22 @@ impl crate::App {
             } else {
                 String::new()
             };
+            // The preview's `--- / +++` headers name every touched file
+            // workspace-relative; the tool argument is the fallback for a
+            // terse result (and for `apply_patch`, which has no `path`).
+            let mut paths = activity_feed::edit_paths_from_preview(&diff);
+            if paths.is_empty()
+                && let Some(arg) = label_detail(label).filter(|p| !p.is_empty())
+            {
+                paths.push(arg);
+            }
+            let root = self.workspace_root.clone();
+            let paths: Vec<String> = paths
+                .iter()
+                .map(|p| activity_feed::relative_edit_path(p, &root))
+                .collect();
+            let path = activity_feed::edit_paths_label(&paths).unwrap_or_else(|| name.to_string());
+            self.note_session_edits(&paths);
             if self.try_coalesce_edit(&path, additions, deletions, &diff) {
                 return;
             }
@@ -961,6 +977,17 @@ impl crate::App {
             detail,
             body: display_result,
         });
+    }
+
+    /// Record edited paths as the turn runs so the Changes pane (Ctrl-G) is a
+    /// running view: the harness only reports `changed_files` at turn end.
+    fn note_session_edits(&mut self, paths: &[String]) {
+        for path in paths {
+            if !self.session_changed_files.iter().any(|s| s == path) {
+                self.session_changed_files.push(path.clone());
+            }
+        }
+        self.refresh_review_if_open();
     }
 
     fn push_activity(&mut self, kind: ActivityKind) {
