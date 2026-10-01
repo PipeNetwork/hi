@@ -14,6 +14,7 @@ use crate::model_picker::{display_capabilities, display_price, display_window};
 use crate::render::{dim, lerp_color, markdown_line, wrapped_line_height};
 use crate::theme::UiTone;
 use crate::util::fmt_elapsed;
+use crate::wrap::{RowJoin, prose_wrap_cols, push_wrapped};
 use crate::{FORM_LABEL_WIDTH, PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
 /// Render a confirmation request's details as styled lines so the user can
@@ -997,6 +998,7 @@ impl crate::App {
                 .iter()
                 .map(crate::render::line_text)
                 .collect();
+            self.view_line_joins = self.view_cache.joins.clone();
             self.view_prefix = self.view_cache.prefix.clone();
             self.view_geometry_key = Some(cache_key);
         }
@@ -1696,6 +1698,7 @@ impl crate::App {
 
         let th = crate::theme::theme();
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut joins: Vec<RowJoin> = Vec::new();
         let mut prompt_line_starts: Vec<usize> = Vec::new();
         let mut tool_ord = 0usize;
         let mut block_line_ranges: Vec<(usize, usize, usize)> = Vec::new();
@@ -1709,7 +1712,9 @@ impl crate::App {
             ));
         }
 
+        let mut last_entry_start = lines.len();
         for entry in &self.transcript {
+            last_entry_start = lines.len();
             if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
                 if !lines.is_empty()
                     && !lines
@@ -1736,24 +1741,25 @@ impl crate::App {
                 None
             };
             let start = lines.len();
-            lines.extend(entry.flatten(self.show_reasoning, self.show_tool_output, self.density));
+            let (flat, flat_joins) = entry.flatten_joined_at(
+                inner_w,
+                self.show_reasoning,
+                self.show_tool_output,
+                self.density,
+            );
+            lines.extend(flat);
+            joins.resize(start, RowJoin::NewLine);
+            joins.extend(flat_joins);
             if let Some(o) = ord {
                 block_line_ranges.push((start, lines.len(), o));
             }
         }
         let committed_entries = self.transcript.len();
         let committed_flat_lines = lines.len();
-        lines.extend(self.live_thinking_lines_wrapped(inner_w));
-        if let Some((style, markdown, text)) = &self.pending {
-            let mut line = if *markdown {
-                markdown_line(text, &mut self.code_lang.clone())
-            } else {
-                Line::styled(text.clone(), *style)
-            };
-            line.spans
-                .push(Span::styled("▍", Style::default().fg(th.gray_dim)));
-            lines.push(line);
-        }
+        let (tail, tail_joins) = self.tail_rows(inner_w);
+        lines.extend(tail);
+        joins.resize(committed_flat_lines, RowJoin::NewLine);
+        joins.extend(tail_joins);
 
         let mut prefix: Vec<u32> = Vec::with_capacity(lines.len() + 1);
         let mut cum = 0u32;
@@ -1774,11 +1780,13 @@ impl crate::App {
             trimmed,
             subagent_tick,
             lines,
+            joins,
             prefix,
             prompt_line_starts,
             block_line_ranges,
             committed_entries,
             committed_flat_lines,
+            last_entry_start,
         };
     }
 
@@ -1817,27 +1825,27 @@ impl crate::App {
         if self.transcript.len() < c.committed_entries {
             return false;
         }
-        let th = crate::theme::theme();
         let mut lines = c.lines.clone();
+        let mut joins = c.joins.clone();
         let mut prefix = c.prefix.clone();
         let mut prompt_line_starts = c.prompt_line_starts.clone();
         let mut block_line_ranges = c.block_line_ranges.clone();
 
-        // Drop old pending line from the end of the cached flatten.
-        if c.pending_fp != 0 && !lines.is_empty() {
-            lines.pop();
-            prefix.pop();
-        }
-        // Ensure lines/prefix align to committed_flat_lines.
-        if lines.len() > c.committed_flat_lines {
-            lines.truncate(c.committed_flat_lines);
-            prefix.truncate(c.committed_flat_lines + 1);
-        }
+        // Keep the flatten up to the last committed entry and redo the rest:
+        // that entry may have grown in place (a streamed line joins the open
+        // assistant message), and the live tail always changes.
+        let restart_entry = c.committed_entries.saturating_sub(1);
+        let restart_line = c.last_entry_start.min(c.committed_flat_lines);
+        lines.truncate(restart_line);
+        joins.truncate(restart_line);
+        prefix.truncate(restart_line + 1);
+        prompt_line_starts.retain(|&start| start < restart_line);
+        block_line_ranges.retain(|&(start, _, _)| start < restart_line);
 
-        // Append newly committed entries.
-        let start_entry = c.committed_entries;
         let mut tool_ord = block_line_ranges.last().map(|(_, _, o)| o + 1).unwrap_or(0);
-        for entry in &self.transcript[start_entry..] {
+        let mut last_entry_start = lines.len();
+        for entry in &self.transcript[restart_entry..] {
+            last_entry_start = lines.len();
             if matches!(entry, crate::TranscriptEntry::UserPrompt { .. }) {
                 if !lines.is_empty()
                     && !lines
@@ -1859,13 +1867,20 @@ impl crate::App {
                 None
             };
             let start = lines.len();
-            let flat = entry.flatten(self.show_reasoning, self.show_tool_output, self.density);
+            let (flat, flat_joins) = entry.flatten_joined_at(
+                inner_w,
+                self.show_reasoning,
+                self.show_tool_output,
+                self.density,
+            );
             for line in &flat {
                 let h = wrapped_line_height(line, inner_w) as u32;
                 let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
                 prefix.push(cum);
             }
             lines.extend(flat);
+            joins.resize(start, RowJoin::NewLine);
+            joins.extend(flat_joins);
             if let Some(o) = ord {
                 block_line_ranges.push((start, lines.len(), o));
             }
@@ -1873,27 +1888,15 @@ impl crate::App {
         let committed_entries = self.transcript.len();
         let committed_flat_lines = lines.len();
 
-        for line in self.live_thinking_lines_wrapped(inner_w) {
+        let (tail, tail_joins) = self.tail_rows(inner_w);
+        for line in tail {
             let h = wrapped_line_height(&line, inner_w) as u32;
             let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
             prefix.push(cum);
             lines.push(line);
         }
-
-        // Re-add pending.
-        if let Some((style, markdown, text)) = &self.pending {
-            let mut line = if *markdown {
-                markdown_line(text, &mut self.code_lang.clone())
-            } else {
-                Line::styled(text.clone(), *style)
-            };
-            line.spans
-                .push(Span::styled("▍", Style::default().fg(th.gray_dim)));
-            let h = wrapped_line_height(&line, inner_w) as u32;
-            let cum = prefix.last().copied().unwrap_or(0).saturating_add(h);
-            prefix.push(cum);
-            lines.push(line);
-        }
+        joins.resize(committed_flat_lines, RowJoin::NewLine);
+        joins.extend(tail_joins);
 
         self.view_cache = crate::view_cache::TranscriptViewCache {
             generation: self.transcript_gen,
@@ -1907,14 +1910,41 @@ impl crate::App {
             trimmed,
             subagent_tick: self.live_subagent_tick(),
             lines,
+            joins,
             prefix,
             prompt_line_starts,
             block_line_ranges,
             committed_entries,
             committed_flat_lines,
+            last_entry_start,
         };
-        let _ = th; // silence when paints unused
         true
+    }
+
+    /// The live rows after the committed transcript, with how each joins the
+    /// row above: the in-flight thinking block, then the uncommitted tail of
+    /// the streaming line, cursor included, wrapped like the committed prose
+    /// it is about to join so nothing reflows the moment it commits.
+    fn tail_rows(&self, inner_w: u16) -> (Vec<Line<'static>>, Vec<RowJoin>) {
+        let mut rows = self.live_thinking_lines_wrapped(prose_wrap_cols(inner_w));
+        let mut joins = vec![RowJoin::NewLine; rows.len()];
+        let Some((style, markdown, text)) = &self.pending else {
+            return (rows, joins);
+        };
+        if *markdown {
+            let line = markdown_line(text, &mut self.code_lang.clone());
+            push_wrapped(&mut rows, &mut joins, &line, prose_wrap_cols(inner_w));
+        } else {
+            rows.push(Line::styled(text.clone(), *style));
+            joins.push(RowJoin::NewLine);
+        }
+        if let Some(last) = rows.last_mut() {
+            last.spans.push(Span::styled(
+                "▍",
+                Style::default().fg(crate::theme::theme().gray_dim),
+            ));
+        }
+        (rows, joins)
     }
 }
 

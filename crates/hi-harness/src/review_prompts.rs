@@ -6,7 +6,8 @@
 //! here, so callers keep using `crate::review::audit_prompt` and friends.
 
 use crate::review::{
-    ChecklistItem, Finding, GitSource, InputKind, REVIEW_PREFIX, ReviewInputs, chunk_label,
+    ChecklistItem, Finding, GitScope, GitSource, InputKind, REVIEW_PREFIX, ReviewInputs,
+    VerifySeed, chunk_label, chunk_parts,
 };
 
 /// The verdict contract, quoted in every audit prompt and the format re-ask.
@@ -129,6 +130,11 @@ fn push_inputs(
     checklists: &[(String, Vec<ChecklistItem>)],
     chunk: Option<usize>,
 ) {
+    if let Some(root) = &inputs.root {
+        out.push_str(&format!(
+            "Workspace root: {root} (every path below is relative to it; cite paths the same way).\n"
+        ));
+    }
     if inputs.files.is_empty() {
         out.push_str(
             "Inputs: none found (no plan.md or spec.md). This is a defects-only audit: there are no plan/spec items, \
@@ -161,21 +167,23 @@ install steps and usage tips are not)",
         ));
     }
     if let Some(git) = &inputs.git {
-        push_git_scope(out, git);
+        push_git_scope(
+            out,
+            git,
+            chunk.filter(|_| !inputs.chunks.is_empty()),
+            inputs.chunks.len(),
+        );
+        return;
     }
     if let Some(index) = chunk
-        && let Some(dir) = inputs.chunks.get(index)
+        && let Some(chunk) = inputs.chunks.get(index)
     {
-        let where_ = if dir == "." {
-            "the files directly in the workspace root (not its subdirectories)".to_string()
-        } else {
-            format!("`{dir}/`")
-        };
         out.push_str(&format!(
-            "Scope: chunk {}/{} of the workspace: {where_}. Limit the code audit to it; the other chunks are audited \
-in their own turns, so report nothing outside it.",
+            "Scope: chunk {}/{} of the workspace: {}. Limit the code audit to it (its files are listed below); \
+the other chunks are audited in their own turns, so report nothing outside it.",
             index + 1,
-            inputs.chunks.len()
+            inputs.chunks.len(),
+            describe_chunk(chunk)
         ));
         if !inputs.files.is_empty() {
             out.push_str(
@@ -187,33 +195,106 @@ as its citation; rows are merged across chunks (an item implemented in any chunk
     }
 }
 
+/// `\`src/\``, `the files directly in the workspace root`, `\`crates/x/\`
+/// part 2/5`, joined with `and`.
+fn describe_chunk(chunk: &str) -> String {
+    let parts: Vec<String> = chunk_parts(chunk)
+        .into_iter()
+        .map(|part| {
+            if part == "." {
+                return "the files directly in the workspace root (not its subdirectories)"
+                    .to_string();
+            }
+            if let Some(dir) = part.strip_suffix("/.") {
+                return format!("the files directly in `{dir}/` (not its subdirectories)");
+            }
+            match part.rsplit_once(" (") {
+                Some((dir, slice)) if slice.ends_with(')') => {
+                    format!("`{dir}/` part {}", slice.trim_end_matches(')'))
+                }
+                _ => format!("`{part}/`"),
+            }
+        })
+        .collect();
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].clone(),
+        n => format!("{} and {}", parts[..n - 1].join(", "), parts[n - 1]),
+    }
+}
+
 /// The recent-work scope: how it was chosen, how to see the changes, and
-/// the files (capped; git has the rest).
-fn push_git_scope(out: &mut String, git: &crate::review::GitScope) {
-    let count = git.files.len();
+/// the files of this turn with their line counts. `chunk` is the turn's
+/// index when the scope is audited in turns.
+fn push_git_scope(out: &mut String, git: &GitScope, chunk: Option<usize>, chunks: usize) {
+    let total = git.files.len();
+    let files = match chunk {
+        Some(index) => git.chunk_files(index),
+        None => git.files.clone(),
+    };
+    let turn = match chunk {
+        Some(index) => format!(
+            "chunk {}/{chunks} of the {total} files: the {} listed below",
+            index + 1,
+            files.len()
+        ),
+        None => format!("the {total} file(s) listed below"),
+    };
     match &git.source {
         GitSource::Uncommitted => out.push_str(&format!(
-            "\nCode under audit: the {count} uncommitted file(s) per `git status` (no plan/spec was found, so this audit \
-covers recent work, not the whole repo). Run `git status --short` and `git diff HEAD` to see the changes; \
-untracked files have no diff, read them in full. Read surrounding code only as needed to judge the changes, \
-and report defects in these changes, not elsewhere.\n"
+            "\nCode under audit: {turn}, uncommitted per `git status` (no plan/spec was found, so this audit \
+covers recent work, not the whole repo). Line counts are `git diff --numstat` against HEAD. \
+For each file run `git diff HEAD -- <path>` or read it in full (untracked files have no diff); \
+read surrounding code only as needed to judge the change, and report defects in these files, not elsewhere.\n"
         )),
         GitSource::LastCommit { short_hash, subject } => out.push_str(&format!(
-            "\nCode under audit: the {count} file(s) changed by the last commit {short_hash} \"{subject}\"; the tree is clean \
-(no plan/spec was found, so this audit covers recent work, not the whole repo). Run `git show HEAD` to see the change. \
-Read surrounding code only as needed to judge it, and report defects in this change, not elsewhere.\n"
+            "\nCode under audit: {turn}, changed by the last commit {short_hash} \"{subject}\"; the tree is clean \
+(no plan/spec was found, so this audit covers recent work, not the whole repo). \
+For each file run `git show HEAD -- <path>` or read it in full; read surrounding code only as needed to judge it, \
+and report defects in these files, not elsewhere.\n"
         )),
     }
-    out.push_str("Files:\n");
-    for file in git.files.iter().take(SCOPE_FILES_LISTED) {
-        out.push_str(&format!("- {file}\n"));
+    if chunk.is_some() {
+        out.push_str(
+            "The other chunks are audited in their own turns, so report nothing outside this one.\n",
+        );
     }
-    if count > SCOPE_FILES_LISTED {
+    out.push_str("Files (read every one):\n");
+    for file in files.iter().take(SCOPE_FILES_LISTED) {
+        match git.numstat_for(file) {
+            Some(stat) => out.push_str(&format!("- {file} ({})\n", stat.label())),
+            None => out.push_str(&format!("- {file}\n")),
+        }
+    }
+    if files.len() > SCOPE_FILES_LISTED {
         out.push_str(&format!(
-            "- … and {} more (git lists them)\n",
-            count - SCOPE_FILES_LISTED
+            "- … and {} more (`git status --short` lists them)\n",
+            files.len() - SCOPE_FILES_LISTED
         ));
     }
+}
+
+/// The files of a non-git scope, appended to an audit prompt by the
+/// harness (it walks the tree; the prompt builders do not). Capped; the
+/// model has `list`/`glob` for the rest.
+pub fn scope_files_section(files: &[String]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\nFiles in scope ({}; the report counts which of them were read):\n",
+        files.len()
+    );
+    for file in files.iter().take(SCOPE_FILES_LISTED) {
+        out.push_str(&format!("- {file}\n"));
+    }
+    if files.len() > SCOPE_FILES_LISTED {
+        out.push_str(&format!(
+            "- … and {} more (`list`/`glob` show them)\n",
+            files.len() - SCOPE_FILES_LISTED
+        ));
+    }
+    out
 }
 
 /// `3 checklist rows: 1 checked, claims to verify; 2 unchecked, known gaps…`.
@@ -283,12 +364,15 @@ Cite `path:line` only for files you actually read.\n",
 /// Audit turn. Read-only; the harness forces `Intent::Review` because this
 /// text mentions fixing. `chunk` indexes `inputs.chunks` in a chunked audit
 /// (ignored otherwise); each chunk turn carries the whole contract, since
-/// the model has no memory of the previous chunk's turn.
+/// the model has no memory of the previous chunk's turn. `seed` is the
+/// verify run before an earlier turn of the same audit; the first turn's
+/// seed runs after the prompt is built and is appended by the harness.
 pub fn audit_prompt(
     inputs: &ReviewInputs,
     checklists: &[(String, Vec<ChecklistItem>)],
     chunk: usize,
     max_passes: u32,
+    seed: Option<&VerifySeed>,
 ) -> String {
     let defects_only = inputs.defects_only();
     let mut out = format!("{REVIEW_PREFIX} ");
@@ -310,11 +394,15 @@ pub fn audit_prompt(
 This turn is read-only: do not edit files, do not run mutating shell commands, do not call update_plan.\n\n"
     ));
     push_inputs(&mut out, inputs, checklists, Some(chunk));
+    if let Some(seed) = seed {
+        out.push_str(&seed.prompt_section());
+    }
     out.push_str("\nProcedure:\n");
     if defects_only {
         out.push_str(
-            "1. Call repo_map (or `git status`/`git diff` for a recent-work scope), then read the code under audit and only \
-the surrounding files needed to judge it.\n\
+            "1. Read every file under audit (listed above) in full, or its diff for a recent-work scope; the harness \
+records which files were read and asks again for the rest, so do not skim by directory. Read surrounding files only \
+as needed to judge them.\n\
 2. Look for P0/P1 defects: crashes, data loss, wrong results, security holes, broken contracts between modules. \
 Running the project's existing tests read-only (for example `cargo test`) is allowed when it grounds a finding.\n\
 3. Do not fix anything in this turn; report (write, edit, multi_edit, apply_patch and update_plan are denied in an audit turn). \
@@ -334,6 +422,66 @@ The block itself is machine-read and shown as a table, so do not repeat its rows
         );
     }
     push_format_contract(&mut out, &[], defects_only);
+    out
+}
+
+/// A defects-only audit turn left files in scope unread: ask for them,
+/// `continuation` of `max` times per chunk. `prior` are the findings
+/// recorded so far in this audit (they are kept; the model need not repeat
+/// them).
+pub fn continuation_prompt(
+    inputs: &ReviewInputs,
+    chunk: usize,
+    unread: &[String],
+    prior: &[Finding],
+    continuation: u32,
+    max: u32,
+    seed: Option<&VerifySeed>,
+) -> String {
+    let mut out = format!(
+        "{REVIEW_PREFIX} Defect audit, continued ({continuation}/{max}). The last turn left {} of the files under audit \
+unread, so its verdict is partial. This turn is read-only (write tools and update_plan are denied): read every file \
+listed below in full (or its diff), report defects in them, and end with the <review> block.\n\n",
+        unread.len()
+    );
+    if let Some(root) = &inputs.root {
+        out.push_str(&format!(
+            "Workspace root: {root} (paths below are relative to it; cite paths the same way).\n"
+        ));
+    }
+    if let Some(label) = inputs.chunks.get(chunk) {
+        out.push_str(&format!(
+            "Scope: chunk {}/{}: {}.\n",
+            chunk + 1,
+            inputs.chunks.len(),
+            chunk_label(label)
+        ));
+    }
+    out.push_str("Unread files (read every one):\n");
+    for file in unread.iter().take(SCOPE_FILES_LISTED) {
+        match inputs.git.as_ref().and_then(|git| git.numstat_for(file)) {
+            Some(stat) => out.push_str(&format!("- {file} ({})\n", stat.label())),
+            None => out.push_str(&format!("- {file}\n")),
+        }
+    }
+    if unread.len() > SCOPE_FILES_LISTED {
+        out.push_str(&format!(
+            "- … and {} more; the next continuation lists them\n",
+            unread.len() - SCOPE_FILES_LISTED
+        ));
+    }
+    if !prior.is_empty() {
+        out.push_str(
+            "\nFindings already recorded from the files read so far (kept; do not repeat them unless one of the files above adds to it):\n",
+        );
+        for finding in prior {
+            out.push_str(&format!("- {}\n", finding.label()));
+        }
+    }
+    if let Some(seed) = seed {
+        out.push_str(&seed.prompt_section());
+    }
+    push_format_contract(&mut out, &[], true);
     out
 }
 
@@ -365,6 +513,7 @@ pub fn reaudit_prompt(
     inputs: &ReviewInputs,
     items: &[String],
     changed_files: &[String],
+    uncited: &[String],
     prior: &[Finding],
     pass: u32,
     max_passes: u32,
@@ -380,6 +529,15 @@ Report; do not plan. Items still missing from the plan/spec stay `missing` cover
     } else {
         out.push_str("\nFiles changed by the fix pass (read each in full):\n");
         for file in changed_files {
+            out.push_str(&format!("- {file}\n"));
+        }
+    }
+    if !uncited.is_empty() {
+        out.push_str(
+            "\nOf those, files no finding cited (the fix pass went beyond its findings; check each for an unrequested \
+change or a regression, and report one as a `finding:` row):\n",
+        );
+        for file in uncited {
             out.push_str(&format!("- {file}\n"));
         }
     }

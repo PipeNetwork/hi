@@ -47,6 +47,7 @@ mod tutorial;
 mod usage;
 mod util;
 mod view_cache;
+mod wrap;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -375,6 +376,59 @@ impl TranscriptEntry {
         show_tool_output: bool,
         density: Density,
     ) -> Vec<Line<'static>> {
+        self.flatten_at(
+            crate::wrap::PROSE_WRAP_COLS,
+            show_reasoning,
+            show_tool_output,
+            density,
+        )
+    }
+
+    /// [`Self::flatten`] for a transcript panel `width` columns wide: prose
+    /// and thinking wrap at the panel's own width, up to the prose cap (see
+    /// [`crate::wrap::prose_wrap_cols`] for why the panel width matters).
+    pub(crate) fn flatten_at(
+        &self,
+        width: u16,
+        show_reasoning: bool,
+        show_tool_output: bool,
+        density: Density,
+    ) -> Vec<Line<'static>> {
+        self.flatten_rows(
+            width,
+            show_reasoning,
+            show_tool_output,
+            density,
+            &mut Vec::new(),
+        )
+    }
+
+    /// [`Self::flatten_at`] with how each line joins the one above it when
+    /// copied: the rows prose was wrapped into continue their line.
+    pub(crate) fn flatten_joined_at(
+        &self,
+        width: u16,
+        show_reasoning: bool,
+        show_tool_output: bool,
+        density: Density,
+    ) -> (Vec<Line<'static>>, Vec<crate::wrap::RowJoin>) {
+        let mut joins = Vec::new();
+        let lines = self.flatten_rows(width, show_reasoning, show_tool_output, density, &mut joins);
+        joins.resize(lines.len(), crate::wrap::RowJoin::NewLine);
+        (lines, joins)
+    }
+
+    /// The body of [`Self::flatten_at`]. The arms that wrap prose push every
+    /// line's join onto `joins`; the others leave it for the caller to pad.
+    fn flatten_rows(
+        &self,
+        width: u16,
+        show_reasoning: bool,
+        show_tool_output: bool,
+        density: Density,
+        joins: &mut Vec<crate::wrap::RowJoin>,
+    ) -> Vec<Line<'static>> {
+        let wrap_cols = crate::wrap::prose_wrap_cols(width);
         let th = crate::theme::theme();
         let show_tool = density.show_tool_output(show_tool_output);
         let preview_n = density.tool_preview_lines();
@@ -398,7 +452,7 @@ impl TranscriptEntry {
             TranscriptEntry::AssistantMessage { text } => {
                 let mut lines = Vec::new();
                 for line in crate::render::markdown_body_lines(text) {
-                    lines.extend(crate::render::wrap_line_to_width(&line, 120));
+                    crate::wrap::push_wrapped(&mut lines, joins, &line, wrap_cols);
                 }
                 lines
             }
@@ -417,7 +471,10 @@ impl TranscriptEntry {
                     vec![header]
                 } else {
                     let mut lines = vec![header, Line::raw("")];
-                    lines.extend(crate::render::markdown_body_lines(answer));
+                    joins.extend([crate::wrap::RowJoin::NewLine; 2]);
+                    for line in crate::render::markdown_body_lines(answer) {
+                        crate::wrap::push_wrapped(&mut lines, joins, &line, wrap_cols);
+                    }
                     lines
                 }
             }
@@ -427,11 +484,12 @@ impl TranscriptEntry {
                 text,
                 elapsed,
                 expanded,
-            } => crate::thinking::thinking_block_lines(
+            } => crate::thinking::thinking_block_lines_wrapped(
                 text,
                 *elapsed,
                 show_reasoning || *expanded,
                 false,
+                wrap_cols,
             ),
             TranscriptEntry::ToolOutput { body, expanded } => {
                 // The visible body lines sit in a sunken panel (a `panel` base
@@ -770,6 +828,9 @@ pub(crate) struct App {
     /// to a line range and that range copied.
     pub(crate) view_prefix: Vec<u32>,
     pub(crate) view_line_texts: Vec<String>,
+    /// How each of `view_line_texts` joins the one above when copied, so a
+    /// copy of wrapped prose gets its lines back rather than its rows.
+    pub(crate) view_line_joins: Vec<crate::wrap::RowJoin>,
     /// Active mouse text selection, as `(flattened line index, char column)`
     /// points (anchor = where the drag began, cursor = where it is now). The
     /// column drives character-precise selection when both points are on the same
@@ -782,9 +843,10 @@ pub(crate) struct App {
     /// shown briefly above the input after a drag-copy so the copy is visible.
     pub(crate) copy_toast: Option<(usize, Instant)>,
     /// Whether the app is capturing the mouse (scroll wheel, click-to-fold,
-    /// drag-to-copy). On by default, matching grok: click a `›` row to expand.
-    /// `/mouse off` restores the terminal's native highlight-and-copy; Shift-drag
-    /// still selects natively in most terminals while capture is on.
+    /// drag-to-copy). On when this process can set a clipboard the user can
+    /// paste from. Over SSH with no display forwarding it stays off, so
+    /// highlight-to-copy belongs to the local terminal. `/mouse on` opts into
+    /// wheel and `›` clicks; `/mouse off` gives selection back.
     pub(crate) mouse_capture: bool,
     /// Scrollback-oriented minimal transcript rendering preference.
     pub(crate) minimal_screen: bool,
@@ -999,6 +1061,9 @@ pub(crate) struct App {
     /// `/review` spec-review status line while the audit/fix loop is active,
     /// so `/review status` can answer mid-turn without the harness.
     pub(crate) spec_review_status: Option<String>,
+    /// `/ladder` status line while a ladder runs, so `/ladder status` can
+    /// answer mid-turn without the harness.
+    pub(crate) ladder_status: Option<String>,
     /// When true, all confirmation requests are auto-approved for the rest of
     /// the session without showing the modal. Set by pressing `a` on an
     /// approval prompt ("always allow this session"). Cleared only by quitting

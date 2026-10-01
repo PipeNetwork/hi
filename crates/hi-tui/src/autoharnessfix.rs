@@ -43,8 +43,17 @@ pub(crate) struct CrosstermRestore<'a> {
 }
 
 pub(crate) enum ExecKind {
-    Supervisor { session_file: PathBuf },
-    Repair { incident: PathBuf },
+    Supervisor {
+        session_file: PathBuf,
+    },
+    Repair {
+        incident: PathBuf,
+    },
+    /// `/reload`: the rebuilt `hi` on disk, resuming `session_file`.
+    Reload {
+        binary: PathBuf,
+        session_file: PathBuf,
+    },
 }
 
 impl TtyRestore for CrosstermRestore<'_> {
@@ -65,7 +74,12 @@ impl TtyRestore for CrosstermRestore<'_> {
     }
 
     fn print_restart(&mut self) {
-        println!("{}", restart_line());
+        match &self.kind {
+            ExecKind::Reload { binary, .. } => {
+                println!("reloading {} with this session…", binary.display())
+            }
+            _ => println!("{}", restart_line()),
+        }
         let _ = io::stdout().flush();
     }
 
@@ -73,8 +87,125 @@ impl TtyRestore for CrosstermRestore<'_> {
         match &self.kind {
             ExecKind::Supervisor { session_file } => exec_supervisor(session_file),
             ExecKind::Repair { incident } => exec_repair(incident),
+            ExecKind::Reload {
+                binary,
+                session_file,
+            } => exec_reload(binary, session_file),
         }
     }
+}
+
+/// Same argv minus the one-shot prompt and cwd resume flags, pinned to the
+/// session file, so the new build reopens exactly this conversation.
+#[cfg(unix)]
+fn exec_reload(binary: &std::path::Path, session_file: &std::path::Path) -> io::Error {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args = hi_sentinel::relaunch_args(&args, Some(session_file));
+    hi_sentinel::unlink_empty_crash_markers_for_current_pid();
+    std::process::Command::new(binary).args(args).exec()
+}
+
+#[cfg(not(unix))]
+fn exec_reload(_binary: &std::path::Path, _session_file: &std::path::Path) -> io::Error {
+    io::Error::other("/reload is Unix-only")
+}
+
+/// The `hi` path this process was started from. After a rebuild Linux reports
+/// the replaced inode as `… (deleted)`; the path itself holds the new build.
+pub(crate) fn binary_on_disk() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let text = exe.to_string_lossy();
+    let path = PathBuf::from(text.strip_suffix(" (deleted)").unwrap_or(&text).to_string());
+    path.is_file().then_some(path)
+}
+
+/// Notices when the `hi` binary on disk is no longer the build this process
+/// runs. Every fix during the drme stalls needed a restart that was easy to
+/// miss, so the old build kept stalling.
+pub(crate) struct BuildWatch {
+    running: Option<u64>,
+    last_check: std::time::Instant,
+    reported: bool,
+}
+
+const BUILD_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+impl BuildWatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            running: running_inode(),
+            last_check: std::time::Instant::now(),
+            reported: false,
+        }
+    }
+
+    /// True once, the first time the file on disk is a different build.
+    pub(crate) fn newer_build_on_disk(&mut self) -> bool {
+        if self.reported || self.last_check.elapsed() < BUILD_CHECK_EVERY {
+            return false;
+        }
+        self.last_check = std::time::Instant::now();
+        let (Some(running), Some(disk)) = (self.running, binary_on_disk().and_then(|p| inode(&p)))
+        else {
+            return false;
+        };
+        self.reported = running != disk;
+        self.reported
+    }
+}
+
+#[cfg(unix)]
+fn inode(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|meta| meta.ino())
+}
+
+#[cfg(not(unix))]
+fn inode(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// Inode of the running executable. `/proc/self/exe` still resolves after the
+/// file is replaced; elsewhere the path is read once at startup.
+fn running_inode() -> Option<u64> {
+    let proc_exe = std::path::Path::new("/proc/self/exe");
+    if proc_exe.exists() {
+        return inode(proc_exe);
+    }
+    binary_on_disk().and_then(|path| inode(&path))
+}
+
+/// `/reload`: replace this process with the `hi` binary on disk and reopen
+/// the current session.
+pub(crate) fn reload(
+    app: &mut App,
+    harness: &Harness,
+    restore: &mut Option<Restore>,
+    termios: Option<&libc::termios>,
+) -> Result<Option<String>> {
+    let Some(session_file) = harness.session_path().map(std::path::Path::to_path_buf) else {
+        app.push(Line::styled(
+            "this session is not saved, so /reload cannot reopen it; exit and run `hi` again",
+            dim(),
+        ));
+        return Ok(None);
+    };
+    let Some(binary) = binary_on_disk() else {
+        app.push(Line::styled(
+            "cannot find the hi binary on disk to reload",
+            dim(),
+        ));
+        return Ok(None);
+    };
+    exec_after_restore(
+        restore,
+        termios,
+        ExecKind::Reload {
+            binary,
+            session_file,
+        },
+    )
 }
 
 pub(crate) fn snapshot_termios() -> Option<libc::termios> {
@@ -156,8 +287,12 @@ fn exec_after_restore(
         termios,
         kind,
     };
+    let target = match &host.kind {
+        ExecKind::Reload { binary, .. } => binary.display().to_string(),
+        _ => "hi-sentinel".to_string(),
+    };
     let err = restore_then_exec(&mut host);
-    Err(anyhow::anyhow!("exec hi-sentinel: {err}"))
+    Err(anyhow::anyhow!("exec {target}: {err}"))
 }
 
 /// Mirrors `CrosstermRestore`: `Restore::restore_now_static` already left the

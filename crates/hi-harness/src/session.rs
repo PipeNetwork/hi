@@ -15,6 +15,11 @@ pub struct PlanDrive {
     pub resume_on_user_input: bool,
     #[serde(default)]
     pub stall: u32,
+    /// An edit landed since the active step opened. Plan drive starts a
+    /// fresh turn per step, so without this a step finished last turn looks
+    /// untouched and the only way to close it is another edit.
+    #[serde(default)]
+    pub step_edited: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,6 +60,13 @@ pub(crate) enum SessionMeta {
     TurnClosed {
         turn_index: u32,
     },
+    /// Why a turn ended in error. The TUI shows this once and forgets it;
+    /// without a record a stalled session has nothing to diagnose.
+    TurnError {
+        turn_index: u32,
+        kind: String,
+        message: String,
+    },
     Plan {
         steps: Vec<hi_tools::PlanStep>,
     },
@@ -64,6 +76,8 @@ pub(crate) enum SessionMeta {
         resume_on_user_input: bool,
         #[serde(default)]
         stall: u32,
+        #[serde(default)]
+        step_edited: bool,
     },
     ReviewDrive {
         drive: Box<crate::review_drive::ReviewDrive>,
@@ -179,16 +193,19 @@ impl JsonlSession {
                             pending = None;
                         }
                     }
+                    SessionMeta::TurnError { .. } => {}
                     SessionMeta::Plan { steps } => loaded.plan = steps,
                     SessionMeta::PlanDrive {
                         paused,
                         resume_on_user_input,
                         stall,
+                        step_edited,
                     } => {
                         loaded.plan_drive = PlanDrive {
                             paused,
                             resume_on_user_input,
                             stall,
+                            step_edited,
                         };
                     }
                     SessionMeta::ReviewDrive { drive } => loaded.review_drive = *drive,
@@ -252,6 +269,7 @@ impl JsonlSession {
             paused: drive.paused,
             resume_on_user_input: drive.resume_on_user_input,
             stall: drive.stall,
+            step_edited: drive.step_edited,
         })?;
         crate::session_index::patch_index(&self.path, |index| {
             index.drive_paused = drive.paused;
@@ -343,6 +361,14 @@ impl JsonlSession {
         self.write_meta(&SessionMeta::Model { id: id.to_string() })
     }
 
+    pub fn record_turn_error(&mut self, turn_index: u32, kind: &str, message: &str) -> Result<()> {
+        self.write_meta(&SessionMeta::TurnError {
+            turn_index,
+            kind: kind.to_string(),
+            message: message.chars().take(4_000).collect(),
+        })
+    }
+
     pub fn record_knobs(&mut self, permission: u8, effort: Option<&str>) -> Result<()> {
         self.write_meta(&SessionMeta::Knobs {
             permission,
@@ -428,6 +454,7 @@ impl JsonlSession {
                     paused: state.plan_drive.paused,
                     resume_on_user_input: state.plan_drive.resume_on_user_input,
                     stall: state.plan_drive.stall,
+                    step_edited: state.plan_drive.step_edited,
                 },
             )?;
             if state.review_drive.phase != crate::review_drive::ReviewPhase::Idle {
@@ -719,6 +746,7 @@ mod tests {
                 paused: true,
                 resume_on_user_input: true,
                 stall: 2,
+                step_edited: true,
             })
             .unwrap();
         let loaded = JsonlSession::load(&path).unwrap();
@@ -726,6 +754,7 @@ mod tests {
         assert!(loaded.plan_drive.paused);
         assert!(loaded.plan_drive.resume_on_user_input);
         assert_eq!(loaded.plan_drive.stall, 2);
+        assert!(loaded.plan_drive.step_edited);
     }
 
     #[test]

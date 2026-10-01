@@ -10,12 +10,161 @@ use std::path::Path;
 
 use crate::review::{Finding, ReviewVerdict};
 
-/// Same severity, title (normalized), and cited file: the merge key for
-/// duplicate `finding:` rows.
-pub(crate) fn same_finding(a: &Finding, b: &Finding) -> bool {
+/// Cited lines this far apart still mean the same place: a fix pass moves
+/// code by about the size of its edit.
+const LINE_SLACK: u32 = 10;
+
+/// The same `finding:` row reported twice (in one block, or by two turns of
+/// one audit): same severity, normalized title, and cited file. The merge
+/// key; it must stay stricter than [`same_finding`], which would fold a P0
+/// into a P2 a few lines away that shares one word.
+pub(crate) fn duplicate_finding(a: &Finding, b: &Finding) -> bool {
     a.severity == b.severity
         && normalize_title(&a.title) == normalize_title(&b.title)
         && citation_path(a.location.as_deref()) == citation_path(b.location.as_deref())
+}
+
+/// One defect, reported twice: the same cited file and either a similar
+/// title (half the content words shared) or a citation within
+/// [`LINE_SLACK`] lines with a word in common. Severity is not part of the
+/// identity (a P1 re-filed as P0 is the same defect), and a reworded title
+/// at the same place no longer counts as progress. With no cited file,
+/// titles decide.
+fn same_finding(a: &Finding, b: &Finding) -> bool {
+    let (path_a, path_b) = (
+        citation_path(a.location.as_deref()),
+        citation_path(b.location.as_deref()),
+    );
+    if path_a != path_b {
+        return false;
+    }
+    let shared = shared_tokens(&a.title, &b.title);
+    if similar_titles(&a.title, &b.title, shared) {
+        return true;
+    }
+    path_a.is_some()
+        && shared >= 1
+        && matches!(
+            (
+                citation_line(a.location.as_deref()),
+                citation_line(b.location.as_deref()),
+            ),
+            (Some(la), Some(lb)) if la.abs_diff(lb) <= LINE_SLACK
+        )
+}
+
+/// Content words the two titles share.
+fn shared_tokens(a: &str, b: &str) -> usize {
+    let tokens_a = match_tokens(a);
+    let tokens_b = match_tokens(b);
+    tokens_a
+        .iter()
+        .filter(|token| tokens_b.contains(token))
+        .count()
+}
+
+/// Half of the shorter title's content words shared (identical titles
+/// trivially; titles with no content words only when normalized equal).
+fn similar_titles(a: &str, b: &str, shared: usize) -> bool {
+    if normalize_title(a) == normalize_title(b) {
+        return true;
+    }
+    let shorter = match_tokens(a).len().min(match_tokens(b).len());
+    shorter > 0 && shared * 2 >= shorter && shared >= 1
+}
+
+/// True when the two blocking sets are the same defects (each matched by
+/// [`same_finding`] in the other), so a re-audit that only reworded them
+/// is no progress.
+pub fn same_finding_set(prior: &[Finding], now: &[Finding]) -> bool {
+    prior.len() == now.len()
+        && now
+            .iter()
+            .all(|finding| prior.iter().any(|seen| same_finding(seen, finding)))
+        && prior
+            .iter()
+            .all(|finding| now.iter().any(|seen| same_finding(seen, finding)))
+}
+
+/// Files a fix pass changed that none of its findings cite, minus tests,
+/// lockfiles, and the like (a fix is asked to add a regression test). The
+/// re-audit is told to look at them; the report warns.
+pub fn uncited_changes(changed: &[String], findings: &[Finding]) -> Vec<String> {
+    let cited: Vec<String> = findings
+        .iter()
+        .flat_map(|finding| citation_paths(finding.location.as_deref()))
+        .collect();
+    changed
+        .iter()
+        .filter(|file| {
+            let file = file.trim_start_matches("./");
+            !cited.iter().any(|path| path == file) && !is_expected_side_change(file)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Test files, lockfiles, snapshots: files a fix legitimately touches
+/// without a finding citing them.
+fn is_expected_side_change(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    lower.split('/').any(|part| {
+        matches!(
+            part,
+            "tests"
+                | "test"
+                | "__tests__"
+                | "spec"
+                | "specs"
+                | "snapshots"
+                | "__snapshots__"
+                | "fixtures"
+        )
+    }) || name.ends_with("_test.rs")
+        || name.ends_with("_tests.rs")
+        || name.starts_with("test_")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.contains("_test.")
+        || matches!(
+            name,
+            "cargo.lock"
+                | "package-lock.json"
+                | "yarn.lock"
+                | "pnpm-lock.yaml"
+                | "poetry.lock"
+                | "go.sum"
+        )
+}
+
+/// The line of the first citation in a cell (`src/a.rs:42-50` -> 42).
+pub fn citation_line(location: Option<&str>) -> Option<u32> {
+    let raw = location?.split([',', ';']).next()?.trim().trim_matches('`');
+    let raw = match raw.find('(') {
+        Some(open) if open > 0 => raw[..open].trim(),
+        _ => raw,
+    };
+    // Trailing numeric segments are `line`, `line-end`, or `line:col`; the
+    // one right after the path is the line.
+    let mut segments: Vec<&str> = raw.split(':').collect();
+    let mut numeric: Vec<&str> = Vec::new();
+    while segments.len() > 1 {
+        let last = segments[segments.len() - 1];
+        let digits_first = last.chars().next().is_some_and(|ch| ch.is_ascii_digit());
+        if digits_first && last.chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
+            numeric.push(last);
+            segments.pop();
+        } else {
+            break;
+        }
+    }
+    let line = numeric.last()?;
+    line.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 /// Words that carry no meaning for matching a finding to a plan row.

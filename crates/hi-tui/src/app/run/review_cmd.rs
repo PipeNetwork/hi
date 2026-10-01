@@ -117,10 +117,12 @@ pub(super) fn running_status(app: &App) -> String {
         .unwrap_or_else(|| "spec review: not running".into())
 }
 
-/// Short transcript echo for review-injected prompts instead of the full
-/// multi-paragraph instruction block.
+/// Short transcript echo for review- and ladder-injected prompts instead of
+/// the full multi-paragraph instruction block.
 pub(super) fn transcript_echo(prompt: &str) -> String {
-    hi_harness::review_transcript_label(prompt).unwrap_or_else(|| prompt.to_string())
+    hi_harness::review_transcript_label(prompt)
+        .or_else(|| hi_harness::ladder_transcript_label(prompt))
+        .unwrap_or_else(|| prompt.to_string())
 }
 
 fn sync_status(app: &mut App, harness: &Harness) {

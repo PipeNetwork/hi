@@ -4,6 +4,8 @@ mod auth;
 mod bootstrap;
 mod browser_cmd;
 mod config;
+mod credential_recovery;
+mod ladder_cli;
 mod liveness;
 mod paths;
 mod pipe_session;
@@ -38,6 +40,10 @@ fn main() {
     if let Err(error) = run_main() {
         // `hi --spec-review` outcomes are results, not failures: plain line, no red.
         if let Some(exit) = error.downcast_ref::<review_cli::ReviewExit>() {
+            eprintln!("{exit}");
+            std::process::exit(exit.code);
+        }
+        if let Some(exit) = error.downcast_ref::<ladder_cli::LadderExit>() {
             eprintln!("{exit}");
             std::process::exit(exit.code);
         }
@@ -245,8 +251,39 @@ async fn run() -> Result<()> {
         match config::resolve(&cli, &file) {
             Ok(settings) => settings,
             Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(2);
+                let missing = credential_recovery::MissingKey::from_error(
+                    cli.profile.as_deref(),
+                    &file,
+                    &err,
+                );
+                match missing {
+                    // The selected profile is intact but its saved key is gone
+                    // from the credential store: ask for it again and keep the
+                    // profile, rather than failing on a bare store reference.
+                    Some(missing) if std::io::stdin().is_terminal() => {
+                        liveness::awaiting_user(credential_recovery::recover(
+                            &mut file,
+                            &missing,
+                            cli.config.as_deref(),
+                        ))
+                        .await?;
+                        match config::resolve(&cli, &file) {
+                            Ok(settings) => settings,
+                            Err(err) => {
+                                eprintln!("{err}");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    Some(missing) => {
+                        eprintln!("{err}\n{}", missing.guidance());
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("{err}");
+                        std::process::exit(2);
+                    }
+                }
             }
         }
     };

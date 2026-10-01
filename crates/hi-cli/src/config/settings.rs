@@ -511,10 +511,9 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
 /// Reasoning effort for this route.
 ///
 /// CLI always wins. A profile's `reasoning_effort` applies only when that
-/// profile's provider is the active one — an xAI default profile's `xhigh`
-/// must not follow `--provider pipenetwork` onto DeepSeek wrap-up.
-/// Machine-wide `/config reasoning` still applies, except `xhigh`, which is
-/// an xAI-only wire value and is dropped on every other provider.
+/// profile's provider is the active one — an xAI default profile's setting
+/// must not follow `--provider pipenetwork`. With nothing else set, the
+/// default is `xhigh`.
 pub(crate) fn resolve_reasoning_effort(
     cli: Option<ReasoningEffort>,
     profile: Option<&Profile>,
@@ -532,10 +531,7 @@ pub(crate) fn resolve_reasoning_effort(
             return Some(effort);
         }
     }
-    match machine {
-        Some(ReasoningEffort::Xhigh) if provider != ProviderName::Xai => None,
-        other => other,
-    }
+    Some(machine.unwrap_or(ReasoningEffort::Xhigh))
 }
 
 /// Profile to borrow credentials from when resolving a bare provider preset.

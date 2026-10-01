@@ -156,6 +156,7 @@ fn turn_report_records_silent_inspect_stop_fields() {
         changed_files: Vec::new(),
         error: None,
         verification: None,
+        attempted_mutation: false,
     };
     let body = turn_report_json(&outcome, &ui, 4, &[], None);
     assert!(

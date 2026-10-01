@@ -28,9 +28,11 @@ pub const EMPTY_AFTER_TOOLS_CONTINUATIONS: u32 = 2;
 
 pub const EMPTY_AFTER_TOOLS_HINT: &str = "\
 Your last response ended with no user-visible answer after tool work. \
-Do not repeat the same grep/read/list. If a search returned no matches, \
-the code is not in the tree — add it with edit/write. Continue the task \
-or write the complete reply to the user. Do not stop without that reply.";
+Do not repeat the same grep/read/list/write. If a tool result already \
+answers the user, write that reply now. If a search returned no matches \
+and the user asked you to add the missing code, add it with edit/write. \
+Do not change a file just to restate text that is already there. Do not \
+stop without a user-visible reply.";
 
 pub const UNVERIFIED_FIX_HINT: &str = "\
 You were asked to review and fix. Run `cargo test` (or the project's test \
@@ -42,12 +44,58 @@ pub const NEXT_ACTION_EDIT_HINT: &str = "\
 You were asked to review and fix. Stop inspecting and call `edit`/`write` on \
 the failing code, or run `cargo test` if you do not yet know what fails.";
 
-pub const PLAN_EXECUTE_HINT: &str = "\
+/// Edit demand when a test run cannot close the active step (a lone
+/// untouched step, or this turn's test-run close is spent), so it does not
+/// offer `update_plan`.
+pub const EDIT_NOW_HINT: &str = "\
 Stop inspecting. Your next action MUST be `edit` or `write` on the files that \
-need to change. If a plan is open, implement the active step now. Do not mark \
-a step done unless you changed the tree. Do not start a new grep or list. \
-If you were paging a file, you have enough — edit now. Do not call \
-update_plan. Call edit/write in this response.";
+need to change; if a plan is open, implement its active step. Do not start a \
+new grep or list; if you were paging a file, you have enough. Never add \
+filler comments or no-op edits to satisfy this.";
+
+/// Edit demand while a test run can still close the active step
+/// ([`TurnFacts::test_close_available`]). It must name that route: an
+/// edit-only demand there leaves the model padding a finished file with
+/// comments until plan_stall.
+pub const PLAN_EXECUTE_HINT: &str = "\
+Stop inspecting. Implement the active plan step now: your next action MUST \
+be `edit` or `write` on the files that need to change. Do not start a new \
+grep or list; if you were paging a file, you have enough. Only if the active \
+step is already fully implemented in the current tree: run the project's \
+tests, then call update_plan to mark it done and set the next step active. \
+Never add filler comments or no-op edits to satisfy this.";
+
+/// Edit demand after a step closed this turn without edits
+/// ([`TurnFacts::closed_step_without_edits`]) and a test run can no longer
+/// close another. Stopping is allowed: the next turn gets its own.
+pub const NEXT_STEP_HINT: &str = "\
+A plan step already closed this turn. If the active step still needs changes, \
+make them now with `edit` or `write`; do not start a new grep or list. If it \
+is already implemented, stop and say so: the next turn can close it after a \
+passing test run. Never add filler comments or no-op edits.";
+
+/// Edit demand after the tests failed on the active step's edit.
+pub const FAILING_TESTS_HINT: &str = "\
+The tests failed after your last edit. Read that failure output and fix it \
+with `edit`/`write` now; the step cannot close until the tests pass. Do not \
+re-run them before changing a file, and never add filler edits.";
+
+/// Sent once the active step was edited and the tests passed, but the model
+/// stopped without `update_plan`. An edit demand here instead pushes the model
+/// into filler edits (repeated comment lines) just to keep the turn alive.
+pub const PLAN_CLOSE_HINT: &str = "\
+Your edits are applied and the tests passed, but the active plan step is \
+still open. If that step is complete, call update_plan now: mark it done, set \
+the next unfinished step active, then start that step with edit/write. If \
+part of the step is still missing, edit it. Do not recap, and never add \
+filler comments or no-op edits to keep the turn going.";
+
+pub const FAILED_EDIT_HINT: &str = "\
+Your last edit/write did not apply. Do not retry the same old_string and do \
+not run cargo test again. Read the target file (or the closest-matching \
+region from the error) and copy old_string from the current text, then edit. \
+If the new_string is already in the file, call update_plan: mark the active \
+step done and set the next unfinished step active. Do not recap status.";
 
 pub const INSPECT_STOP_VERDICT_HINT: &str = "\
 Stop inspecting. Write a short user-visible answer now: what to change, or \
@@ -58,6 +106,9 @@ const INSPECT_STOP_MSG: &str = "stopped inspecting without applying the requeste
 const UNVERIFIED_STOP_MSG: &str =
     "changes were applied but the project's tests never ran after the last edit";
 const PLAN_STALL_MSG: &str = "plan still has unfinished steps but the turn stopped without an edit";
+const PLAN_STALL_FAILING_MSG: &str =
+    "plan still has unfinished steps and the tests failed after the last edit";
+const PLAN_KEPT_OPEN_MSG: &str = "the model kept the active plan step open after the tests passed, then stopped without another edit";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -84,6 +135,8 @@ pub enum Demand {
     Verify,
     Verdict,
     VisibleAnswer,
+    /// The active step was edited and tested green; ask for `update_plan`.
+    ClosePlanStep,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +158,10 @@ pub enum Decision {
     /// Call the model again with no extra hint (normal tool loop).
     Proceed,
     Complete,
+    /// The [`Demand::ClosePlanStep`] hint went unanswered. The harness marks
+    /// the active step done itself and completes the turn instead of ending
+    /// in `plan_stall` with the work finished.
+    ClosePlanStep,
     Error {
         kind: &'static str,
         message: &'static str,
@@ -141,6 +198,27 @@ pub struct TurnFacts {
     /// Consecutive same-path pagination rounds. Caps paging one huge file
     /// forever without blocking unique-file exploration.
     pub pagination_rounds: u32,
+    /// An edit/write/patch was attempted and failed this turn.
+    pub failed_mutation: bool,
+    /// One `update_plan` credit after a failed edit plus a read, so an
+    /// already-implemented step can close without a fake patch.
+    pub reconcile_credit_granted: bool,
+    /// An edit landed since the active plan step opened, this turn or an
+    /// earlier one (see [`crate::PlanDrive::step_edited`]).
+    pub step_work: bool,
+    /// The last verify run failed. A red run proves nothing about the step,
+    /// so it grants no reconcile credit and cannot close the step.
+    pub verify_failed: bool,
+    /// Steps in the current plan. Until it is edited, a lone step cannot be
+    /// closed by a test run alone.
+    pub plan_steps: usize,
+    /// A plan step closed this turn. Like a reconcile, that satisfies an
+    /// Implement turn that made no edit because the code was already there.
+    pub closed_step: bool,
+    /// After passing tests the model posted `update_plan` with the active
+    /// step still open: it says the step is not finished, so the harness
+    /// must not close it for the model until another edit lands.
+    pub step_kept_open: bool,
 }
 
 impl TurnFacts {
@@ -162,6 +240,13 @@ impl TurnFacts {
             opening_plan_grace: false,
             seen_read_paths: Vec::new(),
             pagination_rounds: 0,
+            failed_mutation: false,
+            reconcile_credit_granted: false,
+            step_work: false,
+            verify_failed: false,
+            plan_steps: 0,
+            closed_step: false,
+            step_kept_open: false,
         }
     }
 
@@ -169,11 +254,83 @@ impl TurnFacts {
         self.work_credits = self.work_credits.saturating_add(1);
     }
 
+    /// A missed edit plus a later read (or an "already in the file" miss)
+    /// may close exactly one plan step.
+    pub fn grant_reconcile_credit(&mut self) {
+        if self.failed_mutation && !self.reconcile_credit_granted {
+            self.work_credits = self.work_credits.saturating_add(1);
+            self.reconcile_credit_granted = true;
+        }
+    }
+
+    /// A passing test run alone may close one step per turn: a step finished
+    /// in an earlier turn (plan drive runs a turn per step), one an earlier
+    /// step's edits already covered, or one that needs no edit ("Baseline:
+    /// run cargo test"). See [`tests_may_close_plan_step`].
+    pub fn tests_may_close_step(&self) -> bool {
+        tests_may_close(self.plan_open, self.step_work, self.plan_steps)
+    }
+
+    /// Running the tests and calling `update_plan` can still close the
+    /// active step this turn, so a hint may offer that route.
+    pub fn test_close_available(&self) -> bool {
+        self.tests_may_close_step() && (!self.verify_credit_granted || self.work_credits > 0)
+    }
+
+    /// A step closed this turn on tests alone ("Baseline: run cargo test",
+    /// or code an earlier turn wrote) and nothing was edited. If the next
+    /// step is already done too, only a fresh turn can close it, so stopping
+    /// here ends the turn; plan drive opens that step next. A turn with
+    /// edits keeps its post-edit test credit for that and is still pushed to
+    /// finish, so "Remaining: …, not implementing those" stays a plan_stall.
+    pub fn closed_step_without_edits(&self) -> bool {
+        self.closed_step && !self.mutated
+    }
+
+    /// One credit per turn for tests after an edit, or for a passing run
+    /// whenever [`Self::tests_may_close_step`]. Without the second case a
+    /// finished step could only close through yet another (filler) edit.
     pub fn grant_verify_credit(&mut self) {
-        if self.mutated && !self.verify_credit_granted {
+        if self.verify_credit_granted {
+            return;
+        }
+        if self.mutated || (!self.verify_failed && self.tests_may_close_step()) {
             self.work_credits = self.work_credits.saturating_add(1);
             self.verify_credit_granted = true;
         }
+    }
+
+    /// Judge the test-run credit against a proposed `update_plan` before
+    /// [`accept_plan`] spends credits, so tests that already passed this turn
+    /// also count for a plan posted after them.
+    pub fn preview_plan(&mut self, previous: &[PlanStep], proposed: &[PlanStep]) {
+        self.plan_open = proposed.iter().any(|step| !was_done(previous, step));
+        self.plan_steps = proposed.len();
+        if self.ran_verify {
+            self.grant_verify_credit();
+        }
+    }
+
+    /// The active step was edited, the tests after that edit passed, and a
+    /// credit is left to close it. Nothing is owed but `update_plan`.
+    pub fn ready_to_close_step(&self) -> bool {
+        self.plan_open
+            && matches!(self.intent, Intent::Implement | Intent::Fix)
+            && self.step_work
+            && self.ran_verify
+            && !self.verify_failed
+            && self.work_credits > 0
+            && !self.step_kept_open
+    }
+
+    /// Live ~/drme: tests passed, the model answered the close demand with
+    /// `update_plan` keeping "Verify dav1d + ffmpeg + tests" active because
+    /// dav1d still rejected the stream, and the harness closed the step
+    /// anyway. The plan then read 4/4, was dismissed, and nothing resumed.
+    /// A plan posted before the tests ran is not such an answer.
+    pub fn note_plan_update(&mut self, previous: &[PlanStep], proposed: &[PlanStep]) {
+        self.step_kept_open =
+            self.ran_verify && !self.verify_failed && keeps_active_step_open(previous, proposed);
     }
 
     /// Remaining plan steps on Implement and Fix are still an edit demand
@@ -184,7 +341,10 @@ impl TurnFacts {
             return false;
         }
         match self.intent {
-            Intent::Implement => !self.mutated || self.plan_open,
+            Intent::Implement => {
+                self.plan_open
+                    || (!self.mutated && !self.reconcile_credit_granted && !self.closed_step)
+            }
             Intent::Fix => self.plan_open,
             Intent::Review => false,
         }
@@ -219,7 +379,8 @@ impl TurnFacts {
 
     /// Update consecutive stall after a tool round.
     ///
-    /// Mutation always resets. Stall-only rounds increment. `cargo test`
+    /// Mutation (or a round that closed a plan step) always resets.
+    /// Stall-only rounds increment. `cargo test`
     /// while a plan is still open and nothing was edited does **not** reset
     /// — that is the shipping stall (tests, then eighty reads). The first
     /// `update_plan`-only round is checklist progress, not a stall.
@@ -307,18 +468,34 @@ pub fn decide(event: Event, facts: &mut TurnFacts) -> Decision {
 }
 
 fn decide_model_stop(facts: &mut TurnFacts) -> Decision {
-    if !facts.used_tools {
+    // Review/Q&A and a Fix verdict with no tools are finished answers.
+    // An Implement (or open-plan) turn that still owes an edit is a cop-out
+    // even on round zero; completing it lets the model repeat the same
+    // "Want me to…?" recap every turn.
+    if !facts.used_tools && !facts.wants_edit() {
+        return Decision::Complete;
+    }
+    // Edited, tested green, stopped: whatever the model wrote, the step is
+    // finished. An edit demand here would force filler edits, then plan_stall.
+    if facts.ready_to_close_step() {
+        return if can_continue(facts, Demand::ClosePlanStep) {
+            continue_demand(facts, Demand::ClosePlanStep)
+        } else {
+            Decision::ClosePlanStep
+        };
+    }
+    if facts.closed_step_without_edits() && !facts.wants_verify() {
         return Decision::Complete;
     }
     if !facts.visible_answer {
         if facts.wants_verify() && can_continue(facts, Demand::Verify) {
-            return continue_demand(Demand::Verify);
+            return continue_demand(facts, Demand::Verify);
         }
         if facts.wants_edit() && can_continue(facts, Demand::Edit) {
-            return continue_demand(Demand::Edit);
+            return continue_demand(facts, Demand::Edit);
         }
         if can_continue(facts, Demand::VisibleAnswer) {
-            return continue_demand(Demand::VisibleAnswer);
+            return continue_demand(facts, Demand::VisibleAnswer);
         }
         return Decision::Error {
             kind: "empty_stop",
@@ -327,17 +504,17 @@ fn decide_model_stop(facts: &mut TurnFacts) -> Decision {
     }
     if facts.wants_verify() {
         if can_continue(facts, Demand::Verify) {
-            return continue_demand(Demand::Verify);
+            return continue_demand(facts, Demand::Verify);
         }
         return unmet_error(facts);
     }
     if facts.wants_edit() {
         if can_continue(facts, Demand::Edit) {
-            return continue_demand(Demand::Edit);
+            return continue_demand(facts, Demand::Edit);
         }
         if facts.plan_open && !facts.last_chance {
             facts.last_chance = true;
-            return continue_demand(Demand::Edit);
+            return continue_demand(facts, Demand::Edit);
         }
         return unmet_error(facts);
     }
@@ -362,35 +539,53 @@ fn decide_tools_finished(facts: &mut TurnFacts, inspect_repeat_capped: bool) -> 
         return Decision::Proceed;
     }
     if pressure < STALL_ROUNDS_BEFORE_ERROR {
-        return continue_demand(demand);
+        return continue_demand(facts, demand);
     }
     // The inspect that hit the cap often *is* the last file the model
     // needed (live ~/chat: plan + paginated server/db/state, then ws.rs).
     // Give one edit demand with that result in context before plan_stall.
     if facts.wants_edit() && facts.plan_open && !facts.last_chance {
         facts.last_chance = true;
-        return continue_demand(demand);
+        return continue_demand(facts, demand);
     }
-    unmet_error(facts)
+    out_of_demands(facts)
 }
 
 fn capped_repeat_demand(facts: &mut TurnFacts) -> Decision {
     let demand = stall_demand(facts);
     if can_continue(facts, demand) {
-        return continue_demand(demand);
+        return continue_demand(facts, demand);
     }
     if !facts.last_chance {
         facts.last_chance = true;
-        return continue_demand(demand);
+        return continue_demand(facts, demand);
     }
-    unmet_error(facts)
+    out_of_demands(facts)
+}
+
+/// The stall budget is spent. A finished step closes instead of erroring.
+fn out_of_demands(facts: &TurnFacts) -> Decision {
+    if facts.ready_to_close_step() {
+        Decision::ClosePlanStep
+    } else {
+        unmet_error(facts)
+    }
 }
 
 fn unmet_error(facts: &TurnFacts) -> Decision {
     if facts.wants_edit() && facts.plan_open {
+        if facts.closed_step_without_edits() {
+            return Decision::Complete;
+        }
         return Decision::Error {
             kind: "plan_stall",
-            message: PLAN_STALL_MSG,
+            message: if facts.step_kept_open {
+                PLAN_KEPT_OPEN_MSG
+            } else if facts.step_work && facts.verify_failed {
+                PLAN_STALL_FAILING_MSG
+            } else {
+                PLAN_STALL_MSG
+            },
         };
     }
     // The tree did change; only the test run is missing. Saying "without
@@ -417,6 +612,8 @@ fn unmet_error(facts: &TurnFacts) -> Decision {
 pub fn stall_demand(facts: &TurnFacts) -> Demand {
     if facts.wants_verify() {
         Demand::Verify
+    } else if facts.ready_to_close_step() {
+        Demand::ClosePlanStep
     } else if facts.wants_edit() {
         Demand::Edit
     } else {
@@ -437,28 +634,40 @@ fn can_continue(facts: &TurnFacts, demand: Demand) -> bool {
     }
 }
 
-fn continue_demand(demand: Demand) -> Decision {
+fn continue_demand(facts: &TurnFacts, demand: Demand) -> Decision {
     Decision::Continue {
         demand,
-        hint: hint_for(demand),
+        hint: hint_for_facts(facts, demand),
     }
 }
 
-pub fn hint_for(demand: Demand) -> &'static str {
+pub fn hint_for_facts(facts: &TurnFacts, demand: Demand) -> &'static str {
     match demand {
-        Demand::Edit => PLAN_EXECUTE_HINT,
+        Demand::Edit if facts.failed_mutation => FAILED_EDIT_HINT,
+        Demand::Edit if facts.step_work && facts.verify_failed => FAILING_TESTS_HINT,
+        Demand::Edit if facts.test_close_available() => PLAN_EXECUTE_HINT,
+        Demand::Edit if facts.closed_step_without_edits() => NEXT_STEP_HINT,
+        Demand::Edit => EDIT_NOW_HINT,
         Demand::Verify => UNVERIFIED_FIX_HINT,
         Demand::Verdict => INSPECT_STOP_VERDICT_HINT,
         Demand::VisibleAnswer => EMPTY_AFTER_TOOLS_HINT,
+        Demand::ClosePlanStep => PLAN_CLOSE_HINT,
     }
 }
 
-pub fn status_for(demand: Demand) -> &'static str {
+pub fn status_for_facts(facts: &TurnFacts, demand: Demand) -> &'static str {
     match demand {
+        Demand::Edit if facts.failed_mutation => {
+            "last edit missed; asking to read then edit or close the step"
+        }
+        Demand::Edit if facts.step_work && facts.verify_failed => {
+            "tests failed after the edit; asking for a fix"
+        }
         Demand::Edit => "task in progress; asking for an edit",
         Demand::Verify => "review-and-fix stopped after inspection; asking for tests",
         Demand::Verdict => "inspect-repeat stop; asking for a verdict",
         Demand::VisibleAnswer => "empty model stop after tools; continuing",
+        Demand::ClosePlanStep => "step edited and tests passed; asking to mark it done",
     }
 }
 
@@ -469,7 +678,9 @@ pub fn status_for(demand: Demand) -> &'static str {
 /// test of the current tree, inspect-repeat, then `plan_stall`). Remaining
 /// plan steps are also not a cop-out after cargo test.
 pub fn flavor_demand(current: Demand, typesafe: crate::NextAction, facts: &TurnFacts) -> Demand {
-    if current == Demand::VisibleAnswer || typesafe == crate::NextAction::Inspect {
+    if matches!(current, Demand::VisibleAnswer | Demand::ClosePlanStep)
+        || typesafe == crate::NextAction::Inspect
+    {
         return current;
     }
     if facts.plan_open && !facts.mutated && current == Demand::Edit {
@@ -509,7 +720,9 @@ pub fn latest_prompt_text(messages: &[Message], input: &str) -> String {
 }
 
 /// Short "keep going" lines. Punctuation is ignored so
-/// [`crate::CONTINUE_PLAN_PROMPT`] matches.
+/// [`crate::CONTINUE_PLAN_PROMPT`] matches. A drive prompt that starts
+/// with "Continue the open plan." plus the active step still counts;
+/// a bare "continue using …" does not.
 pub fn is_continuation_prompt(text: &str) -> bool {
     let mut normalized = String::new();
     for ch in text.chars() {
@@ -524,8 +737,9 @@ pub fn is_continuation_prompt(text: &str) -> bool {
         }
         normalized.push(ch.to_ascii_lowercase());
     }
+    let trimmed = normalized.trim();
     matches!(
-        normalized.trim(),
+        trimmed,
         "continue"
             | "continue the open plan"
             | "keep going"
@@ -539,7 +753,7 @@ pub fn is_continuation_prompt(text: &str) -> bool {
             | "y"
             | "ok"
             | "okay"
-    )
+    ) || trimmed.starts_with("continue the open plan ")
 }
 
 fn is_weak_ack(text: &str) -> bool {
@@ -619,22 +833,87 @@ pub fn user_asked_to_implement(text: &str) -> bool {
         "do all of that",
         "do all that",
         "build all of that",
+        "start building",
+        "building all of that",
+        "building all that",
         "make those changes",
         "apply those",
         "implement that",
         "implement those",
         "implement it",
+        "build out",
     ];
     if PHRASES.iter().any(|phrase| lower.contains(phrase)) {
         return true;
     }
-    lower
+    let words: Vec<&str> = lower
         .split(|ch: char| !ch.is_ascii_alphabetic())
-        .any(|word| matches!(word, "implement" | "implements"))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "implement" | "implements" | "impliment" | "impliments"
+        )
+    }) || finish_the_implementation(&words)
+}
+
+/// Live ~/drme: "finish the av1 implimentation", sent five times, was a
+/// Review turn, so a stale recap completed it with no edit owed. The verb
+/// must lead: "is the implementation complete?" is still a question.
+fn finish_the_implementation(words: &[&str]) -> bool {
+    const LEADS: &[&str] = &[
+        "please", "pls", "now", "ok", "okay", "so", "just", "go", "ahead", "and", "can", "could",
+        "you", "lets", "let", "s",
+    ];
+    let verb = words.iter().find(|word| !LEADS.contains(word));
+    matches!(verb, Some(&("finish" | "complete" | "build")))
+        && words
+            .iter()
+            .any(|word| *word == "impl" || word.starts_with("implem") || word.starts_with("implim"))
 }
 
 pub fn plan_is_open(plan: &[PlanStep]) -> bool {
     !plan.is_empty() && !PlanStep::all_complete(plan)
+}
+
+/// Not for the lone step of a plan nothing has edited: "post a one-step
+/// plan, run the tests" must not stand in for an Implement request.
+fn tests_may_close(plan_open: bool, step_edited: bool, plan_steps: usize) -> bool {
+    plan_open && (step_edited || plan_steps >= 2)
+}
+
+/// [`TurnFacts::tests_may_close_step`] for a stored plan, where
+/// `step_edited` is [`crate::PlanDrive::step_edited`].
+pub fn tests_may_close_plan_step(plan: &[PlanStep], step_edited: bool) -> bool {
+    tests_may_close(plan_is_open(plan), step_edited, plan.len())
+}
+
+fn was_done(previous: &[PlanStep], step: &PlanStep) -> bool {
+    previous
+        .iter()
+        .any(|prior| prior.title == step.title && prior.status == PlanStatus::Done)
+}
+
+/// `next` marks done a step that `previous` had not finished. Counting done
+/// steps would miss a re-post that drops one done step and closes another.
+pub fn closes_a_step(previous: &[PlanStep], next: &[PlanStep]) -> bool {
+    next.iter()
+        .any(|step| step.status == PlanStatus::Done && !was_done(previous, step))
+}
+
+/// `proposed` still lists the step `previous` had active as unfinished.
+pub fn keeps_active_step_open(previous: &[PlanStep], proposed: &[PlanStep]) -> bool {
+    let Some(active) = previous
+        .iter()
+        .find(|step| step.status == PlanStatus::Active)
+        .or_else(|| previous.iter().find(|step| step.status != PlanStatus::Done))
+    else {
+        return false;
+    };
+    proposed
+        .iter()
+        .any(|step| step.title == active.title && step.status != PlanStatus::Done)
 }
 
 /// Keep `update_plan` honest: each newly `done` step spends one work credit.
@@ -646,13 +925,7 @@ pub fn accept_plan(
     work_credits: &mut u32,
 ) -> Vec<PlanStep> {
     for step in &mut proposed {
-        if step.status != PlanStatus::Done {
-            continue;
-        }
-        let was_done = previous
-            .iter()
-            .any(|prior| prior.title == step.title && prior.status == PlanStatus::Done);
-        if was_done {
+        if step.status != PlanStatus::Done || was_done(previous, step) {
             continue;
         }
         if *work_credits > 0 {
@@ -667,6 +940,65 @@ pub fn accept_plan(
             .unwrap_or(PlanStatus::Pending);
     }
     proposed
+}
+
+/// Tool result for an `update_plan` that [`accept_plan`] partly refused.
+/// The tool itself echoes the proposed statuses ("Plan recorded: 1/7
+/// done."), so without this the model believes the step is closed while
+/// every later demand still asks for it.
+pub fn plan_refusal_note(
+    proposed: &[PlanStep],
+    accepted: &[PlanStep],
+    facts: &TurnFacts,
+) -> Option<String> {
+    let kept_open: Vec<String> = proposed
+        .iter()
+        .zip(accepted)
+        .filter(|(sent, kept)| sent.status == PlanStatus::Done && kept.status != PlanStatus::Done)
+        .map(|(sent, _)| format!("\"{}\"", sent.title))
+        .collect();
+    if kept_open.is_empty() {
+        return None;
+    }
+    let done = accepted
+        .iter()
+        .filter(|step| step.status == PlanStatus::Done)
+        .count();
+    let route = if facts.test_close_available() {
+        "If one of them is already implemented in the tree, run the project's \
+         tests; once they pass, call update_plan again to close that one step."
+    } else {
+        "Implement what is missing with edit/write, run the tests, then call \
+         update_plan again."
+    };
+    Some(format!(
+        "Plan recorded: {done}/{} done. Not marked done: {}. Each newly done step \
+         needs an edit applied this turn; a passing test run can close one more \
+         step per turn, unless it is the only step of a plan nothing has edited. \
+         {route} Do not add filler edits.",
+        accepted.len(),
+        kept_open.join(", ")
+    ))
+}
+
+/// `plan` with its active step (else the first unfinished one) marked done
+/// and the next unfinished step made active, plus the closed step's title.
+pub fn close_active_step(plan: &[PlanStep]) -> Option<(Vec<PlanStep>, String)> {
+    let index = plan
+        .iter()
+        .position(|step| step.status == PlanStatus::Active)
+        .or_else(|| plan.iter().position(|step| step.status != PlanStatus::Done))?;
+    let mut next = plan.to_vec();
+    next[index].status = PlanStatus::Done;
+    if !next.iter().any(|step| step.status == PlanStatus::Active)
+        && let Some(following) = (index + 1..next.len())
+            .chain(0..index)
+            .find(|&i| next[i].status != PlanStatus::Done)
+    {
+        next[following].status = PlanStatus::Active;
+    }
+    let title = next[index].title.clone();
+    Some((next, title))
 }
 
 /// Last `update_plan` tool call in the transcript, if any.
@@ -731,6 +1063,27 @@ pub fn looks_like_verify(name: &str, arguments: &str) -> bool {
     }
     let lower = bash_command(arguments).to_ascii_lowercase();
     shell_segments(&lower).any(segment_is_verify)
+}
+
+/// Failure lines that survive a pager. `cargo test 2>&1 | tail -5` exits 0
+/// whatever the tests did, so the status alone would call it green.
+const VERIFY_FAILURE_MARKERS: &[&str] = &[
+    "test result: FAILED",
+    "error: could not compile",
+    "error: test failed",
+    "Failures (read these first)",
+    "--- FAIL:",
+    "FAILED (failures=",
+    "FAILED (errors=",
+];
+
+/// A verify run passed: the command succeeded and its output shows none
+/// of the usual runner failure lines.
+pub fn verify_passed(status: hi_tools::ToolStatus, content: &str) -> bool {
+    status == hi_tools::ToolStatus::Succeeded
+        && !VERIFY_FAILURE_MARKERS
+            .iter()
+            .any(|marker| content.contains(marker))
 }
 
 fn segment_is_verify(segment: &str) -> bool {
@@ -972,6 +1325,68 @@ mod tests {
     fn round_zero_empty_completes() {
         let mut facts = facts(Intent::Review);
         assert!(is_complete(&decide(Event::ModelStop, &mut facts)));
+    }
+
+    #[test]
+    fn open_plan_text_only_recap_demands_edit() {
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.visible_answer = true;
+        let first = decide(Event::ModelStop, &mut facts);
+        assert!(
+            is_continue(&first, Demand::Edit),
+            "a text-only recap with an open plan must demand an edit, got {first:?}"
+        );
+        facts.note_continue(Demand::Edit);
+        let second = decide(Event::ModelStop, &mut facts);
+        assert!(
+            is_continue(&second, Demand::Edit),
+            "one last edit push after a text-only recap, got {second:?}"
+        );
+        facts.note_continue(Demand::Edit);
+        let third = decide(Event::ModelStop, &mut facts);
+        assert!(is_error(&third, "plan_stall"), "{third:?}");
+    }
+
+    #[test]
+    fn review_text_only_still_completes() {
+        let mut facts = facts(Intent::Review);
+        facts.visible_answer = true;
+        assert!(is_complete(&decide(Event::ModelStop, &mut facts)));
+    }
+
+    #[test]
+    fn failed_edit_hint_allows_update_plan_and_grants_a_reconcile_credit() {
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.failed_mutation = true;
+        facts.visible_answer = true;
+        let first = decide(Event::ModelStop, &mut facts);
+        match first {
+            Decision::Continue { demand, hint } => {
+                assert_eq!(demand, Demand::Edit);
+                assert!(hint.contains("update_plan"), "{hint}");
+                assert!(!hint.contains("Do not call update_plan"), "{hint}");
+            }
+            other => panic!("expected edit demand, got {other:?}"),
+        }
+        facts.grant_reconcile_credit();
+        assert_eq!(facts.work_credits, 1);
+        let previous = vec![hi_tools::PlanStep {
+            title: "Frame id numbers in frame header/decoder".into(),
+            status: PlanStatus::Active,
+        }];
+        let proposed = vec![
+            hi_tools::PlanStep {
+                title: "Frame id numbers in frame header/decoder".into(),
+                status: PlanStatus::Done,
+            },
+            hi_tools::PlanStep {
+                title: "Timing info read/write".into(),
+                status: PlanStatus::Active,
+            },
+        ];
+        let plan = accept_plan(&previous, proposed, &mut facts.work_credits);
+        assert_eq!(plan[0].status, PlanStatus::Done);
+        assert_eq!(facts.work_credits, 0);
     }
 
     #[test]
@@ -1579,6 +1994,12 @@ mod tests {
             Intent::Fix
         );
         assert_eq!(Intent::from_prompt("do all of that"), Intent::Implement);
+        // Live ~/drme: "start building all of that" with an open plan was
+        // classified as review, so inspect rounds never hit plan_stall.
+        assert_eq!(
+            Intent::from_prompt("start building all of that"),
+            Intent::Implement
+        );
         assert_eq!(
             Intent::from_prompt(
                 "How should we add GET /metrics? Post a step-by-step plan. Do not implement yet."
@@ -1592,6 +2013,37 @@ mod tests {
         assert!(!user_asked_to_fix(
             "Run cargo test to verify the review change didn't break anything."
         ));
+        // Live ~/drme prompts, typos included, ran as Review turns.
+        for prompt in [
+            "finish the av1 implimentation",
+            "build out full av1 spec implimentation",
+            "impliment the obu parser",
+            "please complete the implementation",
+            "can you finish the av1 impl",
+        ] {
+            assert_eq!(Intent::from_prompt(prompt), Intent::Implement, "{prompt}");
+        }
+        for prompt in [
+            "is the implementation complete?",
+            "review the av1 implementation",
+            "how does the build work",
+            "build the project and list the warnings",
+        ] {
+            assert_eq!(Intent::from_prompt(prompt), Intent::Review, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn start_building_an_open_plan_demands_an_edit() {
+        let mut facts = open_plan_facts(Intent::from_prompt("start building all of that"));
+        facts.used_tools = true;
+        facts.note_round(false, true, false);
+        facts.note_round(false, true, false);
+        let decision = tools_finished(&mut facts);
+        assert!(
+            is_continue(&decision, Demand::Edit),
+            "inspecting instead of editing the open plan must demand an edit, got {decision:?}"
+        );
     }
 
     #[test]
@@ -1599,6 +2051,9 @@ mod tests {
         assert!(is_continuation_prompt("continue"));
         assert!(is_continuation_prompt("Continue."));
         assert!(is_continuation_prompt(crate::CONTINUE_PLAN_PROMPT));
+        assert!(is_continuation_prompt(
+            "Continue the open plan. Implement this step now with edit or write: Encoder-side superres."
+        ));
         assert!(is_continuation_prompt("keep going"));
         assert!(!is_continuation_prompt("how can we improve this"));
         assert!(!is_continuation_prompt("continue using solana-sdk"));
@@ -1609,6 +2064,29 @@ mod tests {
             intent_for_turn(&older, crate::CONTINUE_PLAN_PROMPT, true),
             Intent::Implement
         );
+        let active = [hi_tools::PlanStep {
+            title: "Encoder-side superres downscale + signaling".into(),
+            status: hi_tools::PlanStatus::Active,
+        }];
+        for (stall, step_edited) in [(0, false), (0, true), (1, false), (1, true)] {
+            let driven = crate::drive_continue_prompt(&active, stall, step_edited);
+            assert_eq!(
+                intent_for_turn(&older, &driven, true),
+                Intent::Implement,
+                "{driven}"
+            );
+            assert_eq!(driven.contains("update_plan"), step_edited, "{driven}");
+            assert!(driven.contains("filler edits"), "{driven}");
+        }
+        let two_steps = [
+            active[0].clone(),
+            hi_tools::PlanStep {
+                title: "Update README support matrix".into(),
+                status: hi_tools::PlanStatus::Pending,
+            },
+        ];
+        let driven = crate::drive_continue_prompt(&two_steps, 0, false);
+        assert!(driven.contains("update_plan"), "{driven}");
         assert_eq!(
             intent_for_turn(&older, "how can we improve this", true),
             Intent::Review
@@ -1724,5 +2202,458 @@ mod tests {
         let first = decide(Event::ModelStop, &mut facts);
         assert!(is_continue(&first, Demand::Edit), "{first:?}");
         assert!(!is_complete(&first));
+    }
+
+    /// The active step, edited and tested green this turn.
+    fn finished_step_facts() -> TurnFacts {
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.used_tools = true;
+        facts.visible_answer = true;
+        facts.mutated = true;
+        facts.step_work = true;
+        facts.grant_mutation_credit();
+        facts.ran_verify = true;
+        facts.grant_verify_credit();
+        facts
+    }
+
+    /// Live ~/drme: edit + passing `cargo test` + "the step is complete"
+    /// got "Your next action MUST be `edit`… Do not call update_plan" until
+    /// plan_stall, and the model padded the file with comment lines.
+    #[test]
+    fn finished_step_asks_for_update_plan_then_closes_itself() {
+        let mut facts = finished_step_facts();
+        assert!(facts.ready_to_close_step());
+        match decide(Event::ModelStop, &mut facts) {
+            Decision::Continue { demand, hint } => {
+                assert_eq!(demand, Demand::ClosePlanStep);
+                assert!(hint.contains("call update_plan now"), "{hint}");
+                assert!(hint.contains("filler"), "{hint}");
+            }
+            other => panic!("a finished step must ask for update_plan, got {other:?}"),
+        }
+        facts.note_continue(Demand::ClosePlanStep);
+        assert_eq!(
+            decide(Event::ModelStop, &mut facts),
+            Decision::ClosePlanStep,
+            "an ignored close hint closes the step instead of plan_stall"
+        );
+        let mut empty = finished_step_facts();
+        empty.visible_answer = false;
+        assert!(is_continue(
+            &decide(Event::ModelStop, &mut empty),
+            Demand::ClosePlanStep
+        ));
+    }
+
+    #[test]
+    fn finished_step_closes_at_the_stall_cap_instead_of_plan_stall() {
+        let mut facts = finished_step_facts();
+        facts.consecutive_stall = STALL_ROUNDS_BEFORE_DEMAND;
+        assert!(is_continue(
+            &tools_finished(&mut facts),
+            Demand::ClosePlanStep
+        ));
+        facts.consecutive_stall = STALL_ROUNDS_BEFORE_ERROR;
+        let last = tools_finished(&mut facts);
+        assert!(is_continue(&last, Demand::ClosePlanStep), "{last:?}");
+        assert_eq!(tools_finished(&mut facts), Decision::ClosePlanStep);
+
+        let mut capped = finished_step_facts();
+        let capped_decide = |facts: &mut TurnFacts| {
+            decide(
+                Event::ToolsFinished {
+                    inspect_repeat_capped: true,
+                },
+                facts,
+            )
+        };
+        assert!(is_continue(
+            &capped_decide(&mut capped),
+            Demand::ClosePlanStep
+        ));
+        capped.note_continue(Demand::ClosePlanStep);
+        assert!(is_continue(
+            &capped_decide(&mut capped),
+            Demand::ClosePlanStep
+        ));
+        assert_eq!(capped_decide(&mut capped), Decision::ClosePlanStep);
+    }
+
+    /// Live ~/drme turn 53: after green tests the model answered the close
+    /// demand with `update_plan` keeping "Verify dav1d + ffmpeg + tests"
+    /// active because dav1d still rejected the stream. The harness closed
+    /// it anyway, the plan read 4/4, and nothing resumed the work.
+    #[test]
+    fn a_step_the_model_keeps_open_is_not_closed_for_it() {
+        let previous = vec![
+            step("Parse sequence header", PlanStatus::Done),
+            step("Write frame OBUs", PlanStatus::Done),
+            step("Encode tiles", PlanStatus::Done),
+            step("Verify dav1d + ffmpeg + tests", PlanStatus::Active),
+        ];
+        let plan_stall = Decision::Error {
+            kind: "plan_stall",
+            message: PLAN_KEPT_OPEN_MSG,
+        };
+        let mut facts = finished_step_facts();
+        facts.note_plan_update(&previous, &previous);
+        assert!(!facts.ready_to_close_step());
+        let first = decide(Event::ModelStop, &mut facts);
+        assert!(is_continue(&first, Demand::Edit), "{first:?}");
+        facts.note_continue(Demand::Edit);
+        let last = decide(Event::ModelStop, &mut facts);
+        assert!(is_continue(&last, Demand::Edit), "{last:?}");
+        facts.note_continue(Demand::Edit);
+        assert_eq!(decide(Event::ModelStop, &mut facts), plan_stall);
+
+        let mut stalled = finished_step_facts();
+        stalled.note_plan_update(&previous, &previous);
+        stalled.consecutive_stall = STALL_ROUNDS_BEFORE_ERROR;
+        stalled.last_chance = true;
+        assert_eq!(tools_finished(&mut stalled), plan_stall);
+
+        let mut done = previous.clone();
+        done[3].status = PlanStatus::Done;
+        facts.note_plan_update(&previous, &done);
+        assert!(
+            !facts.step_kept_open,
+            "marking it done is not keeping it open"
+        );
+
+        // Posted before the tests ran, the plan says nothing about them.
+        let mut early = finished_step_facts();
+        early.ran_verify = false;
+        early.note_plan_update(&previous, &previous);
+        early.ran_verify = true;
+        assert!(early.ready_to_close_step());
+    }
+
+    #[test]
+    fn failing_tests_keep_the_step_open_and_plan_stall_says_why() {
+        let mut facts = finished_step_facts();
+        facts.verify_failed = true;
+        assert!(!facts.ready_to_close_step());
+        let first = decide(Event::ModelStop, &mut facts);
+        assert_eq!(
+            first,
+            Decision::Continue {
+                demand: Demand::Edit,
+                hint: FAILING_TESTS_HINT
+            }
+        );
+        facts.note_continue(Demand::Edit);
+        let second = decide(Event::ModelStop, &mut facts);
+        assert!(is_continue(&second, Demand::Edit), "{second:?}");
+        facts.note_continue(Demand::Edit);
+        match decide(Event::ModelStop, &mut facts) {
+            Decision::Error { kind, message } => {
+                assert_eq!(kind, "plan_stall");
+                assert!(message.contains("tests failed"), "{message}");
+            }
+            other => panic!("expected plan_stall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_without_an_edit_is_never_closed_by_the_harness() {
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.used_tools = true;
+        facts.visible_answer = true;
+        facts.plan_steps = 2;
+        facts.ran_verify = true;
+        facts.grant_verify_credit();
+        assert_eq!(facts.work_credits, 1, "a test run may close one step");
+        assert!(
+            !facts.ready_to_close_step(),
+            "but only the model may say so"
+        );
+        let first = decide(Event::ModelStop, &mut facts);
+        match first {
+            Decision::Continue { demand, hint } => {
+                assert_eq!(demand, Demand::Edit);
+                assert_eq!(hint, PLAN_EXECUTE_HINT);
+            }
+            other => panic!("expected an edit demand, got {other:?}"),
+        }
+        let mut review = finished_step_facts();
+        review.intent = Intent::Review;
+        assert!(!review.ready_to_close_step());
+    }
+
+    #[test]
+    fn passing_tests_close_one_step_per_turn_but_never_a_lone_untouched_step() {
+        let mut lone = open_plan_facts(Intent::Implement);
+        lone.plan_steps = 1;
+        lone.grant_verify_credit();
+        assert_eq!(lone.work_credits, 0, "a one-step plan needs an edit");
+
+        let mut baseline = open_plan_facts(Intent::Implement);
+        baseline.plan_steps = 3;
+        baseline.grant_verify_credit();
+        assert_eq!(
+            baseline.work_credits, 1,
+            "\"Baseline: run cargo test\" closes on the run"
+        );
+
+        let mut carried = open_plan_facts(Intent::Implement);
+        carried.plan_steps = 1;
+        carried.step_work = true;
+        carried.grant_verify_credit();
+        assert_eq!(carried.work_credits, 1);
+        carried.grant_verify_credit();
+        assert_eq!(carried.work_credits, 1, "one test-run credit per turn");
+
+        let mut red = open_plan_facts(Intent::Implement);
+        red.step_work = true;
+        red.verify_failed = true;
+        red.grant_verify_credit();
+        assert_eq!(red.work_credits, 0, "a failing run proves nothing");
+
+        let mut edited_red = open_plan_facts(Intent::Implement);
+        edited_red.mutated = true;
+        edited_red.verify_failed = true;
+        edited_red.grant_verify_credit();
+        assert_eq!(
+            edited_red.work_credits, 1,
+            "tests after an edit still count"
+        );
+    }
+
+    #[test]
+    fn plan_hints_offer_update_plan_only_when_it_can_succeed() {
+        for hint in [
+            PLAN_EXECUTE_HINT,
+            EDIT_NOW_HINT,
+            NEXT_STEP_HINT,
+            PLAN_CLOSE_HINT,
+            FAILING_TESTS_HINT,
+        ] {
+            assert!(!hint.contains("Do not call update_plan"), "{hint}");
+            assert!(hint.contains("filler"), "{hint}");
+        }
+        let mut lone = open_plan_facts(Intent::Implement);
+        lone.plan_steps = 1;
+        assert_eq!(hint_for_facts(&lone, Demand::Edit), EDIT_NOW_HINT);
+        assert!(!EDIT_NOW_HINT.contains("update_plan"));
+        let mut multi = open_plan_facts(Intent::Implement);
+        multi.plan_steps = 2;
+        assert_eq!(hint_for_facts(&multi, Demand::Edit), PLAN_EXECUTE_HINT);
+        assert!(PLAN_EXECUTE_HINT.contains("call update_plan"));
+        multi.verify_credit_granted = true;
+        assert_eq!(
+            hint_for_facts(&multi, Demand::Edit),
+            EDIT_NOW_HINT,
+            "this turn's test-run close is spent"
+        );
+        multi.closed_step = true;
+        assert_eq!(hint_for_facts(&multi, Demand::Edit), NEXT_STEP_HINT);
+        multi.work_credits = 1;
+        assert_eq!(hint_for_facts(&multi, Demand::Edit), PLAN_EXECUTE_HINT);
+    }
+
+    /// Tests that passed before the model posted its plan still close a
+    /// "Baseline: run cargo test" step, but not a one-step plan.
+    #[test]
+    fn tests_before_the_plan_count_for_it() {
+        let baseline = vec![
+            step("Baseline: run cargo test", PlanStatus::Done),
+            step(
+                "Frame id numbers in frame header/decoder",
+                PlanStatus::Active,
+            ),
+        ];
+        let mut facts = TurnFacts::new(Intent::Implement, false);
+        facts.ran_verify = true;
+        facts.preview_plan(&[], &baseline);
+        let accepted = accept_plan(&[], baseline.clone(), &mut facts.work_credits);
+        assert_eq!(accepted, baseline);
+        assert_eq!(plan_refusal_note(&baseline, &accepted, &facts), None);
+
+        let lone = vec![step("Frame id numbers", PlanStatus::Done)];
+        let mut facts = TurnFacts::new(Intent::Implement, false);
+        facts.ran_verify = true;
+        facts.preview_plan(&[], &lone);
+        let accepted = accept_plan(&[], lone.clone(), &mut facts.work_credits);
+        assert_eq!(accepted[0].status, PlanStatus::Pending);
+
+        let mut red = TurnFacts::new(Intent::Implement, false);
+        red.ran_verify = true;
+        red.verify_failed = true;
+        red.preview_plan(&[], &baseline);
+        assert_eq!(red.work_credits, 0);
+    }
+
+    /// After a step closed this turn on tests alone, stopping short of the
+    /// next one ends the turn; plan drive picks that step up in a fresh turn.
+    /// With edits this turn the rest is still demanded.
+    #[test]
+    fn a_step_closed_on_tests_alone_ends_the_turn_instead_of_plan_stall() {
+        let closed = || {
+            let mut facts = open_plan_facts(Intent::Implement);
+            facts.plan_steps = 3;
+            facts.used_tools = true;
+            facts.visible_answer = true;
+            facts.closed_step = true;
+            facts.verify_credit_granted = true;
+            facts
+        };
+        let mut stopped = closed();
+        assert!(is_complete(&decide(Event::ModelStop, &mut stopped)));
+        stopped.visible_answer = false;
+        assert!(is_complete(&decide(Event::ModelStop, &mut stopped)));
+
+        let mut inspecting = closed();
+        let mut decision = Decision::Proceed;
+        for _ in 0..20 {
+            inspecting.note_round(false, true, false);
+            decision = tools_finished(&mut inspecting);
+            match decision {
+                Decision::Continue { demand, hint } => {
+                    assert_eq!(demand, Demand::Edit);
+                    assert_eq!(hint, NEXT_STEP_HINT);
+                    inspecting.note_continue(demand);
+                }
+                Decision::Proceed => {}
+                _ => break,
+            }
+        }
+        assert!(is_complete(&decision), "{decision:?}");
+
+        let mut unverified = closed();
+        unverified.mutated = true;
+        unverified.step_work = true;
+        let decision = decide(Event::ModelStop, &mut unverified);
+        assert!(is_continue(&decision, Demand::Verify), "{decision:?}");
+
+        let mut edited = closed();
+        edited.mutated = true;
+        edited.ran_verify = true;
+        let decision = decide(Event::ModelStop, &mut edited);
+        assert!(is_continue(&decision, Demand::Edit), "{decision:?}");
+
+        let mut red = closed();
+        red.mutated = true;
+        red.step_work = true;
+        red.ran_verify = true;
+        red.verify_failed = true;
+        let mut decision = decide(Event::ModelStop, &mut red);
+        while let Decision::Continue { demand, .. } = decision {
+            red.note_continue(demand);
+            decision = decide(Event::ModelStop, &mut red);
+        }
+        assert!(is_error(&decision, "plan_stall"), "{decision:?}");
+    }
+
+    #[test]
+    fn closes_a_step_sees_a_swapped_done_step() {
+        let previous = vec![
+            step("Baseline: run cargo test", PlanStatus::Done),
+            step("Frame id numbers", PlanStatus::Active),
+            step("Timing info", PlanStatus::Pending),
+        ];
+        let replanned = vec![
+            step("Frame id numbers", PlanStatus::Done),
+            step("Encoder superres", PlanStatus::Active),
+        ];
+        assert!(closes_a_step(&previous, &replanned));
+        assert!(!closes_a_step(&previous, &previous));
+        assert!(!closes_a_step(&replanned, &replanned[..1]));
+    }
+
+    #[test]
+    fn refused_update_plan_names_the_steps_left_open() {
+        let previous = vec![
+            step("Sequence header", PlanStatus::Done),
+            step(
+                "Frame id numbers in frame header/decoder",
+                PlanStatus::Active,
+            ),
+            step("Timing info read/write", PlanStatus::Pending),
+        ];
+        let proposed = vec![
+            step("Sequence header", PlanStatus::Done),
+            step("Frame id numbers in frame header/decoder", PlanStatus::Done),
+            step("Timing info read/write", PlanStatus::Active),
+        ];
+        let mut credits = 0;
+        let accepted = accept_plan(&previous, proposed.clone(), &mut credits);
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.plan_steps = previous.len();
+        let note = plan_refusal_note(&proposed, &accepted, &facts).expect("refused");
+        assert!(note.starts_with("Plan recorded: 1/3 done."), "{note}");
+        assert!(
+            note.contains("\"Frame id numbers in frame header/decoder\""),
+            "{note}"
+        );
+        assert!(note.contains("run the project's tests"), "{note}");
+        facts.verify_credit_granted = true;
+        let spent = plan_refusal_note(&proposed, &accepted, &facts).unwrap();
+        assert!(!spent.contains("run the project's tests;"), "{spent}");
+
+        let mut credits = 1;
+        let funded = accept_plan(&previous, proposed.clone(), &mut credits);
+        assert_eq!(plan_refusal_note(&proposed, &funded, &facts), None);
+    }
+
+    #[test]
+    fn close_active_step_marks_it_done_and_starts_the_next() {
+        let plan = vec![
+            step("a", PlanStatus::Done),
+            step("b", PlanStatus::Active),
+            step("c", PlanStatus::Pending),
+        ];
+        let (next, title) = close_active_step(&plan).unwrap();
+        assert_eq!(title, "b");
+        let statuses: Vec<_> = next.iter().map(|step| step.status).collect();
+        assert_eq!(
+            statuses,
+            [PlanStatus::Done, PlanStatus::Done, PlanStatus::Active]
+        );
+
+        let no_active = vec![
+            step("a", PlanStatus::Pending),
+            step("b", PlanStatus::Pending),
+        ];
+        let (next, title) = close_active_step(&no_active).unwrap();
+        assert_eq!(title, "a");
+        assert_eq!(next[1].status, PlanStatus::Active);
+
+        let last = vec![step("a", PlanStatus::Done), step("b", PlanStatus::Active)];
+        let (next, _) = close_active_step(&last).unwrap();
+        assert!(!plan_is_open(&next));
+        assert_eq!(close_active_step(&next), None);
+    }
+
+    #[test]
+    fn verify_passed_sees_failures_through_a_pager() {
+        use hi_tools::ToolStatus::{Failed, Succeeded};
+        assert!(verify_passed(
+            Succeeded,
+            "test result: ok. 567 passed; 0 failed; 0 ignored"
+        ));
+        assert!(!verify_passed(
+            Succeeded,
+            "test result: FAILED. 566 passed; 1 failed; 0 ignored"
+        ));
+        assert!(!verify_passed(
+            Succeeded,
+            "error: could not compile `drme` (lib test) due to 2 previous errors"
+        ));
+        assert!(!verify_passed(Succeeded, "--- FAIL: TestFrameId (0.00s)"));
+        assert!(!verify_passed(Failed, "exit status 101"));
+    }
+
+    #[test]
+    fn closing_the_last_step_satisfies_an_implement_turn_without_an_edit() {
+        let mut facts = open_plan_facts(Intent::Implement);
+        facts.used_tools = true;
+        facts.visible_answer = true;
+        facts.ran_verify = true;
+        facts.plan_open = false;
+        assert!(facts.wants_edit(), "no edit and nothing closed");
+        facts.closed_step = true;
+        assert!(!facts.wants_edit());
+        assert!(is_complete(&decide(Event::ModelStop, &mut facts)));
     }
 }

@@ -47,6 +47,12 @@ pub struct Config {
     /// Optional TypeSafe (Jev) next-action gate. Machine-scoped; env key is enough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typesafe: Option<TypesafeSection>,
+    /// `/review` knobs (`[review]`).
+    #[serde(default)]
+    pub review: ReviewSection,
+    /// `/ladder` rungs and check (`[ladder]`).
+    #[serde(default)]
+    pub ladder: LadderSection,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -687,6 +693,8 @@ pub(crate) fn merge_config_with_project_trust(
     merge_project_rsi(&mut base.rsi, overlay.rsi);
     merge_project_outcome(&mut base.outcome, overlay.outcome, trusted);
     merge_project_x402(&mut base.x402, overlay.x402);
+    super::merge_project_review(&mut base.review, overlay.review, trusted);
+    super::merge_project_ladder(&mut base.ladder, overlay.ladder, trusted);
     merge_mcp_import_source(&mut base.mcp_import.claude, overlay.mcp_import.claude);
     merge_mcp_import_source(&mut base.mcp_import.codex, overlay.mcp_import.codex);
     merge_mcp_import_source(&mut base.mcp_import.hi, overlay.mcp_import.hi);

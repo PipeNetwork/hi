@@ -59,6 +59,9 @@ pub enum UiEvent {
     ToolResult {
         name: String,
         result: String,
+        /// The tool did not succeed. A failed edit must not render as a
+        /// change to the file.
+        failed: bool,
     },
     ToolStream {
         name: String,
@@ -344,6 +347,7 @@ impl Ui for ChannelUi {
         self.send(UiEvent::ToolResult {
             name: name.to_string(),
             result: result.to_string(),
+            failed: false,
         });
     }
     fn tool_result_id(&mut self, id: &str, name: &str, result: &str, status: hi_tools::ToolStatus) {
@@ -351,6 +355,7 @@ impl Ui for ChannelUi {
         self.send(UiEvent::ToolResult {
             name: name.to_string(),
             result: result.to_string(),
+            failed: status != hi_tools::ToolStatus::Succeeded,
         });
     }
     fn plan(&mut self, steps: &[PlanStep]) {

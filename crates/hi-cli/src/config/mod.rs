@@ -22,9 +22,11 @@ mod cli;
 mod credential_refs;
 mod file;
 mod harness;
+mod ladder;
 mod mask;
 mod profile_edit;
 mod quality;
+mod review;
 mod sentinel_flags;
 mod session;
 mod settings;
@@ -39,12 +41,17 @@ mod tests;
 
 pub use autoharnessfix::*;
 pub use cli::*;
-pub(crate) use credential_refs::{migrate_api_key_env_to_literal, resolve_credential_reference};
+pub(crate) use credential_refs::{
+    MissingStoredCredential, migrate_api_key_env_to_literal, repoint_profile_credential,
+    reseal_profile_api_key, resolve_credential_reference,
+};
 pub use file::*;
 pub use harness::*;
+pub use ladder::*;
 pub use mask::*;
 pub use profile_edit::*;
 pub use quality::*;
+pub use review::*;
 pub use sentinel_flags::*;
 pub use session::*;
 pub use settings::*;

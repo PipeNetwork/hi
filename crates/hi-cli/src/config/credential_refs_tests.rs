@@ -55,6 +55,68 @@ api_key_env = "HI_TEST_OUTCOME_KEY"
 }
 
 #[test]
+fn a_missing_store_entry_is_a_typed_error_naming_the_reference() {
+    let reference = "auth-store://profile-api-key/openai/never-stored-by-anyone";
+    let err = resolve_credential_reference(reference, false, true).unwrap_err();
+    let missing = err
+        .downcast_ref::<MissingStoredCredential>()
+        .expect("startup recovery matches on the type");
+    assert_eq!(missing.reference, reference);
+    assert!(err.to_string().contains("was not found"), "{err}");
+
+    let err = resolve_credential_reference("env://HI_NEVER_SET_KEY_998", false, true).unwrap_err();
+    assert!(
+        err.downcast_ref::<MissingStoredCredential>().is_none(),
+        "an unset environment variable is not a lost store entry: {err}"
+    );
+}
+
+#[test]
+fn repointing_a_profile_replaces_only_its_credential() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        profiles: std::collections::HashMap::from([(
+            "default".into(),
+            Profile {
+                provider: Some(ProviderName::Pipenetwork),
+                model: Some("ipop/coder-balanced".into()),
+                max_tokens: Some(4096),
+                api_key_ref: Some("auth-store://profile-api-key/pipenetwork/gone".into()),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    save_config_to(&config, &path).unwrap();
+
+    repoint_profile_credential(
+        &mut config,
+        "default",
+        "auth-store://pipenetwork",
+        Some(&path),
+    )
+    .unwrap();
+
+    let profile = &config.profiles["default"];
+    assert_eq!(
+        profile.api_key_ref.as_deref(),
+        Some("auth-store://pipenetwork")
+    );
+    assert_eq!(profile.model.as_deref(), Some("ipop/coder-balanced"));
+    assert_eq!(profile.max_tokens, Some(4096));
+    let persisted = read_config_file(&path).unwrap();
+    assert_eq!(
+        persisted.profiles["default"].api_key_ref.as_deref(),
+        Some("auth-store://pipenetwork")
+    );
+    assert_eq!(persisted.profiles["default"].max_tokens, Some(4096));
+    assert_eq!(persisted.default_profile.as_deref(), Some("default"));
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("gone"));
+}
+
+#[test]
 fn set_profile_model_updates_model_and_migrates_legacy_credential() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");

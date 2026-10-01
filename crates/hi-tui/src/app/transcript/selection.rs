@@ -7,11 +7,13 @@ use ratatui::text::Line;
 
 use crate::TranscriptEntry;
 use crate::theme::theme;
+use crate::wrap::RowJoin;
 
 /// Trackpad / window-focus jitter still counts as a click so `›` rows expand
 /// instead of becoming a one-character "drag copy". A real drag must change
-/// line or move more than this many columns.
-const CLICK_SLOP_COLS: usize = 2;
+/// line or move more than this many columns. Two columns is a short word;
+/// one column is the jitter a click produces.
+const CLICK_SLOP_COLS: usize = 1;
 
 /// Drop the decorative left gutter baked into painted transcript lines so
 /// whole-line selection copies content, not chrome. Matches the prefixes used
@@ -22,6 +24,14 @@ fn strip_display_gutter(line: &str) -> &str {
         .or_else(|| line.strip_prefix("• "))
         .or_else(|| line.strip_prefix("◆ "))
         .unwrap_or(line)
+}
+
+/// A wrapped line's continuation row without what the wrap repeated at its
+/// start: the hanging indent or the `▏ ` gutter. The wrap drops whitespace
+/// at a break, so the row's own text never starts with a blank.
+fn continuation(row: &str) -> &str {
+    let row = row.trim_start();
+    row.strip_prefix("▏ ").unwrap_or(row).trim_start()
 }
 
 impl crate::App {
@@ -305,9 +315,11 @@ impl crate::App {
     /// clipboard side effect.
     ///
     /// Whole-line copy strips decorative display gutters (`┃ ` tool/status,
-    /// `▏ ` fenced code) so the clipboard matches the underlying content.
-    /// Character spans keep the raw slice — columns already index into the
-    /// painted line, including any gutter the user dragged across.
+    /// `▏ ` fenced code) so the clipboard matches the underlying content, and
+    /// rejoins the rows a long line was wrapped into, so a copied paragraph
+    /// or command comes back as the line it was. Character spans keep the
+    /// raw slice — columns already index into the painted line, including
+    /// any gutter the user dragged across.
     pub(crate) fn selected_text(&self) -> Option<String> {
         if let Some((line, lo, hi)) = self.char_span() {
             let chars: Vec<char> = self.view_line_texts.get(line)?.chars().collect();
@@ -323,13 +335,35 @@ impl crate::App {
         }
         let hi = hi.min(self.view_line_texts.len() - 1);
         let lo = lo.min(hi);
-        let text = self.view_line_texts[lo..=hi]
-            .iter()
-            .map(|line| strip_display_gutter(line))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut text = String::new();
+        for index in lo..=hi {
+            let row = self.view_line_texts[index].as_str();
+            let join = self.view_line_joins.get(index).copied().unwrap_or_default();
+            if index > lo {
+                match join {
+                    RowJoin::NewLine => text.push('\n'),
+                    RowJoin::Space => text.push(' '),
+                    RowJoin::Glued => {}
+                }
+            }
+            text.push_str(if join == RowJoin::NewLine {
+                strip_display_gutter(row)
+            } else {
+                continuation(row)
+            });
+        }
         let text = text.trim_end();
         (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// Ctrl-Shift-C. A drag selection wins; otherwise the last assistant reply,
+    /// same as `/copy`.
+    pub(crate) fn copy_shortcut(&mut self) {
+        if self.selected_text().is_some() {
+            self.copy_selection();
+        } else {
+            self.copy("");
+        }
     }
 
     /// Copy the selected line range to the clipboard. Success shows a brief toast;
@@ -461,6 +495,22 @@ mod tests {
     }
 
     #[test]
+    fn a_two_column_drag_counts_as_text_selection() {
+        let mut app = primed_click_app();
+        app.select_anchor = Some((0, 4));
+        app.select_cursor = Some((0, 6));
+        assert!(
+            app.is_drag_selection(),
+            "two columns is a word, not trackpad jitter"
+        );
+        app.select_cursor = Some((0, 5));
+        assert!(
+            !app.is_drag_selection(),
+            "a 1-column jitter must not become a drag-copy"
+        );
+    }
+
+    #[test]
     fn click_with_trackpad_jitter_still_toggles_fold() {
         let mut app = primed_click_app();
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 0));
@@ -472,11 +522,39 @@ mod tests {
     }
 
     #[test]
-    fn mouse_capture_defaults_on_like_grok() {
-        let app = test_app("openai", "gpt-4o");
+    fn copying_wrapped_rows_gives_back_the_lines_they_were_wrapped_from() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let bullet =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron";
+        let command = "cargo test -p hi-harness --lib review_scope -- --nocapture --test-threads=1";
+        let mut app = test_app("openai", "gpt-4o");
+        app.transcript
+            .push(crate::TranscriptEntry::AssistantMessage {
+                text: format!("- {bullet}\n\n```sh\n{command}\n```"),
+            });
+        let mut term = Terminal::new(TestBackend::new(48, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
         assert!(
+            (20..60).contains(&app.view_inner.width),
+            "both lines wrap: {:?}",
+            app.view_inner
+        );
+        assert_eq!(app.view_line_joins.len(), app.view_line_texts.len());
+        app.select_anchor = Some((0, 0));
+        app.select_cursor = Some((app.view_line_texts.len() - 1, 0));
+        let copied = app.selected_text().expect("a selection");
+        assert!(copied.lines().any(|line| line == bullet), "{copied}");
+        assert!(copied.lines().any(|line| line == command), "{copied}");
+    }
+
+    #[test]
+    fn mouse_capture_follows_whether_the_host_has_a_clipboard() {
+        let app = test_app("openai", "gpt-4o");
+        assert_eq!(
             app.mouse_capture,
-            "click-to-expand needs mouse reporting, as in grok"
+            crate::util::host_clipboard_available(),
+            "without a display, highlight must stay with the local terminal"
         );
     }
 }

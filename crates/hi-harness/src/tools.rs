@@ -8,9 +8,10 @@ use hi_ai::ToolSpec;
 use hi_lsp::LspManager;
 use hi_tools::shell_policy::classify_shell_tool_arguments;
 use hi_tools::{
-    BackgroundRegistry, InspectRepeatLedger, PlanStep, ProcessRunner, ReadCache, RepoMapCache,
-    TOOL_SPECS, ToolEffects, ToolOutcome, ToolStatus, TruncationState, execute_prepared_in_runtime,
-    execute_streaming_in_runtime_with_runner, is_filesystem_mutating,
+    BackgroundRegistry, FailedMutationLedger, InspectRepeatLedger, PlanStep, ProcessRunner,
+    ReadCache, RepoMapCache, RerunLedger, TOOL_SPECS, ToolEffects, ToolOutcome, ToolStatus,
+    TruncationState, VerifyRepeatLedger, execute_prepared_in_runtime,
+    execute_streaming_in_runtime_with_runner, is_filesystem_mutating, is_probe_refusal,
     prepare_mutation_in_with_state,
 };
 
@@ -70,7 +71,27 @@ pub struct ToolHost {
     read_cache: Mutex<ReadCache>,
     repo_map: Mutex<RepoMapCache>,
     inspect_repeats: Mutex<InspectRepeatLedger>,
+    verify_repeats: Mutex<VerifyRepeatLedger>,
+    /// Foreground `bash` commands that are neither probes nor verify runs.
+    reruns: Mutex<RerunLedger>,
+    failed_mutations: Mutex<FailedMutationLedger>,
+    /// Bumped on every applied file change; part of a verify run's storm key.
+    mutation_epoch: std::sync::atomic::AtomicU64,
     liveness: hi_liveness::Publisher,
+}
+
+/// The ledger key for a verify command (`cargo test`, `pytest`, …), or `None`
+/// for anything else.
+fn verify_command_key(name: &str, arguments: &str) -> Option<String> {
+    if !crate::completion::looks_like_verify(name, arguments) {
+        return None;
+    }
+    let command = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()?
+        .get("command")?
+        .as_str()?
+        .to_string();
+    Some(hi_tools::verify_key(&command))
 }
 
 impl ToolHost {
@@ -94,6 +115,10 @@ impl ToolHost {
             read_cache: Mutex::new(ReadCache::new()),
             repo_map: Mutex::new(RepoMapCache::new()),
             inspect_repeats: Mutex::new(InspectRepeatLedger::new()),
+            verify_repeats: Mutex::new(VerifyRepeatLedger::new()),
+            reruns: Mutex::new(RerunLedger::new()),
+            failed_mutations: Mutex::new(FailedMutationLedger::new()),
+            mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             liveness: hi_liveness::Publisher::new(),
         };
         host.bind_pgid_source();
@@ -145,6 +170,12 @@ impl ToolHost {
         if let Ok(mut ledger) = self.inspect_repeats.lock() {
             ledger.reset();
         }
+        if let Ok(mut ledger) = self.verify_repeats.lock() {
+            ledger.reset();
+        }
+        if let Ok(mut ledger) = self.reruns.lock() {
+            ledger.reset();
+        }
     }
 
     pub(crate) fn forget_inspect_keys(&self, keys: &[String]) {
@@ -165,6 +196,53 @@ impl ToolHost {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .admit(name, fingerprint)
+    }
+
+    fn admit_verify_repeat(&self, key: Option<&str>) -> Option<String> {
+        self.verify_repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(key?)
+    }
+
+    fn admit_rerun(&self, fingerprint: &str, command: Option<&str>) -> Option<String> {
+        self.reruns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(fingerprint, command?)
+    }
+
+    fn record_rerun_output(&self, fingerprint: &str, command: Option<&str>, outcome: &ToolOutcome) {
+        if command.is_none() || outcome.status == ToolStatus::Denied {
+            return;
+        }
+        self.reruns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_output(fingerprint, &outcome.content);
+    }
+
+    fn admit_failed_mutation(&self, name: &str, fingerprint: &str) -> Option<String> {
+        if !matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
+            return None;
+        }
+        self.failed_mutations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .admit(fingerprint)
+    }
+
+    fn record_verify_output(&self, key: Option<&str>, output: &str) {
+        let Some(key) = key else {
+            return;
+        };
+        if is_probe_refusal(output) {
+            return;
+        }
+        self.verify_repeats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_output(key, output);
     }
 
     fn record_inspect_output(&self, name: &str, fingerprint: &str, output: &str) {
@@ -251,7 +329,48 @@ impl ToolHost {
             self.liveness.note_tool_end(false);
             return failed_outcome(message);
         }
-        self.liveness.note_tool_fingerprint(&fingerprint);
+        let verify = verify_command_key(name, arguments);
+        if let Some(message) = self.admit_verify_repeat(verify.as_deref()) {
+            self.liveness.note_tool_end(false);
+            return failed_outcome(message);
+        }
+        if let Some(message) = self.admit_failed_mutation(name, &fingerprint) {
+            self.liveness.note_tool_end(false);
+            return failed_outcome(message);
+        }
+        // Refused before the storm count, like the ledgers above: the third
+        // identical output gets a replay instead of ending the turn.
+        let rerun = rerun_command(name, arguments, verify.is_some());
+        if let Some(message) = self.admit_rerun(&fingerprint, rerun.as_deref()) {
+            self.liveness.note_tool_end(false);
+            return failed_outcome(message);
+        }
+        // Edit, test, edit, test is progress, not a storm: a verify run after a
+        // file change counts as a new call. The verify ledger above still
+        // refuses a rerun when nothing changed.
+        let storm_key = if verify.is_some() {
+            format!(
+                "{fingerprint}@{}",
+                self.mutation_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            )
+        } else {
+            fingerprint.clone()
+        };
+        self.liveness.note_tool_fingerprint(&storm_key);
+        if self
+            .liveness
+            .snapshot()
+            .invariant
+            .is_some_and(|inv| inv.code == hi_liveness::InvariantCode::IdenticalToolStorm)
+        {
+            // The call that crosses the cap must not start. A full `cargo test`
+            // here is what made the storm look like a stall.
+            self.liveness.note_tool_end(false);
+            return failed_outcome(
+                "identical tool storm; this call was not started. Stop repeating it.",
+            );
+        }
         let run = async {
             if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
                 match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
@@ -292,10 +411,35 @@ impl ToolHost {
             if let Ok(mut ledger) = self.inspect_repeats.lock() {
                 ledger.reset();
             }
+            if let Ok(mut ledger) = self.verify_repeats.lock() {
+                ledger.note_mutation();
+            }
+            if let Ok(mut ledger) = self.reruns.lock() {
+                ledger.note_mutation();
+            }
+            if let Ok(mut ledger) = self.failed_mutations.lock() {
+                ledger.note_mutation();
+            }
+            self.mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else if outcome.status == ToolStatus::Failed
+            && matches!(name, "write" | "edit" | "multi_edit" | "apply_patch")
+            && let Ok(mut ledger) = self.failed_mutations.lock()
+        {
+            ledger.note_failure(&fingerprint, &outcome.content);
         }
         self.record_inspect_output(name, &fingerprint, &outcome.content);
+        self.record_verify_output(verify.as_deref(), &outcome.content);
+        self.record_rerun_output(&fingerprint, rerun.as_deref(), &outcome);
         if outcome.status == ToolStatus::Failed {
-            self.liveness.note_tool_error(&outcome.content);
+            // A suite that keeps failing the same way across edits (drme's
+            // pre-existing CABAC test) must not read as nine identical errors.
+            if verify.is_some() {
+                self.liveness
+                    .note_tool_error(&format!("{storm_key} {}", outcome.content));
+            } else {
+                self.liveness.note_tool_error(&outcome.content);
+            }
         }
         let leaked = !self.runner.detached_descendants_preserved()
             && !run_in_background(name, arguments)
@@ -439,6 +583,15 @@ fn run_in_background(name: &str, arguments: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The command of a foreground `bash` call the verify ledger does not
+/// already cover.
+fn rerun_command(name: &str, arguments: &str, verify: bool) -> Option<String> {
+    if name != "bash" || verify || run_in_background(name, arguments) {
+        return None;
+    }
+    Some(command_from_args(arguments))
+}
+
 fn path_from_args(arguments: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()?
@@ -533,6 +686,147 @@ mod tests {
             "echo should run: {}",
             out.content
         );
+    }
+
+    /// Live ~/drme: the fourth `cargo test` after real edits was refused, and
+    /// the model dodged the cap by dropping `timeout`. A rerun is refused only
+    /// when no file changed, whatever the pager or tool options.
+    #[tokio::test]
+    async fn verify_rerun_is_refused_only_when_nothing_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let mut ui = TestUi::default();
+        let run = |command: &str, timeout: bool| {
+            if timeout {
+                serde_json::json!({"command": command, "timeout": 600}).to_string()
+            } else {
+                serde_json::json!({"command": command}).to_string()
+            }
+        };
+        let first = host
+            .execute(
+                "t0",
+                "bash",
+                &run("cargo test 2>&1 | tail -40", true),
+                || PermissionMode::Always,
+                &mut ui,
+            )
+            .await;
+        assert!(
+            !hi_tools::is_probe_refusal(&first.content),
+            "{}",
+            first.content
+        );
+        let dodged = host
+            .execute(
+                "t1",
+                "bash",
+                &run("cargo test 2>&1 | tail -30", false),
+                || PermissionMode::Always,
+                &mut ui,
+            )
+            .await;
+        assert!(
+            hi_tools::is_probe_refusal(&dodged.content),
+            "same command with another pager and no timeout is the same run: {}",
+            dodged.content
+        );
+        for round in 0..10 {
+            let write_args = serde_json::json!({
+                "path": "touched.rs",
+                "content": format!("pub fn touched() -> u32 {{ {round} }}\n")
+            })
+            .to_string();
+            let wrote = host
+                .execute(
+                    &format!("w{round}"),
+                    "write",
+                    &write_args,
+                    || PermissionMode::Always,
+                    &mut ui,
+                )
+                .await;
+            assert_eq!(wrote.status, ToolStatus::Succeeded, "{}", wrote.content);
+            let rerun = host
+                .execute(
+                    &format!("v{round}"),
+                    "bash",
+                    &run("cargo test 2>&1 | tail -40", true),
+                    || PermissionMode::Always,
+                    &mut ui,
+                )
+                .await;
+            assert!(
+                !hi_tools::is_probe_refusal(&rerun.content),
+                "run {round} after an edit must start: {}",
+                rerun.content
+            );
+        }
+        assert!(
+            host.liveness.snapshot().invariant.is_none(),
+            "a suite failing the same way after each edit is not a tool storm: {:?}",
+            host.liveness.snapshot().invariant
+        );
+    }
+
+    /// Live ~/drme: one `python3 << 'EOF'` script ran eight times with the
+    /// same output and no edit, and the storm cap ended the turn. The third
+    /// identical output is refused with a replay before the storm counts it.
+    #[tokio::test]
+    async fn identical_bash_output_is_refused_before_the_storm() {
+        async fn bash(host: &ToolHost, ui: &mut TestUi, id: &str, args: &str) -> ToolOutcome {
+            host.execute(id, "bash", args, || PermissionMode::Always, ui)
+                .await
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let host = host(dir.path().to_path_buf());
+        let mut ui = TestUi::default();
+        let script = serde_json::json!({
+            "command": "printf 'obu_size mismatch at 0x1f\\n'\nprintf 'bits_for(74) = 7\\n'"
+        })
+        .to_string();
+        for id in ["p0", "p1"] {
+            let out = bash(&host, &mut ui, id, &script).await;
+            assert!(!is_probe_refusal(&out.content), "{id}: {}", out.content);
+            assert!(out.content.contains("obu_size mismatch"), "{}", out.content);
+        }
+        let refused = bash(&host, &mut ui, "p2", &script).await;
+        assert_eq!(refused.status, ToolStatus::Failed);
+        assert!(is_probe_refusal(&refused.content), "{}", refused.content);
+        assert!(
+            refused.content.contains("obu_size mismatch at 0x1f"),
+            "the refusal replays the last output: {}",
+            refused.content
+        );
+        for round in 3..12 {
+            let out = bash(&host, &mut ui, &format!("p{round}"), &script).await;
+            assert!(is_probe_refusal(&out.content), "{}", out.content);
+        }
+        assert!(
+            host.liveness.snapshot().invariant.is_none(),
+            "refused reruns must not add up to a tool storm: {:?}",
+            host.liveness.snapshot().invariant
+        );
+
+        let write =
+            serde_json::json!({"path": "obu.rs", "content": "pub fn obu() {}\n"}).to_string();
+        let wrote = host
+            .execute("w", "write", &write, || PermissionMode::Always, &mut ui)
+            .await;
+        assert_eq!(wrote.status, ToolStatus::Succeeded, "{}", wrote.content);
+        for id in ["after-edit", "after-edit2"] {
+            let out = bash(&host, &mut ui, id, &script).await;
+            assert!(!is_probe_refusal(&out.content), "{id}: {}", out.content);
+        }
+        host.reset_bash_repeats();
+        let out = bash(&host, &mut ui, "next-turn", &script).await;
+        assert!(!is_probe_refusal(&out.content), "{}", out.content);
+
+        let changing = serde_json::json!({"command": "echo pid $$"}).to_string();
+        for round in 0..6 {
+            let out = bash(&host, &mut ui, &format!("e{round}"), &changing).await;
+            assert!(!is_probe_refusal(&out.content), "{}", out.content);
+        }
     }
 
     #[tokio::test]

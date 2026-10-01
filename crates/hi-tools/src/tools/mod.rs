@@ -2418,6 +2418,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_of_text_already_in_the_file_does_not_say_to_edit() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-write-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&state).unwrap();
+        let snippet = "pub const DEFAULT_DIR: &str = \"wallets\";\n";
+        let existing = format!("//! header\n{snippet}{}", "fn keep() {}\n".repeat(80));
+        assert!(existing.len() > 512);
+        std::fs::write(dir.join("wallet.rs"), &existing).unwrap();
+        let args = serde_json::json!({
+            "filePath": "wallet.rs",
+            "content": snippet
+        })
+        .to_string();
+        let err = crate::prepare_mutation_in_with_state(&dir, &state, "write", &args)
+            .await
+            .expect_err("snippet already in the file must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already in this file"), "{msg}");
+        assert!(msg.contains("Answer the user"), "{msg}");
+        assert!(!msg.contains("use `edit`"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("wallet.rs")).unwrap(),
+            existing
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn mutations_reject_internal_elision_placeholder_as_content() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
@@ -2525,7 +2561,7 @@ mod tests {
         std::fs::write(dir.path().join("private/config.txt"), "original\n").unwrap();
 
         for requested in ["src/../private/config.txt", "private/config.txt"] {
-            let args = serde_json::json!({"path": requested, "content": "original\n"});
+            let args = serde_json::json!({"path": requested, "content": "updated\n"});
             let prepared = crate::prepare_mutation_in_with_state(
                 dir.path(),
                 state.path(),

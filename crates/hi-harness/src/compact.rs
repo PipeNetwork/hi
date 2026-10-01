@@ -1106,7 +1106,7 @@ mod tests {
             messages,
             ..LoadedSession::default()
         });
-        assert!(harness.persist_snapshot());
+        assert!(harness.persist_snapshot().is_ok());
 
         let mut tmp = path.as_os_str().to_os_string();
         tmp.push(".tmp");

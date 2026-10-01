@@ -231,6 +231,77 @@ fn migrate_section_credential(
     true
 }
 
+/// A profile's `auth-store://` reference names an entry the private store no
+/// longer holds: after `hi logout`, a `config.toml` copied to another machine,
+/// or a store rewritten from under it. The profile itself is intact, so
+/// startup on a terminal asks for the key again ([`crate::credential_recovery`])
+/// instead of failing on the bare reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingStoredCredential {
+    pub reference: String,
+}
+
+impl std::fmt::Display for MissingStoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "credential reference {:?} was not found", self.reference)?;
+        if let Some(path) = hi_ai::auth_store::auth_path() {
+            write!(f, " in {}", path.display())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MissingStoredCredential {}
+
+/// Give profile `name` a newly pasted `key`. The store key is derived from the
+/// owning file's path and the profile name, so the sealed reference is the one
+/// the profile already carries: `config.toml` is rewritten unchanged, the
+/// store regains its entry, and every other field of the profile stays.
+pub fn reseal_profile_api_key(
+    config: &mut Config,
+    name: &str,
+    key: &str,
+    explicit: Option<&Path>,
+) -> Result<()> {
+    rewrite_profile_credential(config, name, explicit, |profile| {
+        profile.api_key = Some(key.to_string());
+        profile.api_key_ref = None;
+        profile.api_key_env = None;
+    })
+}
+
+/// Point profile `name` at an existing store entry (`auth-store://pipenetwork`
+/// after browser pairing) in place of the one it lost.
+pub fn repoint_profile_credential(
+    config: &mut Config,
+    name: &str,
+    reference: &str,
+    explicit: Option<&Path>,
+) -> Result<()> {
+    rewrite_profile_credential(config, name, explicit, |profile| {
+        profile.api_key_ref = Some(reference.to_string());
+        profile.api_key = None;
+        profile.api_key_env = None;
+    })
+}
+
+fn rewrite_profile_credential(
+    config: &mut Config,
+    name: &str,
+    explicit: Option<&Path>,
+    mutate: impl FnOnce(&mut Profile),
+) -> Result<()> {
+    let fallback = config
+        .profiles
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
+    let target = profile_save_target(name, explicit)?;
+    let updated = rmw_profile_file(&target, name, fallback, mutate)?;
+    config.profiles.insert(name.to_string(), updated);
+    Ok(())
+}
+
 pub(crate) fn resolve_credential_reference(
     reference: &str,
     project_local: bool,
@@ -243,7 +314,11 @@ pub(crate) fn resolve_credential_reference(
         }
         return hi_ai::auth_store::load(key)
             .map(|credential| credential.access)
-            .ok_or_else(|| anyhow!("credential reference {reference:?} was not found"));
+            .ok_or_else(|| {
+                anyhow::Error::new(MissingStoredCredential {
+                    reference: reference.to_string(),
+                })
+            });
     }
     let environment = reference
         .strip_prefix("env://")

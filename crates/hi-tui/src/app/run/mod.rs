@@ -2,6 +2,7 @@
 
 mod hydrate;
 mod idle;
+mod ladder_cmd;
 mod review_cmd;
 mod session;
 

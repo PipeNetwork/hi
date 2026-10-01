@@ -2,25 +2,34 @@
 //!
 //! One loop: stream from `api.pipenetwork.ai`, execute local tools, repeat.
 
+mod check_run;
 mod command;
 mod compact;
 mod completion;
 mod dashboard;
 mod jev_auto;
 mod jev_compact;
+mod ladder;
+mod ladder_harness;
 mod live;
 mod managed;
 pub use managed::{ManagedInspection, ManagedSettings, inspect_managed_journal};
 mod liveness;
 mod pipe;
+mod plan_drive;
 mod prompt;
 mod review;
 mod review_citations;
 mod review_drive;
+mod review_git;
 mod review_guard;
+mod review_harness;
 mod review_prompts;
+mod review_reads;
 mod review_report;
 mod review_scope;
+mod review_seed;
+mod review_settings;
 mod review_stream;
 mod session;
 mod session_index;
@@ -50,6 +59,11 @@ pub use dashboard::{
     normalize_row_model, split_model_prefix,
 };
 pub use hi_ai::ReasoningEffort;
+pub use ladder::{
+    AttemptResult, DEFAULT_ATTEMPTS_PER_RUNG as LADDER_DEFAULT_ATTEMPTS, Ladder, LadderAttempt,
+    LadderCommand, LadderPhase, LadderRung, LadderSettings, LadderStep, LadderTurnFacts,
+    MAX_ATTEMPTS_PER_RUNG as LADDER_MAX_ATTEMPTS, transcript_label as ladder_transcript_label,
+};
 pub use live::LiveSettings;
 pub use liveness::AwaitingUserGuard;
 pub use pipe::{
@@ -57,15 +71,22 @@ pub use pipe::{
 };
 pub use prompt::SYSTEM_PROMPT;
 pub use review::{
-    ChecklistItem, CoverageRow, CoverageState, DEFAULT_REVIEW_PASSES, Finding, GitScope, GitSource,
-    InputKind, REVIEW_DEFECTS_FORMAT_BLOCK, REVIEW_FORMAT_BLOCK, REVIEW_FORMAT_HINT, REVIEW_PREFIX,
-    ReviewAction, ReviewArgs, ReviewInput, ReviewInputs, ReviewVerdict, Severity, check_citations,
-    discover_inputs, fingerprint as review_fingerprint, parse_checklist,
-    take_all as review_take_all, transcript_label as review_transcript_label,
+    ChecklistItem, CoverageRow, CoverageState, DEFAULT_CHUNK_FILES, DEFAULT_REVIEW_PASSES, Finding,
+    GitNumstat, GitScope, GitSource, InputKind, REVIEW_DEFECTS_FORMAT_BLOCK, REVIEW_FORMAT_BLOCK,
+    REVIEW_FORMAT_HINT, REVIEW_PREFIX, ReviewAction, ReviewArgs, ReviewInput, ReviewInputs,
+    ReviewSettings, ReviewVerdict, Severity, VerifySeed, check_citations, discover_inputs,
+    fingerprint as review_fingerprint, parse_checklist, take_all as review_take_all,
+    transcript_label as review_transcript_label,
 };
-pub use review_drive::{ReviewCommand, ReviewDrive, ReviewPhase, ReviewStep, ReviewTurnFacts};
+pub use review_drive::{
+    MAX_CONTINUATIONS as REVIEW_MAX_CONTINUATIONS, ReviewCommand, ReviewDrive, ReviewPhase,
+    ReviewStep, ReviewTurnFacts,
+};
 pub const CONTINUE_PLAN_PROMPT: &str = "Continue the open plan.";
 pub use completion::plan_is_open;
+pub use plan_drive::{
+    DEFAULT_MAX_DRIVE_TURNS, DriveMark, DriveStep, MAX_DRIVE_STALLS, drive_continue_prompt,
+};
 pub use session::{JsonlSession, LoadedSession, PendingTurn, PlanDrive, UserTurn, list_user_turns};
 pub use session_index::{
     SessionIndex, index_path, is_harness_injection, load_or_refresh_index, session_id_from_path,
@@ -131,8 +152,9 @@ impl TurnCancellation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TurnStopReason {
+    #[default]
     Completed,
     Cancelled,
     Error,
@@ -146,6 +168,8 @@ pub struct TurnOutcome {
     pub error: Option<String>,
     /// `passed` / `failed` after `/verify`; `None` when no check ran.
     pub verification: Option<String>,
+    /// The turn called edit/write/patch, even if every call failed.
+    pub attempted_mutation: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -241,69 +265,36 @@ pub struct Harness {
     /// at turn start. Never persisted.
     forced_intent: Option<completion::Intent>,
     review_drive: ReviewDrive,
+    review_settings: ReviewSettings,
+    /// Files the current review audit turn has read so far
+    /// ([`review_reads`]). Reset when an audit turn starts; never persisted.
+    review_read_files: Vec<String>,
+    /// `/ladder`: cheap-first escalation for one task. Never persisted.
+    ladder: Ladder,
+    ladder_settings: LadderSettings,
+    /// Output of the last verify run when it failed, for the ladder's retry
+    /// prompt. Taken once per turn.
+    last_verify_output: Option<String>,
+    /// The last finished turn called edit/write/patch, even if it failed.
+    attempted_mutation: bool,
 }
 
 impl Harness {
     pub fn new(config: HarnessConfig) -> Result<Self> {
-        let mut tools = ToolHost::new(config.workspace_root.clone(), config.state_root.clone())?;
-        let session = open_session(config.session_path.as_deref(), &config.model)?;
-        let liveness = resolve_liveness(&config, &tools);
-        tools.set_liveness(liveness.clone());
-        let workspace = config.workspace_root.display().to_string();
-        liveness.set_workspace(workspace);
-        if let Some(session) = &session {
-            liveness.set_session_path(Some(session.path().display().to_string()));
-        }
-        liveness.set_state(hi_liveness::HarnessState::Idle);
-        Ok(Self {
-            client: Client::new(config.base_url, config.api_key).with_managed(
-                config
-                    .session_path
-                    .as_ref()
-                    .map(|p| p.with_extension("managed.json"))
-                    .unwrap_or_else(|| config.state_root.join("managed-turn.json")),
-                config.managed,
-            ),
-            tools,
-            workspace_root: config.workspace_root,
-            state_root: config.state_root,
-            live: LiveSettings::new(config.model, PermissionMode::Ask, config.reasoning_effort),
-            configured_max_tokens: config.max_tokens.max(1),
-            max_tokens_explicit: config.max_tokens_explicit,
-            messages: Vec::new(),
-            plan: Vec::new(),
-            plan_drive: PlanDrive::default(),
-            session_usage: Usage::default(),
-            checkpoints: Vec::new(),
-            last_changed_files: Vec::new(),
-            last_context_occupancy: 0,
-            context_window: DEFAULT_CONTEXT_WINDOW,
-            model_windows: HashMap::new(),
-            model_output_caps: HashMap::new(),
-            auto_compact: config.auto_compact,
-            jev_compact: config.jev_compact && config.typesafe.is_enabled(),
-            compact_suppressed: false,
-            verify_command: None,
-            session,
-            interrupt: Arc::new(AtomicBool::new(false)),
-            turn_cancel: None,
-            steer: SteerQueue::default(),
-            pending_turn: None,
-            turn_index: 0,
-            turn_open: false,
-            turn_oneshot: false,
-            turn_plain: false,
-            liveness,
-            typesafe: config.typesafe.clone(),
-            next_action: config.typesafe.source(),
-            turn_effort: None,
-            forced_intent: None,
-            review_drive: ReviewDrive::default(),
-        })
+        let tools = ToolHost::new(config.workspace_root.clone(), config.state_root.clone())?;
+        Self::build(config, tools, PermissionMode::Ask)
     }
 
     /// Test/embedded constructor with a caller-owned process runner (sandbox off).
-    pub fn new_with_tools(config: HarnessConfig, mut tools: ToolHost) -> Result<Self> {
+    pub fn new_with_tools(config: HarnessConfig, tools: ToolHost) -> Result<Self> {
+        Self::build(config, tools, PermissionMode::Always)
+    }
+
+    fn build(
+        config: HarnessConfig,
+        mut tools: ToolHost,
+        permission: PermissionMode,
+    ) -> Result<Self> {
         let session = open_session(config.session_path.as_deref(), &config.model)?;
         let liveness = resolve_liveness(&config, &tools);
         tools.set_liveness(liveness.clone());
@@ -324,11 +315,7 @@ impl Harness {
             tools,
             workspace_root: config.workspace_root,
             state_root: config.state_root,
-            live: LiveSettings::new(
-                config.model,
-                PermissionMode::Always,
-                config.reasoning_effort,
-            ),
+            live: LiveSettings::new(config.model, permission, config.reasoning_effort),
             configured_max_tokens: config.max_tokens.max(1),
             max_tokens_explicit: config.max_tokens_explicit,
             messages: Vec::new(),
@@ -360,6 +347,12 @@ impl Harness {
             turn_effort: None,
             forced_intent: None,
             review_drive: ReviewDrive::default(),
+            review_settings: ReviewSettings::default(),
+            review_read_files: Vec::new(),
+            ladder: Ladder::default(),
+            ladder_settings: LadderSettings::default(),
+            last_verify_output: None,
+            attempted_mutation: false,
         })
     }
 
@@ -405,8 +398,8 @@ impl Harness {
             messages: self.messages.clone(),
             usage: self.session_usage,
             checkpoints: self.checkpoints.clone(),
-            verify_command: self.verify_command.clone(),
-            model: Some(self.model()),
+            verify_command: self.recorded_verify_command(),
+            model: Some(self.recorded_model()),
             name: None,
             permission: Some(self.permission_mode().as_u8()),
             effort: self
@@ -421,27 +414,24 @@ impl Harness {
 
     /// Rewrite the session file to match in-memory state.
     ///
-    /// Returns true when there is no session file, or when the rewrite
-    /// succeeded. False means the file is unchanged: callers that already
+    /// Returns `Ok(())` when there is no session file, or when the rewrite
+    /// succeeded. On error the file is unchanged: callers that already
     /// replaced `messages` must restore the previous history so the persist
     /// cursor cannot run ahead of the file.
     ///
     /// Do not report `SessionAppendFailed` here. That invariant auto-repairs
     /// and would kill a turn that just rolled back to a consistent snapshot.
     /// Close still reports if the final append cannot be written.
-    #[must_use]
-    pub(crate) fn persist_snapshot(&mut self) -> bool {
+    pub(crate) fn persist_snapshot(&mut self) -> Result<()> {
         let state = self.snapshot_state();
         let Some(session) = &mut self.session else {
-            return true;
+            return Ok(());
         };
-        if session.rewrite(&state).is_err() {
-            return false;
-        }
+        session.rewrite(&state)?;
         self.liveness.note_progress();
         self.liveness
             .emit(hi_liveness::EventCode::SessionRewrite, None, None, None);
-        true
+        Ok(())
     }
 
     /// Replace live history and rewrite the session. On rewrite failure,
@@ -453,7 +443,7 @@ impl Harness {
         let prev_occ = self.last_context_occupancy;
         self.last_context_occupancy = crate::compact::estimate_message_tokens(&self.messages);
         self.session_usage.context_occupancy = self.last_context_occupancy;
-        if self.persist_snapshot() {
+        if self.persist_snapshot().is_ok() {
             true
         } else {
             self.messages = previous;
@@ -470,7 +460,7 @@ impl Harness {
             let prev_pending = self.pending_turn.clone();
             self.messages.truncate(len);
             self.pending_turn = None;
-            if !self.persist_snapshot() {
+            if self.persist_snapshot().is_err() {
                 self.messages = previous;
                 self.pending_turn = prev_pending;
             }
@@ -829,7 +819,7 @@ impl Harness {
         let prev_pending = self.pending_turn.take();
         self.review_drive = ReviewDrive::default();
         self.forced_intent = None;
-        if !self.persist_snapshot() {
+        if self.persist_snapshot().is_err() {
             self.messages = previous;
             self.plan = prev_plan;
             self.last_changed_files = prev_files;

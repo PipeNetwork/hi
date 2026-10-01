@@ -6,10 +6,9 @@
 # ("Run cargo test to verify the welcome-message change…") must complete
 # rather than stall as no_progress after a green suite.
 #
-# Credentials (first match wins):
-#   1. PIPENETWORK_API_KEY / HI_API_KEY in the environment
-#   2. The hi client's saved pipenetwork profile in ~/.config/hi
-#      (auth-store:// api_key_ref, or the pipenetwork pairing key)
+# Credentials: the saved default profile in the local hi config (its sealed
+# key in the private store), or PIPENETWORK_API_KEY / HI_API_KEY if exported.
+# HI_PROFILE or HI_PROVIDER selects a different route.
 #
 # This is deliberately not a one-token canary. Budget is large enough for a
 # multi-round review/fix/re-test loop:
@@ -17,49 +16,25 @@
 #   ~20-minute wall clock (review/fix plus a verify-only follow-up)
 #
 # Optional:
-#   HI_MODEL   (default: the saved pipenetwork profile model)
+#   HI_PROFILE (default: the saved default profile)
+#   HI_PROVIDER (default: unset; forces a provider and drops the profile key)
+#   HI_MODEL   (default: that profile's model)
 #   HI_BIN     (default: freshly built ./target/debug/hi)
 #   HI_LIVE_E2E_KEEP=1  keep the workdir on failure
 #
 # Exit: 0 pass · 1 fail · 2 skipped (no key).
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.." || exit 1
 
 HI_BIN="${HI_BIN:-$PWD/target/debug/hi}"
 FIXTURE="$PWD/bench/tui-smoke/scenarios/live_review_fix_chat/fixture"
 
-has_pipe_credential() {
-  python3 - <<'PY'
-import json, os
-from pathlib import Path
+# shellcheck source=live_e2e_auth.sh
+source "$SCRIPT_DIR/live_e2e_auth.sh"
 
-def nonempty(name):
-    return bool(os.environ.get(name, "").strip())
-
-if nonempty("PIPENETWORK_API_KEY") or nonempty("HI_API_KEY"):
-    raise SystemExit(0)
-
-auth_path = Path.home() / ".config" / "hi" / "auth.json"
-if not auth_path.is_file():
-    raise SystemExit(1)
-try:
-    data = json.loads(auth_path.read_text())
-except Exception:
-    raise SystemExit(1)
-if not isinstance(data, dict):
-    raise SystemExit(1)
-for key, value in data.items():
-    if "pipenetwork" not in str(key):
-        continue
-    access = value.get("access", "") if isinstance(value, dict) else ""
-    if str(access).strip():
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-if ! has_pipe_credential; then
-  echo "SKIP: no pipenetwork credential (set PIPENETWORK_API_KEY / HI_API_KEY, or save one with hi auth pipenetwork / the default pipenetwork profile)" >&2
+if ! has_saved_hi_credential; then
+  echo "SKIP: no saved hi credential (configure a profile with hi auth / hi login, or set PIPENETWORK_API_KEY / HI_API_KEY)" >&2
   exit 2
 fi
 if [[ ! -d "$FIXTURE" ]]; then
@@ -104,20 +79,16 @@ Keep the existing tests; do not weaken or delete them. Make the tests pass by fi
 
 REPORT="$WD/report.json"
 HI_ARGS=(
-  --profile pipenetwork
   --allow-unverified --no-save --no-memory --no-finalize
   --temperature 0 --max-tokens 16384 --max-steps 80
   --max-verify-repairs 8 --verify "cargo test --offline"
   --report "$REPORT"
 )
+apply_live_route
 if [[ -n "${HI_MODEL:-}" ]]; then
   HI_ARGS+=(--model "$HI_MODEL")
 fi
-if [[ -n "${PIPENETWORK_API_KEY:-${HI_API_KEY:-}}" ]]; then
-  echo "== review-fix live e2e: credential=env model=${HI_MODEL:-profile} workdir=$WD/repo ==" >&2
-else
-  echo "== review-fix live e2e: credential=hi-client-auth-store model=${HI_MODEL:-profile} workdir=$WD/repo ==" >&2
-fi
+echo "== review-fix live e2e: credential=$(live_credential_label) route=$(live_route_label) model=${HI_MODEL:-profile} workdir=$WD/repo ==" >&2
 
 set +e
 ( cd "$WD/repo" && \
@@ -222,12 +193,12 @@ fi
 VERIFY_PROMPT="Run cargo test to verify the welcome-message change didn't break anything."
 VERIFY_REPORT="$WD/report-verify.json"
 HI_ARGS=(
-  --profile pipenetwork
   --allow-unverified --no-save --no-memory --no-finalize
   --temperature 0 --max-tokens 8192 --max-steps 24
   --max-verify-repairs 2 --verify "cargo test --offline"
   --report "$VERIFY_REPORT"
 )
+apply_live_route
 if [[ -n "${HI_MODEL:-}" ]]; then
   HI_ARGS+=(--model "$HI_MODEL")
 fi

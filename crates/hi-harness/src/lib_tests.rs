@@ -1,6 +1,7 @@
 use super::*;
 use crate::pipe::test_support::{
-    MockPipe, Scripted, text_chunk, tool_chunk, usage_chunk, usage_chunk_with_reason,
+    MockPipe, Scripted, reasoning_chunk, text_chunk, tool_chunk, usage_chunk,
+    usage_chunk_with_reason,
 };
 use hi_tools::ProcessRunner;
 use hi_tools::sandbox::SandboxPolicy;
@@ -108,6 +109,436 @@ async fn text_only_turn_completes() {
     assert_eq!(harness.session_usage().input_tokens, 4);
     assert_eq!(harness.session_usage().output_tokens, 2);
     assert_eq!(harness.usage_snapshot().usage.input_tokens, 4);
+}
+
+/// Live ~/drme: after `cargo build` the next model call dropped mid-body
+/// while reasoning was streaming, and the turn ended until the user retyped.
+#[tokio::test]
+async fn stream_dropped_mid_reasoning_is_retried_and_the_turn_completes() {
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Truncated(vec![
+            reasoning_chunk("checking the build output"),
+            text_chunk("partial"),
+        ]),
+        Scripted::Sse(vec![text_chunk("build is clean"), usage_chunk(4, 2)]),
+    ]) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("is the build clean?", &mut ui, TurnCancellation::new())
+        .await
+        .expect("a dropped stream must not fail the turn");
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::Completed,
+        "errors: {:?}",
+        ui.errors
+    );
+    assert!(
+        ui.errors.is_empty(),
+        "no turn error expected: {:?}",
+        ui.errors
+    );
+    let last = harness.messages().last().expect("assistant reply").text();
+    assert!(last.contains("build is clean"), "{last}");
+    assert!(
+        !last.contains("partial"),
+        "the dropped partial reply is not kept: {last}"
+    );
+    assert!(
+        ui.statuses.iter().any(|status| status.contains("retrying")),
+        "status should say the stream is being retried: {:?}",
+        ui.statuses
+    );
+}
+
+/// A long turn can hit several unrelated drops. The retry budget is per
+/// failure streak, not per turn, so a later drop is still recovered.
+#[tokio::test]
+async fn retry_budget_resets_after_a_successful_round() {
+    // Each streak outlasts the client's own transport retries (1 + 3), so it
+    // reaches the turn-level budget. One more streak than that budget only
+    // passes if a successful round resets it.
+    let streaks = crate::pipe::MAX_STREAM_RECOVERIES + 1;
+    let mut scripts = Vec::new();
+    for round in 0..streaks {
+        for _ in 0..4 {
+            scripts.push(Scripted::Truncated(vec![reasoning_chunk("thinking")]));
+        }
+        let args = serde_json::json!({"command": format!("echo step {round}")}).to_string();
+        scripts.push(Scripted::Sse(vec![
+            tool_chunk(0, &format!("call_{round}"), "bash", &args),
+            usage_chunk(1, 1),
+        ]));
+    }
+    scripts.push(Scripted::Sse(vec![
+        text_chunk("all steps ran"),
+        usage_chunk(1, 1),
+    ]));
+    let Some(server) = MockPipe::new(scripts) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("run the steps", &mut ui, TurnCancellation::new())
+        .await
+        .expect("sporadic drops across a long turn must not fail it");
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::Completed,
+        "errors: {:?}",
+        ui.errors
+    );
+    assert!(
+        harness
+            .messages()
+            .last()
+            .is_some_and(|message| message.text().contains("all steps ran")),
+        "the turn must reach its final answer"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .filter(|status| status.contains("retry 1/"))
+            .count()
+            >= streaks as usize,
+        "every streak starts again at retry 1: {:?}",
+        ui.statuses
+    );
+}
+
+/// Live ~/drme: after a 5 KB edit, Pipe rejected the next reply with "model
+/// output did not satisfy the tool protocol". hi resent the identical request
+/// about 24 times, then ended the turn. A rejected tool call is retried once
+/// with a repair hint, so the model produces a different call.
+#[tokio::test]
+async fn tool_protocol_rejection_is_retried_with_a_repair_hint() {
+    let frame = r#"{"error":{"message":"model output did not satisfy the tool protocol"}}"#;
+    let http_400 = Scripted::Http {
+        status: 400,
+        body: r#"{"error":"model output did not satisfy the tool protocol"}"#.into(),
+        retry_after: None,
+    };
+    for (label, rejection) in [
+        ("sse frame", Scripted::Sse(vec![frame.into()])),
+        ("http 400", http_400),
+    ] {
+        let Some(server) = MockPipe::new(vec![
+            rejection,
+            Scripted::Sse(vec![text_chunk("smaller edit applied"), usage_chunk(2, 1)]),
+        ]) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+        let mut ui = TestUi::default();
+        let outcome = harness
+            .run_turn_cancellable("is the build clean?", &mut ui, TurnCancellation::new())
+            .await
+            .expect("a rejected tool call must not fail the turn");
+        assert_eq!(
+            outcome.stop_reason,
+            TurnStopReason::Completed,
+            "{label}: {:?}",
+            ui.errors
+        );
+        let bodies = server.bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "{label}: one repaired retry, no blind resends"
+        );
+        assert!(
+            !bodies[0].contains("rejected by the model gateway"),
+            "{label}: the first request has no hint"
+        );
+        assert!(
+            bodies[1].contains("rejected by the model gateway"),
+            "{label}: the retry carries the repair hint"
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("smaller call")),
+            "{label}: {:?}",
+            ui.statuses
+        );
+    }
+}
+
+fn open_plan_session(steps: &[(&str, hi_tools::PlanStatus)]) -> crate::LoadedSession {
+    crate::LoadedSession {
+        plan: steps
+            .iter()
+            .map(|(title, status)| hi_tools::PlanStep {
+                title: (*title).to_string(),
+                status: *status,
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn outcome(stop_reason: TurnStopReason, changed: &[&str], error: Option<&str>) -> TurnOutcome {
+    TurnOutcome {
+        stop_reason,
+        usage: Usage::default(),
+        changed_files: changed.iter().map(|path| path.to_string()).collect(),
+        error: error.map(str::to_string),
+        verification: None,
+        attempted_mutation: false,
+    }
+}
+
+/// Live ~/drme: every stall ended with plan steps left and hi idle until the
+/// user typed "Continue the open plan." The drive starts that turn itself and
+/// stops when the plan closes.
+#[tokio::test]
+async fn plan_drive_continues_an_open_plan_until_it_closes() {
+    let step_one = serde_json::json!({"path": "one.txt", "content": "one\n"}).to_string();
+    let step_two = serde_json::json!({"path": "two.txt", "content": "two\n"}).to_string();
+    let plan_one = serde_json::json!({"steps": [
+        {"title": "write one", "status": "done"},
+        {"title": "write two", "status": "pending"}
+    ]})
+    .to_string();
+    let plan_two = serde_json::json!({"steps": [
+        {"title": "write one", "status": "done"},
+        {"title": "write two", "status": "done"}
+    ]})
+    .to_string();
+    let verify = serde_json::json!({"command": "cargo test"}).to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "w1", "write", &step_one),
+            tool_chunk(1, "p1", "update_plan", &plan_one),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Step one is written. Next: write two."),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "w2", "write", &step_two),
+            tool_chunk(1, "p2", "update_plan", &plan_two),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "t2", "bash", &verify),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![text_chunk("Both steps are done."), usage_chunk(1, 1)]),
+    ]) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+
+    let mark = harness.plan_drive_mark();
+    let first = harness
+        .run_turn_cancellable("set up the two-step plan", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert!(
+        crate::plan_is_open(harness.current_plan()),
+        "{:?}",
+        ui.errors
+    );
+    let crate::DriveStep::Continue(driven) = harness.plan_drive_after_turn(mark, Some(&first), 0)
+    else {
+        panic!("an open plan must keep driving");
+    };
+    assert!(driven.starts_with(crate::CONTINUE_PLAN_PROMPT), "{driven}");
+    assert!(driven.contains("write two"), "{driven}");
+
+    let mark = harness.plan_drive_mark();
+    let second = harness
+        .run_turn_cancellable(&driven, &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert!(!crate::plan_is_open(harness.current_plan()));
+    assert_eq!(
+        harness.plan_drive_after_turn(mark, Some(&second), 1),
+        crate::DriveStep::Idle,
+        "a closed plan stops the drive"
+    );
+    assert!(
+        dir.path().join("two.txt").exists(),
+        "the driven turn did the work"
+    );
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert!(
+        bodies[2].contains(crate::CONTINUE_PLAN_PROMPT),
+        "the third request is the driven turn"
+    );
+}
+
+#[test]
+fn plan_drive_pauses_after_turns_without_progress_and_resumes_on_input() {
+    use hi_tools::PlanStatus::{Done, Pending};
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness("http://127.0.0.1:9", dir.path().to_path_buf());
+    harness.apply_loaded_session(open_plan_session(&[("a", Done), ("b", Pending)]));
+    let idle = outcome(TurnStopReason::Error, &[], Some("plan_stall"));
+
+    let mark = harness.plan_drive_mark();
+    let crate::DriveStep::Continue(first) = harness.plan_drive_after_turn(mark, Some(&idle), 0)
+    else {
+        panic!("one unproductive turn still gets another try");
+    };
+    assert!(
+        first.starts_with(crate::CONTINUE_PLAN_PROMPT) && first.contains("b"),
+        "{first}"
+    );
+    assert!(
+        first.contains("recapped and changed nothing"),
+        "a stall must send the sterner continue prompt, got {first}"
+    );
+    let crate::DriveStep::Paused(reason) = harness.plan_drive_after_turn(mark, Some(&idle), 1)
+    else {
+        panic!("a second unproductive turn must pause the drive");
+    };
+    assert!(reason.contains("2 turns"), "{reason}");
+    assert!(harness.plan_drive().paused);
+    assert_eq!(
+        harness.plan_drive_after_turn(mark, Some(&idle), 2),
+        crate::DriveStep::Idle,
+        "a paused drive stays paused"
+    );
+
+    harness.resume_plan_drive_on_input();
+    assert!(!harness.plan_drive().paused, "typing a prompt resumes it");
+    let edited = outcome(TurnStopReason::Error, &["src/lib.rs"], Some("plan_stall"));
+    let crate::DriveStep::Continue(after_edit) =
+        harness.plan_drive_after_turn(mark, Some(&edited), 0)
+    else {
+        panic!("a turn that changed files is progress even if it ended in an error");
+    };
+    assert!(
+        after_edit.starts_with(crate::CONTINUE_PLAN_PROMPT) && after_edit.contains("b"),
+        "{after_edit}"
+    );
+    assert!(
+        !after_edit.contains("recapped and changed nothing"),
+        "progress must reset the continue prompt, got {after_edit}"
+    );
+}
+
+#[test]
+fn plan_drive_keeps_going_when_the_turn_attempted_an_edit() {
+    use hi_tools::PlanStatus::Pending;
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness("http://127.0.0.1:9", dir.path().to_path_buf());
+    harness.apply_loaded_session(open_plan_session(&[("frame id", Pending)]));
+    let mark = harness.plan_drive_mark();
+    let missed = TurnOutcome {
+        attempted_mutation: true,
+        ..outcome(TurnStopReason::Error, &[], Some("plan_stall"))
+    };
+    let crate::DriveStep::Continue(first) = harness.plan_drive_after_turn(mark, Some(&missed), 0)
+    else {
+        panic!("a missed edit is still work; keep driving");
+    };
+    assert!(first.contains("frame id"), "{first}");
+    assert!(
+        !first.contains("recapped and changed nothing"),
+        "failed edits must not look like a recap stall, got {first}"
+    );
+    let crate::DriveStep::Continue(_) = harness.plan_drive_after_turn(mark, Some(&missed), 1)
+    else {
+        panic!("a second missed-edit turn must not pause the drive");
+    };
+    assert!(!harness.plan_drive().paused);
+}
+
+#[test]
+fn plan_drive_pauses_on_interrupt_bad_key_and_turn_cap() {
+    use hi_tools::PlanStatus::Pending;
+    let dir = tempfile::tempdir().unwrap();
+    let mut harness = test_harness("http://127.0.0.1:9", dir.path().to_path_buf());
+    harness.apply_loaded_session(open_plan_session(&[("a", Pending)]));
+    let mark = harness.plan_drive_mark();
+
+    let cancelled = outcome(TurnStopReason::Cancelled, &["x"], None);
+    assert!(matches!(
+        harness.plan_drive_after_turn(mark, Some(&cancelled), 0),
+        crate::DriveStep::Paused(_)
+    ));
+    harness.resume_plan_drive_on_input();
+
+    let bad_key = outcome(
+        TurnStopReason::Error,
+        &[],
+        Some("pipe http 401: unauthorized"),
+    );
+    assert!(matches!(
+        harness.plan_drive_after_turn(mark, Some(&bad_key), 0),
+        crate::DriveStep::Paused(_)
+    ));
+    harness.resume_plan_drive_on_input();
+
+    let productive = outcome(TurnStopReason::Completed, &["x"], None);
+    let cap = crate::DEFAULT_MAX_DRIVE_TURNS;
+    assert!(matches!(
+        harness.plan_drive_after_turn(mark, Some(&productive), cap),
+        crate::DriveStep::Paused(reason) if reason.contains("in a row")
+    ));
+}
+
+/// A failed request is written to the session so the cause survives the
+/// terminal. Without it the drme stalls left nothing to diagnose.
+#[tokio::test]
+async fn unrecoverable_request_error_is_recorded_in_the_session() {
+    let Some(server) = MockPipe::new(vec![Scripted::Http {
+        status: 400,
+        body: r#"{"error":{"message":"unknown model pipe/nope"}}"#.into(),
+        retry_after: None,
+    }]) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let session_path = dir.path().join("session.jsonl");
+    let state = dir.path().join(".hi");
+    let runner = ProcessRunner::new_with_policy(dir.path(), SandboxPolicy::Off).expect("runner");
+    let tools = ToolHost::new_with_runner(dir.path().to_path_buf(), state.clone(), runner).unwrap();
+    let mut config = HarnessConfig::pipe(dir.path().to_path_buf(), "pk_test");
+    config.base_url = server.url.clone();
+    config.state_root = state;
+    config.session_path = Some(session_path.clone());
+    let mut harness = Harness::new_with_tools(config, tools).unwrap();
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable("hello", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Error);
+    let body = std::fs::read_to_string(&session_path).unwrap();
+    let recorded = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["type"] == "turn_error")
+        .expect("turn_error record in the session");
+    assert_eq!(recorded["kind"], "request");
+    assert!(
+        recorded["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown model")),
+        "{recorded}"
+    );
 }
 
 #[tokio::test]
@@ -409,7 +840,9 @@ async fn long_tool_loops_are_not_round_capped() {
 #[tokio::test]
 async fn identical_tool_storm_stops_the_turn() {
     let dir = tempfile::tempdir().unwrap();
-    let args = serde_json::json!({"command": "echo storm"}).to_string();
+    // The call is identical but its output is not, so only the storm cap
+    // (not the same-output rerun refusal) can stop it.
+    let args = serde_json::json!({"command": "echo storm $$"}).to_string();
     let mut scripts = Vec::new();
     for i in 0..hi_liveness::IDENTICAL_TOOL_CONSECUTIVE {
         scripts.push(Scripted::Sse(vec![
@@ -444,9 +877,64 @@ async fn identical_tool_storm_stops_the_turn() {
 }
 
 #[tokio::test]
+async fn turn_after_tool_storm_can_run_a_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let storm = serde_json::json!({"command": "echo storm $$"}).to_string();
+    let recovered = serde_json::json!({"command": "echo recovered"}).to_string();
+    let mut scripts = Vec::new();
+    for i in 0..hi_liveness::IDENTICAL_TOOL_CONSECUTIVE {
+        scripts.push(Scripted::Sse(vec![
+            tool_chunk(0, &format!("call_s{i}"), "bash", &storm),
+            usage_chunk(1, 1),
+        ]));
+    }
+    scripts.push(Scripted::Sse(vec![
+        tool_chunk(0, "call_recovered", "bash", &recovered),
+        usage_chunk(1, 1),
+    ]));
+    scripts.push(Scripted::Sse(vec![
+        text_chunk("back to work"),
+        usage_chunk(1, 1),
+    ]));
+    let Some(server) = MockPipe::new(scripts) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let stormed = harness
+        .run_turn_cancellable("loop", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(stormed.stop_reason, TurnStopReason::Error);
+    let next = harness
+        .run_turn_cancellable("continue", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_ne!(
+        next.error.as_deref(),
+        Some("identical tool storm; stopping the turn"),
+        "a finished storm must not stall the next turn: {next:?}"
+    );
+    let outputs: Vec<String> = harness
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            hi_ai::Content::ToolResult { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        outputs.iter().any(|output| output.contains("recovered")),
+        "next turn must execute its tool, got {outputs:?}"
+    );
+}
+
+#[tokio::test]
 async fn tool_storm_fills_remaining_parallel_calls() {
     let dir = tempfile::tempdir().unwrap();
-    let args = serde_json::json!({"command": "echo storm"}).to_string();
+    let args = serde_json::json!({"command": "echo storm $$"}).to_string();
     let mut scripts = Vec::new();
     for i in 0..hi_liveness::IDENTICAL_TOOL_CONSECUTIVE.saturating_sub(1) {
         scripts.push(Scripted::Sse(vec![
@@ -2245,6 +2733,920 @@ async fn continue_with_open_plan_does_not_accept_apply_later_cop_out() {
     );
 }
 
+/// Live ~/drme: the model repeated the same "Want me to tackle…?" recap
+/// with no tools. The turn completed immediately (`!used_tools`) and plan
+/// drive paused after two copies. A question-cop-out must keep the turn
+/// going until an edit lands.
+#[tokio::test]
+async fn open_plan_want_me_to_recap_does_not_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    fs::write(&path, "fn main() {}\n").unwrap();
+    let edit = serde_json::json!({
+        "path": "main.rs",
+        "old_string": "fn main() {}",
+        "new_string": "fn main() { println!(\"ok\"); }"
+    })
+    .to_string();
+    let test_cmd = serde_json::json!({"command": "cargo test --offline --quiet"}).to_string();
+    let done = serde_json::json!({
+        "steps": [
+            {"title": "Encoder-side superres downscale + signaling", "status": "done"}
+        ]
+    })
+    .to_string();
+    let recap = "Full test suite passes: cargo test exit=0, 567 lib tests green.\n\n\
+**Plan status: 5/7 done**. Want me to tackle the README/CLI doc sync, or the 8-bit prediction clamp generalization?";
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![text_chunk(recap), usage_chunk(10, 4)]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_e", "edit", &edit),
+            usage_chunk(12, 6),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_t", "bash", &test_cmd),
+            usage_chunk(14, 6),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "call_p", "update_plan", &done),
+            usage_chunk(16, 4),
+        ]),
+        Scripted::Sse(vec![text_chunk("superres is signaled"), usage_chunk(18, 4)]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after recap"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = vec![hi_tools::PlanStep {
+        title: "Encoder-side superres downscale + signaling".into(),
+        status: hi_tools::PlanStatus::Active,
+    }];
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable(
+            crate::CONTINUE_PLAN_PROMPT,
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(
+        ui.statuses.iter().any(|status| {
+            status.contains("asked which plan step to do next")
+                || status.contains("asking for an edit")
+        }),
+        "a Want-me-to recap with an open plan must keep the turn going, got {:?}",
+        ui.statuses
+    );
+    assert!(fs::read_to_string(&path).unwrap().contains("println"));
+    assert!(
+        !ui.texts
+            .join("")
+            .contains("should not be requested after recap")
+    );
+}
+
+/// Live ~/drme turn 54: the model re-sent its previous recap before every
+/// tool call. hi saved each copy and nudged again after every tool round,
+/// and one analysis script printed the same output eight times until the
+/// identical-tool storm ended the turn 40 rounds in. Copies are no longer
+/// saved or sent, the recap nudge has a per-turn budget, and the third
+/// identical output is refused, so the completion policy ends the turn.
+#[tokio::test]
+async fn repeated_recap_and_identical_script_end_without_a_tool_storm() {
+    let dir = tempfile::tempdir().unwrap();
+    let recap = "The locked-bytes test passes again (567/567). Now the real issue: dav1d \
+                 still rejects the bitstream. Let me check the `bits_for` function and how \
+                 it is called.";
+    let script = serde_json::json!({
+        "command": "printf 'seq_profile=0\\n'\nprintf 'obu_size mismatch at 0x1f\\n'"
+    })
+    .to_string();
+    let mut scripts = vec![Scripted::Sse(vec![text_chunk(recap), usage_chunk(1, 1)])];
+    for round in 0..12 {
+        scripts.push(Scripted::Sse(vec![text_chunk(recap), usage_chunk(1, 1)]));
+        scripts.push(Scripted::Sse(vec![
+            tool_chunk(0, &format!("py{round}"), "bash", &script),
+            usage_chunk(1, 1),
+        ]));
+    }
+    let Some(server) = MockPipe::new(scripts) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let first = harness
+        .run_turn_cancellable("where are we?", &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(first.stop_reason, TurnStopReason::Completed);
+
+    let outcome = harness
+        .run_turn_cancellable(
+            "build out full av1 spec implimentation",
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Error);
+    assert_eq!(
+        ui.errors
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["inspect_stop"],
+        "the edit demand, not the storm, ends the turn"
+    );
+    assert_eq!(harness.liveness().snapshot().invariant, None);
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|status| status.contains("repeated the same status recap"))
+            .count(),
+        2
+    );
+
+    let saved_recaps = harness
+        .messages()
+        .iter()
+        .filter(|message| message.text().trim() == recap)
+        .count();
+    assert_eq!(saved_recaps, 1, "only the first turn's reply is saved");
+    let outputs: Vec<String> = harness
+        .messages()
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            hi_ai::Content::ToolResult { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .collect();
+    let refused = outputs
+        .iter()
+        .filter(|output| hi_tools::is_probe_refusal(output))
+        .count();
+    assert_eq!(outputs.len() - refused, 2, "{outputs:#?}");
+    assert!(refused >= 1, "{outputs:#?}");
+    assert!(
+        outputs
+            .iter()
+            .all(|output| output.contains("obu_size mismatch at 0x1f"))
+    );
+
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        8,
+        "one first-turn request, seven in the loop turn"
+    );
+    for body in &bodies[1..] {
+        assert_eq!(
+            body.matches("dav1d still rejects the bitstream").count(),
+            1,
+            "the model sees the recap once, not once per round"
+        );
+    }
+}
+
+/// Live ~/drme turn 53: tests passed, and the model answered with
+/// `update_plan` keeping "Verify dav1d + ffmpeg + tests" active because
+/// dav1d still rejected the stream. hi closed the step anyway, the plan
+/// read 4/4 and was dismissed, and after the next turn stalled nothing
+/// resumed. The step stays open and plan drive keeps going.
+#[tokio::test]
+async fn step_kept_open_after_green_tests_is_not_closed_by_the_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("obu.rs"),
+        "pub fn bits_for() -> u32 { 0 }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("check.sh"),
+        "echo 'test result: ok. 567 passed; 0 failed'\n",
+    )
+    .unwrap();
+    let edit = serde_json::json!({
+        "path": "obu.rs",
+        "old_string": "pub fn bits_for() -> u32 { 0 }",
+        "new_string": "pub fn bits_for() -> u32 { 7 }"
+    })
+    .to_string();
+    let check = serde_json::json!({"command": "sh check.sh"}).to_string();
+    let titles = [
+        "Parse sequence header",
+        "Write frame OBUs",
+        "Encode tiles",
+        "Verify dav1d + ffmpeg + tests",
+    ];
+    let keep_open = serde_json::json!({
+        "steps": titles.iter().enumerate().map(|(i, title)| serde_json::json!({
+            "title": title,
+            "status": if i < 3 { "done" } else { "active" },
+        })).collect::<Vec<_>>()
+    })
+    .to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![tool_chunk(0, "e", "edit", &edit), usage_chunk(1, 1)]),
+        Scripted::Sse(vec![tool_chunk(0, "t", "bash", &check), usage_chunk(1, 1)]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p", "update_plan", &keep_open),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Tests pass, but dav1d still rejects the bitstream."),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("dav1d reports an OBU size mismatch at 0x1f."),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("The mismatch is in the tile group size."),
+            usage_chunk(1, 1),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.set_verify_command(Some("sh check.sh".into()));
+    harness.plan = titles
+        .iter()
+        .enumerate()
+        .map(|(i, title)| hi_tools::PlanStep {
+            title: (*title).into(),
+            status: if i < 3 {
+                hi_tools::PlanStatus::Done
+            } else {
+                hi_tools::PlanStatus::Active
+            },
+        })
+        .collect();
+    let mut ui = TestUi::default();
+    let mark = harness.plan_drive_mark();
+    let outcome = harness
+        .run_turn_cancellable(
+            crate::CONTINUE_PLAN_PROMPT,
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stop_reason, TurnStopReason::Error);
+    assert_eq!(
+        ui.errors
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["plan_stall"]
+    );
+    assert!(
+        ui.errors[0].1.contains("kept the active plan step open"),
+        "{:?}",
+        ui.errors
+    );
+    assert!(
+        !ui.statuses.iter().any(|status| status.contains("marked")),
+        "the harness must not close a step the model kept open: {:?}",
+        ui.statuses
+    );
+    assert!(crate::plan_is_open(harness.current_plan()));
+    assert_eq!(
+        harness.current_plan()[3].status,
+        hi_tools::PlanStatus::Active
+    );
+    assert!(!ui.texts.join("").contains("should not be requested"));
+    let crate::DriveStep::Continue(next) = harness.plan_drive_after_turn(mark, Some(&outcome), 0)
+    else {
+        panic!("an open plan keeps driving after the stall");
+    };
+    assert!(next.contains("Verify dav1d + ffmpeg + tests"), "{next}");
+}
+
+/// Live ~/drme: the same old_string miss was retried until plan_stall, then
+/// plan drive paused. A second identical miss must be refused, and the
+/// model must be able to close the already-implemented step.
+#[tokio::test]
+async fn identical_failed_edit_is_refused_and_the_step_can_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("decoder.rs");
+    let current = "fn decode_frame_id(reader: &mut BitReader) -> u32 {\n    reader.read_uvlc().unwrap_or(0)\n}\n";
+    fs::write(&path, current).unwrap();
+    let miss = serde_json::json!({
+        "path": "decoder.rs",
+        "old_string": "fn decode_frame_id() -> u32 {\n    0\n}",
+        "new_string": current
+    })
+    .to_string();
+    let done = serde_json::json!({
+        "steps": [
+            {"title": "Frame id numbers in frame header/decoder", "status": "done"}
+        ]
+    })
+    .to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![tool_chunk(0, "e1", "edit", &miss), usage_chunk(10, 4)]),
+        Scripted::Sse(vec![tool_chunk(0, "e2", "edit", &miss), usage_chunk(12, 4)]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p1", "update_plan", &done),
+            usage_chunk(14, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("frame id is already in the tree"),
+            usage_chunk(16, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after reconcile"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = vec![hi_tools::PlanStep {
+        title: "Frame id numbers in frame header/decoder".into(),
+        status: hi_tools::PlanStatus::Active,
+    }];
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable(
+            crate::CONTINUE_PLAN_PROMPT,
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ui.tool_results
+            .iter()
+            .any(|(_, result)| result.contains("already failed")
+                || result.contains("already in this file")),
+        "the second identical miss must be refused, got {:?}",
+        ui.tool_results
+    );
+    assert!(
+        !crate::plan_is_open(harness.current_plan()),
+        "reconcile credit must let update_plan close the already-done step, got {:?}",
+        harness.current_plan()
+    );
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(outcome.attempted_mutation);
+    assert!(
+        !ui.texts
+            .join("")
+            .contains("should not be requested after reconcile")
+    );
+}
+
+/// An edit whose new_string is already in the file, up to indentation, used
+/// to report `Edited decoder.rs` while the harness saw no change and asked
+/// for the edit again. It is refused as already in the file, and the step can
+/// close.
+#[tokio::test]
+async fn edit_that_changes_nothing_is_refused_and_the_step_can_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("decoder.rs");
+    let current = "fn decode_frame_id(reader: &mut BitReader) -> u32 {\n    reader.read_uvlc().unwrap_or(0)\n}\n";
+    fs::write(&path, current).unwrap();
+    let noop = serde_json::json!({
+        "path": "decoder.rs",
+        "old_string": "fn decode_frame_id(reader: &mut BitReader) -> u32 {\n  reader.read_uvlc().unwrap_or(0)\n}",
+        "new_string": current.trim_end()
+    })
+    .to_string();
+    let done = serde_json::json!({
+        "steps": [{"title": FRAME_ID_STEP, "status": "done"}]
+    })
+    .to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![tool_chunk(0, "e1", "edit", &noop), usage_chunk(10, 4)]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p1", "update_plan", &done),
+            usage_chunk(12, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("frame id is already in the tree"),
+            usage_chunk(14, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after the no-op"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = vec![hi_tools::PlanStep {
+        title: FRAME_ID_STEP.into(),
+        status: hi_tools::PlanStatus::Active,
+    }];
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable(
+            crate::CONTINUE_PLAN_PROMPT,
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    let edit_result = ui
+        .tool_results
+        .iter()
+        .find(|(name, _)| name == "edit")
+        .map(|(_, result)| result.clone())
+        .unwrap_or_default();
+    assert!(
+        edit_result.contains("no change:") && edit_result.contains("already in this file"),
+        "the model is told nothing changed, got {edit_result:?}"
+    );
+    assert!(!edit_result.contains("Edited"), "{edit_result:?}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), current);
+    assert!(
+        !crate::plan_is_open(harness.current_plan()),
+        "the already-done step closes, got {:?}",
+        harness.current_plan()
+    );
+    assert_eq!(outcome.stop_reason, TurnStopReason::Completed);
+    assert!(
+        !ui.texts
+            .join("")
+            .contains("should not be requested after the no-op")
+    );
+}
+
+const FRAME_ID_STEP: &str = "Frame id numbers in frame header/decoder";
+const TIMING_STEP: &str = "Timing info read/write";
+
+/// A workspace whose `make test` passes, plus a decoder file to edit.
+fn passing_tests_workspace() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("Makefile"), "test:\n\t@echo ok\n").unwrap();
+    let path = dir.path().join("decoder.rs");
+    fs::write(&path, "fn frame_id() -> u32 {\n    0\n}\n").unwrap();
+    (dir, path)
+}
+
+fn frame_id_edit() -> String {
+    serde_json::json!({
+        "path": "decoder.rs",
+        "old_string": "    0\n",
+        "new_string": "    reader.read_bits(16)\n"
+    })
+    .to_string()
+}
+
+const EDITED_DECODER: &str = "fn frame_id() -> u32 {\n    reader.read_bits(16)\n}\n";
+
+fn make_test() -> String {
+    serde_json::json!({"command": "make test"}).to_string()
+}
+
+fn plan_steps(steps: &[(&str, hi_tools::PlanStatus)]) -> Vec<hi_tools::PlanStep> {
+    steps
+        .iter()
+        .map(|(title, status)| hi_tools::PlanStep {
+            title: (*title).to_string(),
+            status: *status,
+        })
+        .collect()
+}
+
+/// Live ~/drme: the active step was edited and the tests passed, but every
+/// stop got "Your next action MUST be `edit`… Do not call update_plan", so
+/// the model padded src/decoder/mod.rs with comment lines until plan_stall.
+/// A finished step closes instead, and nothing else touches the file.
+#[tokio::test]
+async fn edited_and_tested_step_closes_instead_of_forcing_filler_edits() {
+    use hi_tools::PlanStatus::{Active, Done, Pending};
+    let (dir, path) = passing_tests_workspace();
+    let claim = "Frame id numbers are fully wired through the frame header and the decoder, \
+                 and make test passes; this plan step is complete.";
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "e1", "edit", &frame_id_edit()),
+            usage_chunk(10, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "t1", "bash", &make_test()),
+            usage_chunk(12, 4),
+        ]),
+        Scripted::Sse(vec![text_chunk(claim), usage_chunk(14, 4)]),
+        Scripted::Sse(vec![text_chunk(claim), usage_chunk(16, 4)]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after the close"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = plan_steps(&[(FRAME_ID_STEP, Active), (TIMING_STEP, Pending)]);
+    let mut ui = TestUi::default();
+    let mark = harness.plan_drive_mark();
+    let prompt = crate::drive_continue_prompt(&harness.plan, 0, false);
+    let outcome = harness
+        .run_turn_cancellable(&prompt, &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert!(ui.errors.is_empty(), "no plan_stall: {:?}", ui.errors);
+    assert_eq!(
+        harness.current_plan(),
+        plan_steps(&[(FRAME_ID_STEP, Done), (TIMING_STEP, Active)]).as_slice()
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("asking to mark it done")),
+        "{:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains(&format!("marked \"{FRAME_ID_STEP}\" done"))),
+        "the harness must say it closed the step, got {:?}",
+        ui.statuses
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), EDITED_DECODER);
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 4, "the close must not ask the model again");
+    assert!(bodies[3].contains("call update_plan now"), "{}", bodies[3]);
+    assert!(
+        bodies
+            .iter()
+            .all(|body| !body.contains("Do not call update_plan")),
+        "no request may forbid the call that closes the step"
+    );
+    assert!(!ui.texts.join("").contains("should not be requested"));
+    assert!(
+        !harness.plan_drive().step_edited,
+        "the next step starts clean"
+    );
+
+    let crate::DriveStep::Continue(next) = harness.plan_drive_after_turn(mark, Some(&outcome), 0)
+    else {
+        panic!("the plan still has a step; keep driving");
+    };
+    assert!(next.contains(TIMING_STEP), "{next}");
+    assert!(next.contains("update_plan"), "{next}");
+}
+
+/// `update_plan` answered "Plan recorded: 1/1 done." even when the
+/// harness kept the step open, so the model thought it had closed it.
+#[tokio::test]
+async fn refused_plan_close_is_reported_to_the_model() {
+    use hi_tools::PlanStatus::{Active, Done};
+    let (dir, path) = passing_tests_workspace();
+    let done =
+        serde_json::json!({"steps": [{"title": FRAME_ID_STEP, "status": "done"}]}).to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "p1", "update_plan", &done),
+            usage_chunk(10, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "e1", "edit", &frame_id_edit()),
+            usage_chunk(12, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "t1", "bash", &make_test()),
+            usage_chunk(14, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p2", "update_plan", &done),
+            usage_chunk(16, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Frame ids are read in the decoder; make test passes."),
+            usage_chunk(18, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after the plan closed"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = plan_steps(&[(FRAME_ID_STEP, Active)]);
+    let mut ui = TestUi::default();
+    let outcome = harness
+        .run_turn_cancellable(
+            crate::CONTINUE_PLAN_PROMPT,
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert_eq!(
+        harness.current_plan(),
+        plan_steps(&[(FRAME_ID_STEP, Done)]).as_slice()
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), EDITED_DECODER);
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert!(
+        bodies[1].contains("Not marked done") && !bodies[1].contains("Plan recorded: 1/1 done"),
+        "the refused close must be reported as refused: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[4].contains("Plan recorded: 1/1 done"),
+        "{}",
+        bodies[4]
+    );
+    assert!(!ui.texts.join("").contains("should not be requested"));
+}
+
+/// After `/reload` the live ~/drme plan was 1/7 with the active step already
+/// in the tree and no edit on record for it. A passing test run lets the
+/// model close it; nothing asks for an edit that would only be filler.
+#[tokio::test]
+async fn step_already_in_the_tree_closes_on_a_passing_test_run() {
+    use hi_tools::PlanStatus::{Active, Done};
+    let (dir, path) = passing_tests_workspace();
+    fs::write(&path, EDITED_DECODER).unwrap();
+    let done = serde_json::json!({"steps": [
+        {"title": "Sequence header", "status": "done"},
+        {"title": FRAME_ID_STEP, "status": "done"}
+    ]})
+    .to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "t1", "bash", &make_test()),
+            usage_chunk(10, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p1", "update_plan", &done),
+            usage_chunk(12, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Frame ids were already read in the decoder; make test passes."),
+            usage_chunk(14, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after the plan closed"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = plan_steps(&[("Sequence header", Done), (FRAME_ID_STEP, Active)]);
+    let mut ui = TestUi::default();
+    let prompt = crate::drive_continue_prompt(&harness.plan, 0, false);
+    assert!(prompt.contains("update_plan"), "{prompt}");
+    let outcome = harness
+        .run_turn_cancellable(&prompt, &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert!(!crate::plan_is_open(harness.current_plan()));
+    assert_eq!(fs::read_to_string(&path).unwrap(), EDITED_DECODER);
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("asking for an edit")),
+        "{:?}",
+        ui.statuses
+    );
+    assert!(!ui.texts.join("").contains("should not be requested"));
+}
+
+/// Plan drive starts a fresh turn per step. The edit from the turn before
+/// still counts toward the active step, so the next turn can close it once
+/// the tests pass instead of being told to edit again.
+#[tokio::test]
+async fn step_edit_from_the_previous_turn_still_counts() {
+    use hi_tools::PlanStatus::{Active, Done};
+    let (dir, path) = passing_tests_workspace();
+    let done =
+        serde_json::json!({"steps": [{"title": FRAME_ID_STEP, "status": "done"}]}).to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "e1", "edit", &frame_id_edit()),
+            usage_chunk(10, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Edited the frame id reader."),
+            usage_chunk(12, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("The frame id reader is edited; stopping here."),
+            usage_chunk(14, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "t1", "bash", &make_test()),
+            usage_chunk(16, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p1", "update_plan", &done),
+            usage_chunk(18, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Frame ids are read in the decoder; make test passes."),
+            usage_chunk(20, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after the plan closed"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    harness.plan = plan_steps(&[(FRAME_ID_STEP, Active)]);
+    let mut ui = TestUi::default();
+    let mark = harness.plan_drive_mark();
+    let first = harness
+        .run_turn_cancellable(
+            crate::CONTINUE_PLAN_PROMPT,
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.error.as_deref(),
+        Some(UNVERIFIED_FIRST_TURN),
+        "{:?}",
+        ui.errors
+    );
+    assert!(
+        harness.plan_drive().step_edited,
+        "the edit must outlive the turn"
+    );
+    let crate::DriveStep::Continue(driven) = harness.plan_drive_after_turn(mark, Some(&first), 0)
+    else {
+        panic!("an edited open plan keeps driving");
+    };
+    assert!(driven.contains("update_plan"), "{driven}");
+
+    let second = harness
+        .run_turn_cancellable(&driven, &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert_eq!(
+        harness.current_plan(),
+        plan_steps(&[(FRAME_ID_STEP, Done)]).as_slice()
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), EDITED_DECODER);
+    assert!(!harness.plan_drive().step_edited);
+    assert!(!ui.texts.join("").contains("should not be requested"));
+}
+
+/// The live ~/drme plans open with a "Baseline: run cargo test" step. Tests
+/// that ran before the plan was posted close it; a second step already in
+/// the tree ends that turn cleanly, and the drive's next turn closes it on
+/// its own passing run. No demand asks for an edit, so nothing invites filler.
+#[tokio::test]
+async fn baseline_and_already_done_steps_close_without_plan_stall() {
+    use hi_tools::PlanStatus::{Active, Done};
+    const BASELINE: &str = "Baseline: run make test";
+    let (dir, path) = passing_tests_workspace();
+    fs::write(&path, EDITED_DECODER).unwrap();
+    let opening = serde_json::json!({"steps": [
+        {"title": BASELINE, "status": "done"},
+        {"title": FRAME_ID_STEP, "status": "active"}
+    ]})
+    .to_string();
+    let closing = serde_json::json!({"steps": [
+        {"title": BASELINE, "status": "done"},
+        {"title": FRAME_ID_STEP, "status": "done"}
+    ]})
+    .to_string();
+    let Some(server) = MockPipe::new(vec![
+        Scripted::Sse(vec![
+            tool_chunk(0, "t1", "bash", &make_test()),
+            usage_chunk(10, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p1", "update_plan", &opening),
+            usage_chunk(12, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Baseline passes. The decoder already reads frame ids."),
+            usage_chunk(14, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "t2", "bash", &make_test()),
+            usage_chunk(16, 4),
+        ]),
+        Scripted::Sse(vec![
+            tool_chunk(0, "p2", "update_plan", &closing),
+            usage_chunk(18, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("Frame ids were already in the decoder; make test passes."),
+            usage_chunk(20, 4),
+        ]),
+        Scripted::Sse(vec![
+            text_chunk("should not be requested after the plan closed"),
+            usage_chunk(1, 1),
+        ]),
+    ]) else {
+        return;
+    };
+    let mut harness = test_harness(&server.url, dir.path().to_path_buf());
+    harness.set_permission_mode(PermissionMode::Always);
+    let mut ui = TestUi::default();
+    let mark = harness.plan_drive_mark();
+    let first = harness
+        .run_turn_cancellable(
+            "Implement frame id numbers in the decoder.",
+            &mut ui,
+            TurnCancellation::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert_eq!(
+        harness.current_plan(),
+        plan_steps(&[(BASELINE, Done), (FRAME_ID_STEP, Active)]).as_slice()
+    );
+    let crate::DriveStep::Continue(driven) = harness.plan_drive_after_turn(mark, Some(&first), 0)
+    else {
+        panic!("a closed step keeps the drive going");
+    };
+    assert!(driven.contains("update_plan"), "{driven}");
+
+    let second = harness
+        .run_turn_cancellable(&driven, &mut ui, TurnCancellation::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.stop_reason,
+        TurnStopReason::Completed,
+        "{:?}",
+        ui.errors
+    );
+    assert!(!crate::plan_is_open(harness.current_plan()));
+    assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+    assert_eq!(fs::read_to_string(&path).unwrap(), EDITED_DECODER);
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("asking for an edit")),
+        "{:?}",
+        ui.statuses
+    );
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert!(
+        bodies.iter().all(|body| !body.contains("Not marked done")),
+        "a close was refused"
+    );
+    assert!(!ui.texts.join("").contains("should not be requested"));
+}
+
+const UNVERIFIED_FIRST_TURN: &str =
+    "changes were applied but the project's tests never ran after the last edit";
+
 #[tokio::test]
 async fn post_edit_review_and_fix_reruns_tests() {
     let dir = tempfile::tempdir().unwrap();
@@ -3165,7 +4567,7 @@ fn failed_compact_rewrite_does_not_append_onto_old_session_file() {
         Message::user("three"),
         Message::assistant(vec![hi_ai::Content::Text("four".into())]),
     ];
-    assert!(harness.persist_snapshot());
+    assert!(harness.persist_snapshot().is_ok());
     let mut persisted_before = harness.messages.len();
 
     let mut tmp = session_path.as_os_str().to_os_string();

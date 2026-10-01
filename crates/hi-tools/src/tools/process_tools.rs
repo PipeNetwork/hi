@@ -13,7 +13,7 @@ use super::{RuntimeResources, background_tool_outcome, mark_effect_inspection_fa
 
 #[path = "file_dump.rs"]
 mod file_dump;
-use file_dump::{file_dump_is_read_eligible, file_dump_read_arguments};
+use file_dump::{file_dump_is_read_eligible, file_dump_read_arguments, shell_page_paths};
 
 const PYTHON_TUI_MARKERS: &[&str] = &[
     "from textual",
@@ -270,6 +270,11 @@ pub(super) async fn run_bash_tool_with_auto_background(
     {
         return crate::read::run_read(root, resources.read_cache, &arguments).await;
     }
+    if !args.run_in_background
+        && let Some(message) = capped_shell_page(root, resources.read_cache, &args.command)
+    {
+        return Ok(ToolOutcome::failed(message));
+    }
     if args.run_in_background {
         let baseline = match crate::effects::workspace_snapshot(root, state_root).await {
             Ok(snapshot) => snapshot,
@@ -518,6 +523,35 @@ Use bash_output with id {id} to read output; bash_kill with id {id} to stop.",
 /// while a false positive would weaken effect attribution.
 fn definitely_read_only_shell(command: &str) -> bool {
     crate::shell_policy::classify_shell_command(command).is_proven_read_only()
+}
+
+/// Refuse a shell page of a path `read` has already closed this turn.
+/// `awk 'NR>=a && NR<=b' file; echo ====; awk …` is not one `read`, so the
+/// rewrite above does not see it; without this check it reprints the file.
+fn capped_shell_page(
+    root: &Path,
+    cache: &std::sync::Mutex<crate::ReadCache>,
+    command: &str,
+) -> Option<String> {
+    let paths = shell_page_paths(command);
+    if paths.is_empty() {
+        return None;
+    }
+    let cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in paths {
+        let path = Path::new(&path);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        if let Some(message) = cache.reread_refusal(&abs) {
+            return Some(message);
+        }
+    }
+    None
 }
 
 /// Drop a trailing `tail`/`head` count pager (`cmd 2>&1 | tail -40`).

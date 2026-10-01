@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::{
     BashArgs, RuntimeResources, definitely_read_only_shell, file_dump_read_arguments,
     managed_handoff_enabled, process_tool_outcome, run_bash_tool_with_auto_background,
-    strip_trailing_output_pager,
+    shell_page_paths, strip_trailing_output_pager,
 };
 use crate::{ProcessExecution, ProcessOutcome, ToolStatus, TruncationState};
 
@@ -121,6 +121,24 @@ fn file_dump_commands_map_to_read_arguments() {
     );
     assert!(parsed(r#"grep -n TODO src/ws.rs"#).is_none());
     assert!(parsed(r#"grep -n "" src/ws.rs | wc -l"#).is_none());
+    assert_eq!(
+        parsed("awk 'NR>=738 && NR<=985' src/obu/frame_header.rs"),
+        Some(serde_json::json!({"path":"src/obu/frame_header.rs","offset":738,"limit":248}))
+    );
+    assert_eq!(
+        parsed("awk 'NR>=1160 && NR<=1224 {print}' src/obu/frame_header.rs"),
+        Some(serde_json::json!({"path":"src/obu/frame_header.rs","offset":1160,"limit":65}))
+    );
+    assert!(parsed("awk '{print $1}' src/obu/frame_header.rs").is_none());
+    assert_eq!(
+        shell_page_paths(
+            "awk 'NR>=1160 && NR<=1224' src/obu/frame_header.rs; echo ====; awk 'NR>=1592 && NR<=1766' src/obu/frame_header.rs"
+        ),
+        vec![
+            "src/obu/frame_header.rs".to_string(),
+            "src/obu/frame_header.rs".to_string()
+        ]
+    );
     assert!(parsed("cat SPEC.md | wc -l").is_none());
 }
 

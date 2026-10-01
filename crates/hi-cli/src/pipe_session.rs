@@ -31,7 +31,7 @@ pub async fn run(
     let stdout_tty = std::io::stdout().is_terminal();
     let stdin_tty = std::io::stdin().is_terminal();
     let headless_review = cli.spec_review.is_some();
-    let use_tui = !cli.plain && stdout_tty && stdin_tty && !headless_review;
+    let use_tui = !cli.plain && stdout_tty && stdin_tty && !headless_review && !cli.ladder;
     let resume = crate::sentinel_resume::plan(cli, prompt.as_ref());
     let prompt = if resume.ignore_prompt { None } else { prompt };
     let interactive = prompt.is_none() && stdin_tty && !headless_review;
@@ -96,6 +96,11 @@ pub async fn run(
         config.jev_compact = false;
     }
     let mut harness = Harness::new(config)?;
+    harness.set_review_settings(file.review.to_settings());
+    let ladder = file
+        .ladder
+        .session_settings(harness.workspace_root(), cli.no_verify);
+    harness.set_ladder_settings(ladder);
     if let Some(path) = &session_path
         && path.is_file()
         && let Ok(loaded) = JsonlSession::load(path)
@@ -162,8 +167,7 @@ pub async fn run(
             &mut harness,
             &mut ui,
             &paths,
-            cli.spec_review_passes
-                .unwrap_or(crate::review_cli::DEFAULT_PASSES),
+            cli.spec_review_passes,
             cli.spec_review_audit_only,
         )
         .await?;
@@ -171,7 +175,24 @@ pub async fn run(
             && let Some(outcome) = &run.last_outcome
         {
             let review = crate::review_cli::review_report_json(&run.drive);
-            write_turn_report(path, outcome, &ui, &harness, Some(review))?;
+            write_turn_report(path, outcome, &ui, &harness, Some(("review", review)))?;
+        }
+        return run.into_result();
+    }
+
+    if cli.ladder {
+        let mut ui = StdoutUi {
+            quiet: cli.quiet,
+            confirm_edits: cli.confirm_edits,
+            ..StdoutUi::default()
+        };
+        let task = prompt.as_deref().unwrap_or_default();
+        let run = crate::ladder_cli::run_headless(&mut harness, &mut ui, task).await?;
+        if let Some(path) = &cli.report
+            && let Some(outcome) = &run.last_outcome
+        {
+            let ladder = crate::ladder_cli::ladder_report_json(&run.ladder);
+            write_turn_report(path, outcome, &ui, &harness, Some(("ladder", ladder)))?;
         }
         return run.into_result();
     }
@@ -220,9 +241,30 @@ pub async fn run(
             confirm_edits: cli.confirm_edits,
             ..StdoutUi::default()
         };
-        let outcome = harness
+        harness.resume_plan_drive_on_input();
+        let mut mark = harness.plan_drive_mark();
+        let mut outcome = harness
             .run_turn_cancellable(&prompt, &mut ui, TurnCancellation::new())
             .await?;
+        let mut driven = 0u32;
+        while cli.drive && !harness.plan_drive().paused {
+            match harness.plan_drive_after_turn(mark, Some(&outcome), driven) {
+                hi_harness::DriveStep::Continue(next) => {
+                    driven += 1;
+                    let (done, total) = harness.plan_progress();
+                    eprintln!("plan drive: continuing the open plan ({done}/{total} steps done)");
+                    mark = harness.plan_drive_mark();
+                    outcome = harness
+                        .run_turn_cancellable(&next, &mut ui, TurnCancellation::new())
+                        .await?;
+                }
+                hi_harness::DriveStep::Paused(reason) => {
+                    eprintln!("plan drive paused: {reason}");
+                    break;
+                }
+                hi_harness::DriveStep::Idle => break,
+            }
+        }
         if let Some(path) = &cli.report {
             write_turn_report(path, &outcome, &ui, &harness, None)?;
         }
@@ -256,7 +298,7 @@ pub async fn run(
                 Command::Quit => break,
                 Command::Help(_) => {
                     println!(
-                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /review /compact /jev-compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
+                        "/login /logout /auth /model /effort /permissions /undo /diff /retry /verify /review /ladder /compact /jev-compact /files /status /usage /dashboard /doctor /autoharnessfix /sessions /rewind /exit"
                     );
                     continue;
                 }
@@ -349,6 +391,9 @@ pub async fn run(
                         continue;
                     }
                 },
+                Command::Ladder(arg) => {
+                    turn_line = crate::ladder_cli::command(&mut harness, &arg).await;
+                }
                 Command::Compact(arg) => {
                     let mut ui = hi_harness::TestUi::default();
                     let note = arg.trim();
@@ -486,6 +531,12 @@ pub async fn run(
                     eprintln!("/tutorial is available in the full-screen TUI");
                     continue;
                 }
+                Command::Reload => {
+                    eprintln!(
+                        "/reload is available in the full-screen TUI; here, exit and run `hi -c`"
+                    );
+                    continue;
+                }
                 Command::Dashboard => {
                     eprintln!(
                         "open the TUI (`hi`) and type /dashboard (aliases /fleet, /agents-dashboard)"
@@ -520,7 +571,8 @@ pub async fn run(
                 None
             }
         };
-        crate::review_cli::chain(&mut harness, &mut ui, outcome).await;
+        crate::review_cli::chain(&mut harness, &mut ui, outcome.clone()).await;
+        crate::ladder_cli::chain(&mut harness, &mut ui, outcome).await;
     }
     Ok(())
 }
@@ -1004,7 +1056,7 @@ fn write_turn_report(
     outcome: &TurnOutcome,
     ui: &StdoutUi,
     harness: &Harness,
-    review: Option<serde_json::Value>,
+    extra: Option<(&str, serde_json::Value)>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1014,18 +1066,19 @@ fn write_turn_report(
         .iter()
         .filter(|message| message.role == hi_ai::Role::Assistant)
         .count() as u64;
-    let body = turn_report_json(outcome, ui, model_requests, harness.current_plan(), review);
+    let body = turn_report_json(outcome, ui, model_requests, harness.current_plan(), extra);
     std::fs::write(path, serde_json::to_vec_pretty(&body)?)
         .with_context(|| format!("writing report {}", path.display()))
 }
 
-/// `review` is the `hi --spec-review` object; `None` leaves the key out.
+/// `extra` is a headless mode's object under its key (`review` for
+/// `hi --spec-review`, `ladder` for `hi --ladder`); `None` leaves it out.
 fn turn_report_json(
     outcome: &TurnOutcome,
     ui: &StdoutUi,
     model_requests: u64,
     plan: &[hi_tools::PlanStep],
-    review: Option<serde_json::Value>,
+    extra: Option<(&str, serde_json::Value)>,
 ) -> serde_json::Value {
     let status = match outcome.stop_reason {
         TurnStopReason::Completed => "completed",
@@ -1073,8 +1126,8 @@ fn turn_report_json(
             "context_occupancy": outcome.usage.context_occupancy,
         },
     });
-    if let Some(review) = review {
-        body["review"] = review;
+    if let Some((key, value)) = extra {
+        body[key] = value;
     }
     body
 }

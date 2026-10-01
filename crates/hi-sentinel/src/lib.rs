@@ -29,6 +29,7 @@ mod spawn;
 mod supervise;
 mod worktree;
 
+pub use args::relaunch_args;
 pub use classify::{BugKind, Class, ClassifyContext, Confidence, ExternalKind, ReportKind};
 pub use config::{MonitorConfig, SupervisorConfig, set_machine_enabled};
 pub use slash::{

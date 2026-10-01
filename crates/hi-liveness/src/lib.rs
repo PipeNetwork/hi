@@ -102,6 +102,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_turn_tools_clears_a_report_only_storm() {
+        let publisher = Publisher::new();
+        publisher.set_invariant(InvariantCode::IdenticalToolStorm);
+        publisher.reset_turn_tools();
+        assert!(
+            publisher.snapshot().invariant.is_none(),
+            "the next turn must not inherit a tool storm"
+        );
+        publisher.set_invariant(InvariantCode::CompactFailedOverWindow);
+        publisher.reset_turn_tools();
+        assert_eq!(
+            publisher.snapshot().invariant.unwrap().code,
+            InvariantCode::CompactFailedOverWindow,
+            "auto-repair invariants stay sticky across turns"
+        );
+    }
+
+    #[test]
     fn report_only_storm_upgrades_to_compact_failed() {
         let publisher = Publisher::new();
         publisher.set_invariant(InvariantCode::IdenticalToolStorm);

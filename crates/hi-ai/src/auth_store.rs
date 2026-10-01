@@ -79,11 +79,19 @@ pub fn auth_path() -> Option<PathBuf> {
     Some(base.join("hi").join("auth.json"))
 }
 
-fn read_all() -> HashMap<String, StoredToken> {
-    let Some(path) = auth_path() else {
-        return HashMap::new();
-    };
-    read_private(&path)
+/// The store one whole operation acts on. Resolved exactly once per
+/// operation: the location comes from process environment (`XDG_CONFIG_HOME`,
+/// `HOME`), and resolving it again between the read and the write of a
+/// read-modify-write lets a concurrent change of that environment write one
+/// store's entries over another's. That is not hypothetical: a test binary
+/// redirecting `XDG_CONFIG_HOME` on another thread once emptied a developer's
+/// real store this way.
+fn store_path() -> Result<PathBuf> {
+    auth_path().context("could not determine config directory")
+}
+
+fn read_at(path: &Path) -> HashMap<String, StoredToken> {
+    read_private(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
@@ -92,25 +100,28 @@ fn read_all() -> HashMap<String, StoredToken> {
 /// The stored credential for `provider`, expired or not. Callers decide whether
 /// to refresh; returning expired tokens is what makes refresh possible at all.
 pub fn load(provider: &str) -> Option<StoredToken> {
-    read_all().remove(provider)
+    let path = auth_path()?;
+    read_at(&path).remove(provider)
 }
 
 /// Replace `provider`'s credential, preserving every other provider's entry.
 pub fn save(provider: &str, token: &StoredToken) -> Result<()> {
-    let _lock = AuthLock::acquire()?;
-    let mut all = read_all();
+    let path = store_path()?;
+    let _lock = AuthLock::acquire(&path)?;
+    let mut all = read_at(&path);
     all.insert(provider.to_string(), token.clone());
-    write_all(&all)
+    write_at(&path, &all)
 }
 
 /// Remove `provider`'s credential (logout). Absent entries are not an error.
 pub fn delete(provider: &str) -> Result<()> {
-    let _lock = AuthLock::acquire()?;
-    let mut all = read_all();
+    let path = store_path()?;
+    let _lock = AuthLock::acquire(&path)?;
+    let mut all = read_at(&path);
     if all.remove(provider).is_none() {
         return Ok(());
     }
-    write_all(&all)
+    write_at(&path, &all)
 }
 
 struct AuthLock {
@@ -118,8 +129,9 @@ struct AuthLock {
 }
 
 impl AuthLock {
-    fn acquire() -> Result<Self> {
-        let auth = auth_path().context("could not determine config directory")?;
+    /// Lock the store at `auth` (the `.json.lock` sibling), creating and
+    /// securing its directory.
+    fn acquire(auth: &Path) -> Result<Self> {
         let parent = auth.parent().context("auth path has no parent")?;
         ensure_private_directory(parent)
             .with_context(|| format!("securing config dir {}", parent.display()))?;
@@ -146,17 +158,16 @@ impl Drop for AuthLock {
     }
 }
 
-/// Write via a 0600 temp file and rename, so a reader never sees a partial file
-/// and the secret is never briefly world-readable (which a write-then-chmod
-/// would allow).
-fn write_all(all: &HashMap<String, StoredToken>) -> Result<()> {
-    let path = auth_path().context("could not determine config directory")?;
+/// Write the whole store to `path` via a 0600 temp file and rename, so a
+/// reader never sees a partial file and the secret is never briefly
+/// world-readable (which a write-then-chmod would allow).
+fn write_at(path: &Path, all: &HashMap<String, StoredToken>) -> Result<()> {
     let parent = path.parent().context("auth path has no parent")?;
     ensure_private_directory(parent)
         .with_context(|| format!("securing config dir {}", parent.display()))?;
 
     let json = serde_json::to_string_pretty(all).context("serializing credentials")?;
-    write_private_atomic(&path, json.as_bytes())
+    write_private_atomic(path, json.as_bytes())
         .with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }

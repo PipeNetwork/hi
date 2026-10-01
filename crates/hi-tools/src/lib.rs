@@ -101,10 +101,12 @@ mod internal_snapshot;
 mod job_lifecycle;
 mod local_server;
 mod lsp;
+mod mutation_repeat;
 mod paths;
 mod process;
 pub mod read;
 mod repo_map;
+mod rerun_repeat;
 mod research;
 pub mod sandbox;
 pub mod shell_policy;
@@ -112,6 +114,7 @@ mod structured_failure;
 pub mod stub_scan;
 mod tools;
 mod transaction;
+mod verify_repeat;
 mod web;
 pub mod worktree;
 pub use action_fusion::{
@@ -162,6 +165,7 @@ pub use local_server::{
     verify_local_server_contract,
 };
 pub use lsp::lsp_status_report_for;
+pub use mutation_repeat::{FailedMutationLedger, new_string_already_present};
 pub use paths::{ReadCache, ResourceRegistrationError};
 pub use process::{
     AdoptableOutcome, ForegroundProcessRegistry, ProcessExecution, ProcessRunner, RunningChild,
@@ -169,6 +173,8 @@ pub use process::{
 };
 pub use read::{read_output_invites_paging, read_regular_file_bytes_bounded};
 pub use repo_map::{RepoMapCache, orientation_for_task, ranked_paths_for_task};
+pub use rerun_repeat::{RerunLedger, SAME_OUTPUT_RUNS_BEFORE_REFUSAL};
+pub use verify_repeat::{MAX_VERIFY_RUNS_PER_TURN, VerifyRepeatLedger, verify_key};
 /// True when a Pipe research API key is installed for this process.
 pub fn research_credentials_configured() -> bool {
     hi_research::credentials_configured()

@@ -5,11 +5,14 @@ use std::time::Duration;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::render::{markdown_body_lines, with_gutter, wrap_line_to_width};
+use crate::render::{markdown_body_lines, with_gutter};
 use crate::theme::theme;
+use crate::wrap::wrap_line_to_width;
 
-/// Wrap width for thinking body lines (grok `ui.max_thoughts_width`, default 120).
-pub(crate) const THINKING_WRAP_COLS: usize = 120;
+/// Wrap width for thinking body lines on a wide terminal (grok
+/// `ui.max_thoughts_width`, default 120) — the same cap as assistant prose,
+/// so a thought does not reflow when it commits beside it.
+pub(crate) const THINKING_WRAP_COLS: usize = crate::wrap::PROSE_WRAP_COLS as usize;
 /// Live truncated tail, matching grok `truncated_lines = 3`.
 const THINKING_TRUNCATED_LINES: usize = 3;
 const BODY_GUTTER_COLS: u16 = 2;

@@ -452,6 +452,14 @@ pub(crate) static KEY_BINDINGS: &[KeyBinding] = &[
         action: None,
         matches: &[],
     },
+    KeyBinding {
+        context: BindContext::ReviewTools,
+        keys: "Ctrl-Shift-C",
+        help: "copy the selection (or the last reply) to the system clipboard",
+        in_help: true,
+        action: None,
+        matches: &[],
+    },
     // --- Queue ---
     KeyBinding {
         context: BindContext::Queue,

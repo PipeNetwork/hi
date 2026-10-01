@@ -337,6 +337,12 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_200_upserts_profile() {
+        // An accepted key is sealed into the private credential store under
+        // XDG_CONFIG_HOME. Unisolated, that replaces the developer's own
+        // ~/.config/hi/auth.json (and races the tests that redirect the var).
+        if run_with_isolated_credentials(std::thread::current().name().unwrap()) {
+            return;
+        }
         let Some(server) = FakeOpenAiServer::new(vec![Response::json(
             200,
             r#"{"data":[{"id":"test-model"}]}"#,
@@ -381,6 +387,9 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_pipenetwork_key_uses_the_flash_profile_and_private_store() {
+        if run_with_isolated_credentials(std::thread::current().name().unwrap()) {
+            return;
+        }
         let Some(server) = FakeOpenAiServer::new(vec![Response::json(
             200,
             r#"{"data":[{"id":"pipe/deepseek-v4-flash-0731"}]}"#,
@@ -484,6 +493,9 @@ mod tests {
         assert!(!text.contains("pk_old"), "old literal leaked: {text}");
     }
 
+    /// Re-run `test` in a child process whose `XDG_CONFIG_HOME` is a scratch
+    /// dir, so the credential store it writes is never the developer's.
+    /// `true` in the parent once the child passed; `false` in the child.
     fn run_with_isolated_credentials(test: &str) -> bool {
         const CHILD: &str = "HI_TEST_PIPE_LOGIN_PROFILE";
         if std::env::var(CHILD).as_deref() == Ok(test) {

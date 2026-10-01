@@ -95,7 +95,10 @@ fn page_footer(start: usize, end: usize, total: usize) -> String {
     }
     let mut footer = format!("… showing lines {start}-{end} of {total}");
     if end < total {
-        footer.push_str(&format!(" — read more with offset {}", end + 1));
+        footer.push_str(&format!(
+            " — read more with offset {} on the read tool",
+            end + 1
+        ));
     }
     footer
 }

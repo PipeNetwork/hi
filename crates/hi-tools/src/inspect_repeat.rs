@@ -69,12 +69,20 @@ impl InspectRepeatLedger {
             .map(String::as_str)
             .filter(|text| !text.is_empty())
             .unwrap_or("(previous body was empty or compacted)");
+        let guidance = if previous.contains("no matches") {
+            "Do not repeat it. The symbol is not in the tree — add it with \
+             `edit`/`write`, or change the pattern, path, or offset for a \
+             different search."
+        } else {
+            "Do not repeat it. Use the matches above. If the user asked a \
+             question, answer it. Change the pattern, path, or offset only \
+             for a different search. Do not change a file unless the user \
+             asked for a change."
+        };
         Some(format!(
             "This exact `{name}` already ran this turn ({count} times) and returned:\n\
              {previous}\n\n\
-             Do not repeat it. If there were no matches, the symbol is not in the \
-             tree — add it with `edit`/`write`. Change the pattern, path, or offset \
-             for a different search."
+             {guidance}"
         ))
     }
 }
@@ -103,10 +111,22 @@ mod tests {
         let refused = ledger.admit("grep", "k").expect("second grep");
         assert!(refused.contains("already ran this turn"), "{refused}");
         assert!(refused.contains("no matches for MAX_PASSWORD"), "{refused}");
+        assert!(refused.contains("add it with"), "{refused}");
         assert!(is_probe_refusal(&refused));
         assert!(ledger.admit("bash", "k").is_none());
         ledger.reset();
         assert!(ledger.admit("grep", "k").is_none());
+    }
+
+    #[test]
+    fn grep_hit_does_not_tell_the_model_to_add_the_symbol() {
+        let mut ledger = InspectRepeatLedger::new();
+        assert!(ledger.admit("grep", "k").is_none());
+        ledger.record_output("grep", "k", "src/wallet.rs:13:pub const DEFAULT_DIR");
+        let refused = ledger.admit("grep", "k").expect("second grep");
+        assert!(refused.contains("DEFAULT_DIR"), "{refused}");
+        assert!(refused.contains("answer it"), "{refused}");
+        assert!(!refused.contains("add it with"), "{refused}");
     }
 
     #[test]

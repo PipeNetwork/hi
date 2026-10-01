@@ -140,10 +140,19 @@ pub struct ReviewInputs {
     /// and no scope ([`crate::review_scope::resolve_target`]).
     #[serde(default)]
     pub git: Option<GitScope>,
-    /// `all`: directories audited one turn each, in this order (`.` is the
-    /// workspace's own top-level files).
+    /// Chunked audit: one label per turn, in this order (see
+    /// [`crate::review_scope::chunk_parts`]; with a git scope, the files are
+    /// in `git.groups`).
     #[serde(default)]
     pub chunks: Vec<String>,
+    /// Directories the chunks skip (`[review] exclude`), kept so a chunk's
+    /// files derive the same way after a reload.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Absolute workspace root, quoted in the prompts so cited paths are
+    /// relative to it (a live model cited paths from a wrong root).
+    #[serde(default)]
+    pub root: Option<String>,
 }
 
 impl ReviewInputs {
@@ -194,10 +203,18 @@ fn normalize_rel(path: &str) -> String {
     trimmed.replace('\\', "/").trim_end_matches('/').to_string()
 }
 
+/// Workspace-relative form of `path`; the workspace itself (`.`, `./`, its
+/// absolute path) is `.`, which the scope resolver reads as the whole tree.
 fn display_path(root: &Path, path: &Path, raw: &str) -> String {
-    path.strip_prefix(root)
+    let shown = path
+        .strip_prefix(root)
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| normalize_rel(raw))
+        .unwrap_or_else(|_| normalize_rel(raw));
+    if shown.is_empty() {
+        ".".to_string()
+    } else {
+        shown
+    }
 }
 
 /// Case-insensitive lookup of `name` directly inside `dir`.
@@ -453,6 +470,10 @@ pub struct Finding {
     /// (see [`ReviewVerdict::mark_feature_gaps`]).
     #[serde(default)]
     pub feature_gap: bool,
+    /// True for the finding the drive adds itself when the seed command
+    /// fails and the model reports no P0/P1 ([`crate::review_seed`]).
+    #[serde(default)]
+    pub from_verify: bool,
 }
 
 fn default_true() -> bool {
@@ -555,8 +576,12 @@ impl ReviewVerdict {
                         location: parts.next().and_then(optional_cell),
                         verified: true,
                         feature_gap: false,
+                        from_verify: false,
                     };
-                    if !findings.iter().any(|seen| same_finding(seen, &finding)) {
+                    if !findings
+                        .iter()
+                        .any(|seen| duplicate_finding(seen, &finding))
+                    {
                         findings.push(finding);
                     }
                 }
@@ -671,7 +696,7 @@ impl ReviewVerdict {
             if !self
                 .findings
                 .iter()
-                .any(|seen| same_finding(seen, &finding))
+                .any(|seen| duplicate_finding(seen, &finding))
             {
                 self.findings.push(finding);
             }
@@ -749,13 +774,19 @@ fn is_template_row(value: &str) -> bool {
     words.iter().any(|w| w == "COMPLETE") && words.iter().any(|w| w == "INCOMPLETE")
 }
 
-pub use crate::review_citations::{check_citations, fingerprint, restates_item};
-pub(crate) use crate::review_citations::{last_tag_block, same_finding};
-pub use crate::review_prompts::{
-    REVIEW_DEFECTS_FORMAT_BLOCK, REVIEW_FORMAT_BLOCK, REVIEW_FORMAT_HINT, audit_prompt, fix_prompt,
-    format_reask_prompt, reaudit_prompt, transcript_label,
+pub use crate::review_citations::{
+    check_citations, fingerprint, restates_item, same_finding_set, uncited_changes,
 };
-pub use crate::review_scope::{GitScope, GitSource, chunk_label};
+pub(crate) use crate::review_citations::{duplicate_finding, last_tag_block};
+pub use crate::review_git::{GitNumstat, GitScope, GitSource};
+pub use crate::review_prompts::{
+    REVIEW_DEFECTS_FORMAT_BLOCK, REVIEW_FORMAT_BLOCK, REVIEW_FORMAT_HINT, audit_prompt,
+    continuation_prompt, fix_prompt, format_reask_prompt, reaudit_prompt, scope_files_section,
+    transcript_label,
+};
+pub use crate::review_scope::{chunk_label, chunk_parts};
+pub use crate::review_seed::VerifySeed;
+pub use crate::review_settings::{DEFAULT_CHUNK_FILES, ReviewSettings};
 
 #[cfg(test)]
 #[path = "review_tests.rs"]

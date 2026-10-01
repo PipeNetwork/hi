@@ -410,7 +410,10 @@ impl ActivityBlock {
                 deletions,
                 diff,
             } => {
-                let mut s = format!("{} {path} (+{additions} -{deletions})", edit_verb(diff));
+                let mut s = format!("{} {path}", edit_verb(diff));
+                if edit_has_stats(*additions, *deletions, diff) {
+                    s.push_str(&format!(" (+{additions} -{deletions})"));
+                }
                 if !diff.trim().is_empty() {
                     s.push('\n');
                     s.push_str(&strip_ansi(diff));
@@ -485,7 +488,9 @@ impl ActivityBlock {
             } => {
                 spans.push(Span::styled(format!("{} ", edit_verb(diff)), verb_style));
                 spans.push(Span::styled(path.clone(), Style::default().fg(th.path)));
-                spans.extend(edit_stat_spans(*additions, *deletions));
+                if edit_has_stats(*additions, *deletions, diff) {
+                    spans.extend(edit_stat_spans(*additions, *deletions));
+                }
             }
             ActivityKind::Run {
                 command,
@@ -504,6 +509,11 @@ impl ActivityBlock {
                 }
             }
             ActivityKind::Other { verb, detail, .. } => {
+                let verb_style = if verb == FAILED_EDIT_VERB {
+                    verb_style.fg(th.accent_error)
+                } else {
+                    verb_style
+                };
                 spans.push(Span::styled(title_case(verb), verb_style));
                 if !detail.is_empty() {
                     spans.push(Span::styled(
@@ -677,6 +687,44 @@ pub(crate) fn edit_verb(diff: &str) -> &'static str {
         (false, true, false) => "Deleted",
         _ => "Updated",
     }
+}
+
+/// Verb of the row for a file tool that failed and changed nothing.
+pub(crate) const FAILED_EDIT_VERB: &str = "edit failed";
+
+/// The first clause of a failed file tool's error, without the `Error:` and
+/// `editing <path>:` prefixes, for the row header.
+pub(crate) fn failed_edit_reason(result: &str) -> String {
+    const MAX_REASON_CHARS: usize = 80;
+    let first = strip_ansi(result.lines().next().unwrap_or_default());
+    let mut reason = first.trim().strip_prefix("Error:").unwrap_or(&first).trim();
+    while let Some(cause) = ["editing ", "patching ", "writing "]
+        .iter()
+        .find_map(|context| {
+            let (_, cause) = reason.strip_prefix(context)?.split_once(": ")?;
+            Some(cause.trim())
+        })
+    {
+        reason = cause;
+    }
+    let end = [". ", "; "]
+        .iter()
+        .filter_map(|stop| reason.find(stop))
+        .min()
+        .unwrap_or(reason.len());
+    let reason = reason[..end].trim_end_matches('.');
+    if reason.chars().count() <= MAX_REASON_CHARS {
+        reason.to_string()
+    } else {
+        let clipped: String = reason.chars().take(MAX_REASON_CHARS).collect();
+        format!("{}…", clipped.trim_end())
+    }
+}
+
+/// Whether an edit row has real `+N -M` counts. A result with neither a
+/// summary nor diff rows (a binary change) would otherwise read `+0 -0`.
+fn edit_has_stats(additions: u32, deletions: u32, diff: &str) -> bool {
+    additions > 0 || deletions > 0 || !diff.trim().is_empty()
 }
 
 /// ` (+N -M)` with the counts in the diff colours.

@@ -13,20 +13,22 @@ use hi_harness::{
     review_take_all,
 };
 
-/// Coverage complete and no P0/P1 findings.
+/// Coverage complete, every file in scope read, and no P0/P1 findings.
 pub const EXIT_COMPLETE: i32 = 0;
 /// Harness error (request failure) before the loop settled.
 pub const EXIT_HARNESS_ERROR: i32 = 1;
 /// Usage error: an explicit plan/spec path does not exist.
 pub const EXIT_USAGE: i32 = 2;
-/// Loop finished; plan/spec items are partial or missing.
+/// Loop finished; plan/spec items are partial or missing, or files in
+/// scope were left unread (a partial defects-only audit).
 pub const EXIT_INCOMPLETE_COVERAGE: i32 = 3;
 /// Loop finished; P0/P1 findings are still open (audit-only or capped).
 pub const EXIT_OPEN_DEFECTS: i32 = 4;
 /// Loop stopped early: no progress, pass cap, unparseable verdict, turn error.
 pub const EXIT_STOPPED: i32 = 5;
 
-/// Default fix passes when `--spec-review-passes` is not given.
+/// Fix passes when neither `--spec-review-passes` nor `[review] passes`
+/// is given.
 pub const DEFAULT_PASSES: u32 = hi_harness::DEFAULT_REVIEW_PASSES;
 
 /// Nonzero `hi --spec-review` result carried through `anyhow` so `main` can
@@ -94,7 +96,9 @@ fn exit_summary(drive: &ReviewDrive) -> String {
         ),
         EXIT_INCOMPLETE_COVERAGE => {
             let (implemented, total) = drive.coverage_counts();
-            if total == 0 {
+            if let Some(partial) = drive.partial_note() {
+                format!("spec review: {partial}")
+            } else if total == 0 {
                 format!(
                     "spec review: no coverage rows reported for {}",
                     drive.inputs.summary()
@@ -135,7 +139,16 @@ pub fn review_report_json(drive: &ReviewDrive) -> serde_json::Value {
         "residual": verdict.and_then(|v| v.residual.clone()),
         "unverified_citations": drive.unverified_citations,
         "changed_files": drive.all_changed_files,
+        "uncited_changes": drive.uncited_changes,
         "audit_changed_files": drive.audit_changed_files,
+        "read": {
+            "files": drive.read_files,
+            "scope_total": drive.scope_count,
+            "unread": drive.unread_files,
+            "unread_count": drive.unread_count,
+            "partial": drive.is_partial(),
+        },
+        "verify": drive.verify,
         "fix_turn_error": drive.fix_turn_error,
         "stop_reason": drive.stop_reason,
         "summary": drive.status_line(),
@@ -146,15 +159,17 @@ pub fn review_report_json(drive: &ReviewDrive) -> serde_json::Value {
 /// Run the whole audit -> fix -> re-audit loop with `ui`, printing the
 /// summary and the coverage/findings report to stdout at the end. `paths`
 /// are the `--spec-review` values; `all` among them chunks the whole repo.
+/// `max_passes` of `None` is the `[review] passes` setting.
 pub async fn run_headless(
     harness: &mut Harness,
     ui: &mut dyn Ui,
     paths: &[String],
-    max_passes: u32,
+    max_passes: Option<u32>,
     audit_only: bool,
 ) -> Result<ReviewRun> {
     let mut paths = paths.to_vec();
     let all = review_take_all(&mut paths);
+    let max_passes = max_passes.unwrap_or(harness.review_settings().passes);
     let mut prompt = match harness.begin_review(&paths, all, audit_only, max_passes) {
         Ok(prompt) => prompt,
         Err(message) => {
@@ -168,6 +183,12 @@ pub async fn run_headless(
     // The turn itself announces the status line; only the notice is extra.
     if let Some(notice) = &harness.review_drive().inputs.notice {
         eprintln!("spec review: {notice}");
+    }
+    if let Some(command) = harness
+        .review_settings()
+        .seed_command(harness.workspace_root(), harness.verify_command())
+    {
+        eprintln!("spec review: seeding each audit turn from `{command}`");
     }
     let mut turns = 0u32;
     let last_outcome;

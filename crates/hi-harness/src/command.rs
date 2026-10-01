@@ -23,6 +23,9 @@ pub enum Command {
     /// `/review [audit|status|stop] [all|path...]`: spec-coverage audit plus
     /// the bounded fix loop. The raw argument string is parsed by `ReviewArgs`.
     Review(String),
+    /// `/ladder [status|stop|<task>]`: run a task cheap-first and escalate
+    /// the model or effort only when the verify command fails.
+    Ladder(String),
     Diff,
     Files,
     Copy(String),
@@ -38,6 +41,9 @@ pub enum Command {
     Tutorial,
     Usage(String),
     Dashboard,
+    /// Replace this process with the `hi` binary on disk and resume the same
+    /// session, so a rebuild takes effect without leaving the terminal.
+    Reload,
     Quit,
     Unknown(String),
     Removed(String),
@@ -114,6 +120,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "review",
         args: "[audit|status|stop] [all|path...]",
         help: "audit the code against plan.md/spec.md (or recent git work), then fix P0/P1 defects in a bounded loop",
+    },
+    CommandSpec {
+        name: "ladder",
+        args: "[status|stop|<task>]",
+        help: "run a task on the cheapest model/effort rung; retry or climb only when the verify command fails",
     },
     CommandSpec {
         name: "login",
@@ -216,6 +227,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         help: "show hi version",
     },
     CommandSpec {
+        name: "reload",
+        args: "",
+        help: "restart into the hi binary on disk (after a rebuild) and keep this session",
+    },
+    CommandSpec {
         name: "tutorial",
         args: "",
         help: "interactive tour (starts with /login)",
@@ -256,6 +272,7 @@ pub const CORE_COMMANDS: &[&str] = &[
     "yolo",
     "verify",
     "review",
+    "ladder",
     "undo",
     "retry",
     "diff",
@@ -311,6 +328,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "verify" | "test" => Command::Verify(arg),
         "trust" => Command::Trust(arg),
         "review" => Command::Review(arg),
+        "ladder" | "escalate" => Command::Ladder(arg),
         "diff" | "changes" => Command::Diff,
         "files" => Command::Files,
         "copy" | "cp" => Command::Copy(arg),
@@ -325,6 +343,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "mouse" => Command::Mouse(arg),
         "tutorial" => Command::Tutorial,
         "dashboard" | "agents-dashboard" | "fleet" => Command::Dashboard,
+        "reload" | "restart" => Command::Reload,
         "quit" | "exit" | "q" => Command::Quit,
         "goal" | "race" | "rsi" | "workflow" | "pipefs" | "delegate" | "moa" | "team"
         | "diff-lab" | "loop" | "watch" | "mcp" | "local" | "inbox" | "btw" => {
@@ -545,6 +564,9 @@ mod tests {
             Some(Command::AutoHarnessFix("on".into()))
         );
         assert!(COMMANDS.iter().any(|s| s.name == "autoharnessfix"));
+        assert!(COMMANDS.iter().any(|s| s.name == "reload"));
+        assert_eq!(parse("/reload"), Some(Command::Reload));
+        assert_eq!(parse("/restart"), Some(Command::Reload));
         assert!(COMMANDS.iter().any(|s| s.name == "dashboard"));
         assert!(COMMANDS.iter().any(|s| s.name == "fleet"));
         assert!(CORE_COMMANDS.contains(&"dashboard"));
@@ -578,6 +600,26 @@ mod tests {
         );
         assert!(COMMANDS.iter().any(|s| s.name == "review"));
         assert!(CORE_COMMANDS.contains(&"review"));
+    }
+
+    #[test]
+    fn parses_ladder_command_and_keeps_the_task_verbatim() {
+        assert_eq!(parse("/ladder"), Some(Command::Ladder(String::new())));
+        assert_eq!(
+            parse("/ladder status"),
+            Some(Command::Ladder("status".into()))
+        );
+        assert_eq!(parse("/ladder stop"), Some(Command::Ladder("stop".into())));
+        assert_eq!(
+            parse("/ladder  fix the failing parse_port test  "),
+            Some(Command::Ladder("fix the failing parse_port test".into()))
+        );
+        assert_eq!(
+            parse("/escalate make it pass"),
+            Some(Command::Ladder("make it pass".into()))
+        );
+        assert!(COMMANDS.iter().any(|s| s.name == "ladder"));
+        assert!(CORE_COMMANDS.contains(&"ladder"));
     }
 
     #[test]

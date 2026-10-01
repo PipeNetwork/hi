@@ -1,5 +1,6 @@
 //! Rendering helpers for the transcript: markdown → styled [`Line`]s, plain
-//! unified-diff colorization, minimal code highlighting, and text wrapping.
+//! unified-diff colorization, minimal code highlighting, and wrapped-height
+//! measurement (soft-wrapping itself lives in [`crate::wrap`]).
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -923,7 +924,7 @@ fn bullet_text(s: &str) -> Option<&str> {
 }
 
 /// Split a leading `N. ` / `N) ` ordered-list marker into (number, rest).
-fn numbered_text(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn numbered_text(s: &str) -> Option<(&str, &str)> {
     let end = s.find(|c: char| !c.is_ascii_digit())?;
     if end == 0 {
         return None;
@@ -1067,63 +1068,17 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
 }
 
-/// Approximate the number of terminal rows `lines` occupy when wrapped to
-/// `width` — used to keep the transcript scrolled to the bottom.
+/// Wrapped row count for a single line at `width` — used to keep the
+/// transcript scrolled to the bottom and to locate sticky-header positions
+/// without re-measuring the whole transcript. `width == 0` → 1 row.
 ///
 /// Uses ratatui's own `Paragraph::line_count` (the same `WordWrapper` the
 /// render path uses) so the height estimate exactly matches what the user
 /// sees. A previous version counted characters (`ceil(len/width)`), which
 /// undercounted whenever word-boundary wrapping produced extra rows — the
 /// accumulated shortfall made `max_scroll` too small and the bottom of a
-/// long message was clipped off-screen.
-/// Wrapped row count for a single line at `width` (the same `WordWrapper` the
-/// render path uses). `width == 0` → 1 row. Used to locate sticky-header
-/// positions without re-measuring the whole transcript.
-/// Split `line` into display-width chunks so a 200-col terminal does not
-/// stretch assistant prose. Width 0 returns the line unchanged.
-pub(crate) fn wrap_line_to_width(line: &Line<'static>, max_cols: u16) -> Vec<Line<'static>> {
-    if max_cols == 0 {
-        return vec![line.clone()];
-    }
-    let max_cols = max_cols as usize;
-    let used: usize = line
-        .spans
-        .iter()
-        .map(|s| crate::layout::display_width(s.content.as_ref()))
-        .sum();
-    if used <= max_cols {
-        return vec![line.clone()];
-    }
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut width = 0usize;
-    for span in &line.spans {
-        let style = span.style;
-        for ch in span.content.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width + w > max_cols && !current.is_empty() {
-                rows.push(Line::from(std::mem::take(&mut current)));
-                width = 0;
-            }
-            if let Some(last) = current.last_mut()
-                && last.style == style
-            {
-                last.content.to_mut().push(ch);
-            } else {
-                current.push(Span::styled(ch.to_string(), style));
-            }
-            width = width.saturating_add(w);
-        }
-    }
-    if !current.is_empty() {
-        rows.push(Line::from(current));
-    }
-    if rows.is_empty() {
-        rows.push(line.clone());
-    }
-    rows
-}
-
+/// long message was clipped off-screen. Soft-wrapping of prose to the panel
+/// width happens before this in [`crate::wrap`].
 pub(crate) fn wrapped_line_height(line: &Line, width: u16) -> u16 {
     if width == 0 {
         return 1;

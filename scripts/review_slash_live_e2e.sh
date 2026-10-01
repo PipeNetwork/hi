@@ -13,61 +13,35 @@
 #   re-audit -> no open P0/P1; /topic is still missing (reported, never built)
 #   exit 3   -> incomplete coverage, no open defects
 #
-# Credentials (first match wins):
-#   1. PIPENETWORK_API_KEY / HI_API_KEY in the environment
-#   2. The hi client's saved pipenetwork profile in ~/.config/hi
+# Credentials: the saved default profile in the local hi config (its sealed
+# key in the private store), or PIPENETWORK_API_KEY / HI_API_KEY if exported.
+# HI_PROFILE or HI_PROVIDER selects a different route.
 #
 # Budget is sized for audit + fix + re-audit (up to 3 passes):
 #   --max-tokens 16384 · --max-steps 80 · --max-verify-repairs 8
 #   ~25-minute wall clock worst case
 #
 # Optional:
-#   HI_PROFILE (default: `--provider pipenetwork`, which borrows the saved
-#              Pipe credential from whichever profile targets pipenetwork)
+#   HI_PROFILE (default: the saved default profile)
+#   HI_PROVIDER (default: unset; forces a provider and drops the profile key)
 #   HI_MODEL   (default: that profile's model)
 #   HI_BIN     (default: freshly built ./target/debug/hi)
 #   HI_LIVE_E2E_KEEP=1  keep the workdir on failure
 #
 # Exit: 0 pass · 1 fail · 2 skipped (no key).
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.." || exit 1
 
 HI_BIN="${HI_BIN:-$PWD/target/debug/hi}"
 FIXTURE="$PWD/bench/tui-smoke/scenarios/live_review_fix_chat/fixture"
 EXPECTED_EXIT=3
 
-has_pipe_credential() {
-  python3 - <<'PY'
-import json, os
-from pathlib import Path
+# shellcheck source=live_e2e_auth.sh
+source "$SCRIPT_DIR/live_e2e_auth.sh"
 
-def nonempty(name):
-    return bool(os.environ.get(name, "").strip())
-
-if nonempty("PIPENETWORK_API_KEY") or nonempty("HI_API_KEY"):
-    raise SystemExit(0)
-
-auth_path = Path.home() / ".config" / "hi" / "auth.json"
-if not auth_path.is_file():
-    raise SystemExit(1)
-try:
-    data = json.loads(auth_path.read_text())
-except Exception:
-    raise SystemExit(1)
-if not isinstance(data, dict):
-    raise SystemExit(1)
-for key, value in data.items():
-    if "pipenetwork" not in str(key):
-        continue
-    access = value.get("access", "") if isinstance(value, dict) else ""
-    if str(access).strip():
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-if ! has_pipe_credential; then
-  echo "SKIP: no pipenetwork credential (set PIPENETWORK_API_KEY / HI_API_KEY, or save one with hi auth pipenetwork / the default pipenetwork profile)" >&2
+if ! has_saved_hi_credential; then
+  echo "SKIP: no saved hi credential (configure a profile with hi auth / hi login, or set PIPENETWORK_API_KEY / HI_API_KEY)" >&2
   exit 2
 fi
 if [[ ! -d "$FIXTURE" ]]; then
@@ -160,20 +134,11 @@ HI_ARGS=(
   --spec-review-passes 3
   --spec-review
 )
-if [[ -n "${HI_PROFILE:-}" ]]; then
-  HI_ARGS=(--profile "$HI_PROFILE" "${HI_ARGS[@]}")
-else
-  HI_ARGS=(--provider pipenetwork "${HI_ARGS[@]}")
-fi
+apply_live_route
 if [[ -n "${HI_MODEL:-}" ]]; then
   HI_ARGS=(--model "$HI_MODEL" "${HI_ARGS[@]}")
 fi
-if [[ -n "${PIPENETWORK_API_KEY:-${HI_API_KEY:-}}" ]]; then
-  credential=env
-else
-  credential=hi-client-auth-store
-fi
-echo "== /review live e2e: credential=$credential route=${HI_PROFILE:+profile $HI_PROFILE}${HI_PROFILE:-provider pipenetwork} model=${HI_MODEL:-profile} workdir=$WD/repo ==" >&2
+echo "== /review live e2e: credential=$(live_credential_label) route=$(live_route_label) model=${HI_MODEL:-profile} workdir=$WD/repo ==" >&2
 
 set +e
 ( cd "$WD/repo" && \

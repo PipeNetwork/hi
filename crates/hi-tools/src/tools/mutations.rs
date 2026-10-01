@@ -17,6 +17,10 @@ use super::parse;
 #[path = "mutation_noop_tests.rs"]
 mod noop_tests;
 
+#[cfg(test)]
+#[path = "mutation_preview_tests.rs"]
+mod preview_tests;
+
 /// A completely parsed and materialized file-tool invocation.
 ///
 /// The contained [`MutationPlan`] owns the exact postimages shown by
@@ -89,7 +93,7 @@ pub async fn prepare_mutation_in_with_state(
             refuse_internal_elision_placeholder(&args.content)?;
             let target = crate::transaction::resolve_workspace_target(root, Path::new(&args.path))?;
             refuse_large_write_overwrite(&target, &args.path)?;
-            refuse_snippet_write_overwrite(&target, &args.path, args.content.len())?;
+            refuse_snippet_write_overwrite(&target, &args.path, &args.content)?;
             let recorded = crate::transaction::workspace_display_path(root, &target);
             let after = args.content;
             crate::read::refuse_oversized_text(&args.path, after.len())?;
@@ -101,6 +105,12 @@ pub async fn prepare_mutation_in_with_state(
                     after.as_bytes().to_vec(),
                 )],
             )?;
+            refuse_noop(&plan, || {
+                format!(
+                    "no change: this content is already in this file, so `{recorded}` would stay \
+                     byte-for-byte identical. Nothing was written; do not write it again. {NOOP_NEXT}"
+                )
+            })?;
             Ok(PreparedMutation {
                 plan,
                 kind: PreparedMutationKind::Write {
@@ -134,6 +144,14 @@ pub async fn prepare_mutation_in_with_state(
                     after.as_bytes().to_vec(),
                 )],
             )?;
+            refuse_noop(&plan, || {
+                format!(
+                    "no change: your new_string is already in this file. It matches the text it \
+                     would replace except for whitespace or line endings, which edit normalizes, \
+                     so `{recorded}` would stay byte-for-byte identical. Nothing was written; do \
+                     not retry this edit. {NOOP_NEXT}"
+                )
+            })?;
             Ok(PreparedMutation {
                 plan,
                 kind: PreparedMutationKind::Edit {
@@ -174,6 +192,13 @@ pub async fn prepare_mutation_in_with_state(
                     after.as_bytes().to_vec(),
                 )],
             )?;
+            refuse_noop(&plan, || {
+                format!(
+                    "no change: the text these edits produce is already in this file, so \
+                     `{recorded}` would stay byte-for-byte identical. Nothing was written; do not \
+                     retry them. {NOOP_NEXT}"
+                )
+            })?;
             Ok(PreparedMutation {
                 plan,
                 kind: PreparedMutationKind::MultiEdit {
@@ -199,6 +224,13 @@ pub async fn prepare_mutation_in_with_state(
             }
             let (plan, summary) =
                 plan_multi_patch_with_disk_retry(root, state_root, &args.patch).await?;
+            refuse_noop(&plan, || {
+                format!(
+                    "no change: what this patch adds is already in this file, so every file it \
+                     names would stay byte-for-byte identical. Nothing was written; do not retry \
+                     it. {NOOP_NEXT}"
+                )
+            })?;
             Ok(PreparedMutation {
                 plan,
                 kind: PreparedMutationKind::ApplyPatch { summary },
@@ -214,6 +246,21 @@ const MAX_MULTI_EDITS: usize = 64;
 /// Cap on an `apply_patch` payload. Stream ingestion already stops at 4 MiB;
 /// this is a tighter, earlier refuse so we never materialize a giant plan.
 const MAX_PATCH_BYTES: usize = 1024 * 1024;
+
+/// What to do after a refused no-op mutation.
+const NOOP_NEXT: &str = "If the active plan step needs nothing else, call update_plan: mark it \
+                         done and set the next unfinished step active.";
+
+/// Refuse a mutation that would leave every target byte-for-byte unchanged.
+/// Committing it would report `Edited`/`Wrote` for a file nothing touched.
+/// Each message must say "already in this file": the harness keys its
+/// already-done credit for the active plan step on that phrase.
+fn refuse_noop(plan: &MutationPlan, message: impl FnOnce() -> String) -> Result<()> {
+    if plan.is_noop() {
+        bail!("{}", message());
+    }
+    Ok(())
+}
 
 /// Compaction replaces old, bulky tool arguments with this internal marker.
 /// It is context metadata, never valid replacement file content. A model can
@@ -258,18 +305,35 @@ fn refuse_large_write_overwrite(target: &Path, display_path: &str) -> Result<()>
 /// `content`). Refuse when the new body is much smaller than the file.
 const SNIPPET_WRITE_EXISTING_MIN_BYTES: u64 = 512;
 
-fn refuse_snippet_write_overwrite(target: &Path, display_path: &str, new_len: usize) -> Result<()> {
+fn refuse_snippet_write_overwrite(target: &Path, display_path: &str, new_body: &str) -> Result<()> {
     if !target.is_file() {
         return Ok(());
     }
     let existing = std::fs::metadata(target)
         .with_context(|| format!("statting existing file {display_path}"))?
         .len();
+    let new_len = new_body.len();
     if existing <= SNIPPET_WRITE_EXISTING_MIN_BYTES {
         return Ok(());
     }
     if (new_len as u64).saturating_mul(2) >= existing {
         return Ok(());
+    }
+    // A lookup model often `write`s the snippet it just read (pipe-wallet:
+    // `DEFAULT_DIR` over `wallet.rs`). "use edit" made that model delete the
+    // next line and put it back. When the snippet is already in the file,
+    // the next step is an answer, not another mutation.
+    if let Ok(text) = std::fs::read_to_string(target)
+        && crate::mutation_repeat::new_string_already_present(&text, new_body)
+    {
+        bail!(
+            "refusing to overwrite existing `{display_path}` ({existing} bytes) with a much \
+             smaller `write` ({new_len} bytes): this content is already in this file. Nothing \
+             was written. Do not retry this write and do not change the file to restate the \
+             same text. Answer the user from the text already in the file. If a plan step is \
+             open and this text finishes it, call update_plan: mark that step done and set the \
+             next unfinished step active. `write` is for creates and full-file replacements."
+        );
     }
     bail!(
         "refusing to overwrite existing `{display_path}` ({existing} bytes) with a much smaller \
@@ -303,12 +367,11 @@ async fn apply_edit_with_disk_retry(
             tokio::task::yield_now().await;
             let refreshed = crate::read::read_text_file(&path_str).await?;
             if refreshed == before {
-                return Err(first).with_context(|| format!("editing {display_path}"));
+                return Err(first);
             }
             let after = apply_edit(&refreshed, old, new, replace_all).with_context(|| {
                 format!(
-                    "editing {display_path} (retried after on-disk change; \
-                     original miss: {first:#})"
+                    "retried after an on-disk change to {display_path}; original miss: {first:#}"
                 )
             })?;
             let replacements = if replace_all {
@@ -318,7 +381,7 @@ async fn apply_edit_with_disk_retry(
             };
             Ok((refreshed, after, replacements))
         }
-        Err(err) => Err(err).with_context(|| format!("editing {display_path}")),
+        Err(err) => Err(err),
     }
 }
 
@@ -491,7 +554,7 @@ pub(super) async fn run_prepared_mutation(
             if let Ok(mut cache) = read_cache.lock() {
                 cache.clear();
             }
-            ToolOutcome::plain(summary)
+            ToolOutcome::shown(summary, display)
         }
     };
     outcome.effects = mutation_effects(changes);

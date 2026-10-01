@@ -576,7 +576,11 @@ impl crate::App {
                     }
                 }
             }
-            UiEvent::ToolResult { name, result } => {
+            UiEvent::ToolResult {
+                name,
+                result,
+                failed,
+            } => {
                 self.event_log
                     .push(format!("tool_result {} chars", result.len()));
                 self.last_turn_event = Some(TurnEventKind::ToolResult);
@@ -588,7 +592,11 @@ impl crate::App {
                 let label = self.current_tool.take().unwrap_or_else(|| name.clone());
                 self.current_tool_started = None;
                 self.flush_pending();
-                self.push_result(&name, &result, &label);
+                if failed && activity_feed::is_edit_tool(&name) {
+                    self.push_failed_edit(&result, &label);
+                } else {
+                    self.push_result(&name, &result, &label);
+                }
             }
             UiEvent::ToolStream { name, line } => {
                 if self.append_live_run_output(&line) {
@@ -976,6 +984,27 @@ impl crate::App {
             verb,
             detail,
             body: display_result,
+        });
+    }
+
+    /// A file tool that failed changed nothing: say so, with the reason, and
+    /// keep the full error folded underneath.
+    pub(crate) fn push_failed_edit(&mut self, result: &str, label: &str) {
+        self.freeze_verb_group();
+        let root = self.workspace_root.clone();
+        let path = label_detail(label)
+            .filter(|path| !path.is_empty())
+            .map(|path| activity_feed::relative_edit_path(&path, &root));
+        let reason = activity_feed::failed_edit_reason(result);
+        let detail = match (path, reason.is_empty()) {
+            (Some(path), false) => format!("{path} · {reason}"),
+            (Some(path), true) => path,
+            (None, _) => reason,
+        };
+        self.push_activity(ActivityKind::Other {
+            verb: activity_feed::FAILED_EDIT_VERB.into(),
+            detail,
+            body: result.to_string(),
         });
     }
 

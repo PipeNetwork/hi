@@ -177,6 +177,16 @@ impl Publisher {
 
     pub fn reset_turn_tools(&self) {
         self.finish_turn_tools(false);
+        // A report-only storm must not stick into the next turn. The harness
+        // stops on that invariant, so leaving it set makes every later tool
+        // call end the turn immediately.
+        let mut g = self.lock();
+        if g.invariant
+            .as_ref()
+            .is_some_and(|inv| inv.code == InvariantCode::IdenticalToolStorm)
+        {
+            g.invariant = None;
+        }
     }
 
     pub fn finish_turn_tools(&self, report_unclosed: bool) {

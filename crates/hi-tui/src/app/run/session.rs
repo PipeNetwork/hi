@@ -68,14 +68,19 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
     let _ = execute!(io::stdout(), EnableBracketedPaste);
     let _ = execute!(io::stdout(), EnableFocusChange);
-    // Grok reports the mouse so click-to-expand (`›` rows) and wheel scroll
-    // work. `/mouse off` turns this back into native terminal selection.
-    let _ = execute!(io::stdout(), EnableMouseCapture);
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
     let mut on_pipenetwork_login = options.on_pipenetwork_login;
     let mut app = App::new(&options.provider, &options.model);
+    // Capturing the mouse swallows the local terminal's highlight. Only do
+    // that when a drag inside hi can land on a clipboard the browser reads.
+    // Otherwise force tracking off — a previous session may have left it on.
+    if app.mouse_capture {
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+    } else {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
     app.session_lister = options.list_sessions;
     app.workspace_root = harness.workspace_root().to_path_buf();
     app.api_key = harness.api_key().to_string();
@@ -115,8 +120,7 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         }
     } else {
         super::hydrate::hydrate_transcript(&mut app, harness.messages());
-        app.plan = harness.current_plan().to_vec();
-        app.plan_drive_paused = harness.plan_drive().paused;
+        sync_plan_drive_chrome(&mut app, harness);
         app.push(Line::styled(
             format!(
                 "resumed {} message(s) · {} — /help for commands",
@@ -139,6 +143,12 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
             app.suggested_prompt = Some(hi_harness::CONTINUE_PLAN_PROMPT.to_string());
         }
     }
+    if !app.mouse_capture {
+        app.push(Line::styled(
+            "highlight to copy — Ctrl-Shift-C or right-click, then paste. /mouse on for wheel and › clicks",
+            dim(),
+        ));
+    }
     let mut startup_prompt = options.startup_prompt;
     let mut resume_incomplete = options.resume_incomplete;
 
@@ -152,11 +162,19 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
         }
     });
     let mut ticker = tokio::time::interval(TICK);
+    let mut build_watch = crate::autoharnessfix::BuildWatch::new();
 
     loop {
         terminal.draw(|frame| app.render(frame))?;
         if app.exit_requested {
             break;
+        }
+        if build_watch.newer_build_on_disk() {
+            app.push(Line::styled(
+                "a newer hi build is on disk (rebuilt after this session started) — /reload switches to it and keeps this session",
+                Style::default().fg(crate::theme::theme().warning),
+            ));
+            app.follow();
         }
         if resume_incomplete || app.resume_incomplete_requested {
             resume_incomplete = false;
@@ -172,7 +190,7 @@ pub async fn run_session(harness: &mut Harness, options: SessionOptions) -> Resu
                 true,
             )
             .await?;
-            super::review_cmd::chain(
+            super::ladder_cmd::chain_after_turn(
                 &mut terminal,
                 &mut input_rx,
                 &mut ticker,
@@ -274,6 +292,10 @@ async fn handle_idle_event(
                 return Ok(None);
             }
             if matches!(key.code, KeyCode::Char('c')) && ctrl {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.copy_shortcut();
+                    return Ok(None);
+                }
                 app.exit_requested = true;
                 return Ok(None);
             }
@@ -355,6 +377,9 @@ async fn handle_command(
         }
         Command::AutoHarnessFix(arg) => {
             return crate::autoharnessfix::handle(app, harness, &arg, ahf, restore, termios);
+        }
+        Command::Reload => {
+            return crate::autoharnessfix::reload(app, harness, restore, termios);
         }
         Command::Login(arg) => start_pipenetwork_login(app, harness, &arg, on_login).await?,
         Command::Logout(arg) => logout_pipenetwork(app, harness, &arg),
@@ -464,6 +489,7 @@ async fn handle_command(
             app.push(Line::styled(message, dim()));
         }
         Command::Review(arg) => return Ok(super::review_cmd::handle(app, harness, &arg)),
+        Command::Ladder(arg) => return Ok(super::ladder_cmd::handle(app, harness, &arg).await),
         Command::Compact(arg) => {
             app.push(Line::styled("compacting conversation…", dim()));
             let mut ui = hi_harness::TestUi::default();
@@ -602,15 +628,20 @@ pub(super) fn apply_model(
 ) {
     let id = resolve_model_query(query, &app.model_ids);
     live.set_model(id);
-    app.model = live.model();
-    if let Some(served) = app.served.get(&app.model) {
-        app.usage_pricing = served.price;
-        app.context_window = served.context_window;
-    }
+    show_model(app, live.model());
     if let Some(effort) = effort {
         apply_effort(app, live, effort);
     }
     app.push(Line::styled(model_status(live), dim()));
+}
+
+/// Point the status bar, cost chip, and context gauge at `model`.
+pub(super) fn show_model(app: &mut App, model: String) {
+    app.model = model;
+    if let Some(served) = app.served.get(&app.model) {
+        app.usage_pricing = served.price;
+        app.context_window = served.context_window;
+    }
 }
 
 fn apply_effort(app: &mut App, live: &LiveSettings, effort: EffortArg) {
@@ -959,6 +990,10 @@ fn handle_running_key(
         *pending_confirm = Some(pending);
     }
     if matches!(key.code, KeyCode::Char('c')) && ctrl {
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            app.copy_shortcut();
+            return;
+        }
         cancel.cancel();
         if let Some(flag) = app.interrupt.as_ref() {
             flag.store(true, std::sync::atomic::Ordering::Release);
@@ -1039,6 +1074,7 @@ fn apply_running_line(
                 "spec review: Esc pauses the running turn; then /review resumes or /review stop ends it",
                 dim(),
             )),
+            Command::Ladder(arg) => super::ladder_cmd::running_reply(app, &arg),
             Command::Usage(arg) => apply_usage_command(app, None, &arg),
             Command::Dashboard => {
                 if let Err(err) = crate::dashboard::open_from_app(app) {
@@ -1068,7 +1104,7 @@ fn apply_running_line(
     ));
 }
 
-fn apply_running_model(app: &mut App, live: &LiveSettings, arg: &str) {
+pub(super) fn apply_running_model(app: &mut App, live: &LiveSettings, arg: &str) {
     let parsed = parse_model_args(arg);
     if parsed.model.is_none() && parsed.effort.is_none() {
         app.push(Line::styled(
@@ -1076,6 +1112,13 @@ fn apply_running_model(app: &mut App, live: &LiveSettings, arg: &str) {
                 "{} — type /model <id> [effort] while a turn is running",
                 model_status(live)
             ),
+            dim(),
+        ));
+        return;
+    }
+    if parsed.model.is_some() && app.ladder_status.is_some() {
+        app.push(Line::styled(
+            "ladder: it picks each attempt's model and restores yours when it ends · Esc ends the ladder, then /model",
             dim(),
         ));
         return;
@@ -1242,6 +1285,14 @@ fn logout_pipenetwork(app: &mut App, harness: &mut Harness, arg: &str) {
     app.follow();
 }
 
+/// Chrome reads `app.plan_drive_paused` on every frame. Sync it whenever the
+/// harness drive starts, continues, or pauses so "paused" cannot linger
+/// through a live continue turn.
+fn sync_plan_drive_chrome(app: &mut App, harness: &Harness) {
+    app.plan = harness.current_plan().to_vec();
+    app.plan_drive_paused = harness.plan_drive().paused;
+}
+
 #[allow(clippy::too_many_arguments)] // slash handler needs the live Restore so exec can drop it
 async fn run_prompt(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -1255,22 +1306,83 @@ async fn run_prompt(
     restore: &mut Option<Restore>,
     termios: Option<&libc::termios>,
 ) -> Result<()> {
-    let outcome = run_turn(terminal, input_rx, ticker, app, harness, prompt, false).await?;
+    harness.resume_plan_drive_on_input();
+    sync_plan_drive_chrome(app, harness);
+    let mut mark = harness.plan_drive_mark();
+    let mut last = run_turn(terminal, input_rx, ticker, app, harness, prompt, false).await?;
     // Spec-review chaining: audit -> fix -> re-audit until the drive is done,
-    // stopped, or paused by Esc. Queued prompts run after the loop.
-    super::review_cmd::chain(terminal, input_rx, ticker, app, harness, outcome).await?;
-    while let Some(next) = app.queue.pop_front() {
-        app.clamp_queue_selection();
-        if let Some(command) = parse_command(&next) {
-            if let Some(prompt) =
-                handle_command(app, harness, command, on_login, ahf, restore, termios).await?
-            {
-                run_turn(terminal, input_rx, ticker, app, harness, &prompt, false).await?;
+    // stopped, or paused by Esc; then ladder attempts until the check settles.
+    // Queued prompts run after the loop, then the plan drive continues an
+    // open plan until it finishes or pauses itself.
+    super::ladder_cmd::chain_after_turn(terminal, input_rx, ticker, app, harness, last.clone())
+        .await?;
+    let mut driven = 0u32;
+    loop {
+        while let Some(next) = app.queue.pop_front() {
+            app.clamp_queue_selection();
+            if let Some(command) = parse_command(&next) {
+                if let Some(prompt) =
+                    handle_command(app, harness, command, on_login, ahf, restore, termios).await?
+                {
+                    mark = harness.plan_drive_mark();
+                    last =
+                        run_turn(terminal, input_rx, ticker, app, harness, &prompt, false).await?;
+                    super::ladder_cmd::chain_after_turn(
+                        terminal,
+                        input_rx,
+                        ticker,
+                        app,
+                        harness,
+                        last.clone(),
+                    )
+                    .await?;
+                }
+            } else {
+                harness.resume_plan_drive_on_input();
+                sync_plan_drive_chrome(app, harness);
+                mark = harness.plan_drive_mark();
+                last = run_turn(terminal, input_rx, ticker, app, harness, &next, false).await?;
             }
-        } else {
-            run_turn(terminal, input_rx, ticker, app, harness, &next, false).await?;
+        }
+        match harness.plan_drive_after_turn(mark, last.as_ref(), driven) {
+            hi_harness::DriveStep::Continue(next) => {
+                driven += 1;
+                let (done, total) = harness.plan_progress();
+                app.push(Line::styled(
+                    format!("plan drive: continuing the open plan ({done}/{total} steps done)"),
+                    dim(),
+                ));
+                app.follow();
+                mark = harness.plan_drive_mark();
+                last = run_turn(terminal, input_rx, ticker, app, harness, &next, false).await?;
+                super::ladder_cmd::chain_after_turn(
+                    terminal,
+                    input_rx,
+                    ticker,
+                    app,
+                    harness,
+                    last.clone(),
+                )
+                .await?;
+            }
+            hi_harness::DriveStep::Paused(reason) => {
+                sync_plan_drive_chrome(app, harness);
+                app.push(Line::styled(
+                    format!(
+                        "plan drive paused: {reason}. Type a prompt, or accept \"{}\", to resume.",
+                        hi_harness::CONTINUE_PLAN_PROMPT
+                    ),
+                    dim(),
+                ));
+                app.suggested_prompt = Some(hi_harness::CONTINUE_PLAN_PROMPT.to_string());
+                app.suggested_prompt_dismissed = false;
+                app.follow();
+                break;
+            }
+            hi_harness::DriveStep::Idle => break,
         }
     }
+    sync_plan_drive_chrome(app, harness);
     Ok(())
 }
 
@@ -1283,6 +1395,7 @@ pub(super) async fn run_turn(
     prompt: &str,
     resume: bool,
 ) -> Result<Option<hi_harness::TurnOutcome>> {
+    sync_plan_drive_chrome(app, harness);
     if resume {
         app.last_prompt = harness
             .messages()
@@ -1398,7 +1511,7 @@ pub(super) async fn run_turn(
     app.set_working(false);
     app.interrupt = None;
     harness.persist_live_knobs();
-    app.plan = harness.current_plan().to_vec();
+    sync_plan_drive_chrome(app, harness);
     app.last_changed_files = harness.last_changed_files().to_vec();
     Ok(outcome)
 }

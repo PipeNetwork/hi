@@ -394,6 +394,9 @@ impl Harness {
     }
 
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        if let Some(effort) = self.ladder_reasoning_effort() {
+            return effort;
+        }
         if self.live.effort_pinned() {
             return self.live.reasoning_effort();
         }
@@ -410,7 +413,7 @@ impl Harness {
         resume: bool,
         input: &str,
     ) -> Option<tokio::task::JoinHandle<Option<f64>>> {
-        if resume || self.live.effort_pinned() || !self.typesafe.effort_enabled() {
+        if resume || self.effort_fixed() || !self.typesafe.effort_enabled() {
             return None;
         }
         let client = self.typesafe.client()?;

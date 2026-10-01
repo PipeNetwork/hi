@@ -7,6 +7,9 @@
 use crate::review::{CoverageState, Finding, GitSource, ReviewVerdict};
 use crate::review_drive::{ReviewDrive, ReviewPhase};
 
+/// Unread files named in the report line before `(+N more)`.
+const UNREAD_SHOWN: usize = 12;
+
 impl ReviewDrive {
     /// Blocking findings still open per the last verdict.
     pub fn open_blocking(&self) -> Vec<Finding> {
@@ -30,17 +33,51 @@ impl ReviewDrive {
         (implemented, rows.len())
     }
 
-    /// True when the last verdict exists and has no partial/missing rows.
-    /// With no rows at all there was nothing to cover unless a real
-    /// plan/spec was among the inputs (then the model skipped its items).
+    /// True when the last verdict exists, has no partial/missing rows, and
+    /// the audit is not partial. With no rows at all there was nothing to
+    /// cover unless a real plan/spec was among the inputs (then the model
+    /// skipped its items).
     pub fn coverage_complete(&self) -> bool {
         self.last_verdict.as_ref().is_some_and(|verdict| {
-            if verdict.coverage.is_empty() {
+            let rows = if verdict.coverage.is_empty() {
                 !self.inputs.has_spec()
             } else {
                 verdict.coverage_complete()
-            }
+            };
+            rows && !self.is_partial()
         })
+    }
+
+    /// A defects-only audit that left files in scope unread after its
+    /// continuation turns judged only what it read: "no P0/P1" then means
+    /// "none in the files read", so the audit is partial, not complete. A
+    /// spec audit reads what grounds its items; unread files are shown for
+    /// it but do not make it partial.
+    pub fn is_partial(&self) -> bool {
+        self.inputs.defects_only() && self.unread_count > 0
+    }
+
+    /// `read 11/62 files in scope` once files were tracked; `None` when the
+    /// scope was unbounded (a spec audit of the whole tree).
+    pub fn read_coverage(&self) -> Option<String> {
+        if self.scope_count == 0 {
+            return None;
+        }
+        let read = self.scope_count.saturating_sub(self.unread_count);
+        Some(format!("read {read}/{} files in scope", self.scope_count))
+    }
+
+    /// `partial audit: read 11/62 files in scope; 51 unread` when the audit
+    /// is partial ([`Self::is_partial`]).
+    pub fn partial_note(&self) -> Option<String> {
+        if !self.is_partial() {
+            return None;
+        }
+        Some(format!(
+            "partial audit: {}; {} unread",
+            self.read_coverage().unwrap_or_default(),
+            self.unread_count
+        ))
     }
 
     /// What the user should do now, once the loop has ended. `None` when it
@@ -56,6 +93,13 @@ impl ReviewDrive {
                     "next: {open} P0/P1 finding(s) are still open (above); fix them, then `/review` again"
                 )
             });
+        }
+        if self.is_partial() {
+            return Some(format!(
+                "next: the audit is partial ({} file(s) in scope were never read); `/review audit <dir>` audits one \
+directory in smaller turns, or set `[review] chunk_files` lower",
+                self.unread_count
+            ));
         }
         if !self.inputs.has_spec() {
             let mut wider = "";
@@ -119,7 +163,17 @@ impl ReviewDrive {
         } else {
             "no P0/P1 defects".to_string()
         };
-        let mut text = format!("spec review complete: {coverage} · {defects}");
+        let head = if self.is_partial() {
+            "spec review partial"
+        } else {
+            "spec review complete"
+        };
+        let mut text = format!("{head}: {coverage} · {defects}");
+        if let Some(note) = self.partial_note() {
+            text.push_str(&format!(" · {note}"));
+        } else if let Some(read) = self.read_coverage() {
+            text.push_str(&format!(" · {read}"));
+        }
         let gaps = self
             .last_verdict
             .as_ref()
@@ -132,6 +186,13 @@ impl ReviewDrive {
         }
         if minor > 0 {
             text.push_str(&format!(" · {minor} P2/P3 reported"));
+        }
+        if self
+            .last_verdict
+            .as_ref()
+            .is_some_and(|verdict| verdict.findings.iter().any(|f| f.from_verify))
+        {
+            text.push_str(" · 1 P1 seeded from the failing verify command");
         }
         text
     }
@@ -183,6 +244,11 @@ impl ReviewDrive {
                 if finding.feature_gap {
                     flags.push_str(" (unchecked plan item: reported, not fixed)");
                 }
+                if finding.from_verify {
+                    flags.push_str(
+                        " (seeded: the verify command fails and the model reported no defect)",
+                    );
+                }
                 if !finding.verified {
                     flags.push_str(" (cited file not found)");
                 }
@@ -194,6 +260,39 @@ impl ReviewDrive {
         }
         if let Some(note) = verdict.verdict_note() {
             lines.push(format!("note: {note}"));
+        }
+        if let Some(seed) = &self.verify {
+            lines.push(format!("verify: {}", seed.summary()));
+        }
+        if let Some(read) = self.read_coverage() {
+            if self.unread_count > 0 {
+                let mut unread = self
+                    .unread_files
+                    .iter()
+                    .take(UNREAD_SHOWN)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if self.unread_count > UNREAD_SHOWN {
+                    unread.push_str(&format!(" (+{} more)", self.unread_count - UNREAD_SHOWN));
+                }
+                if self.is_partial() {
+                    lines.push(format!(
+                        "{read}; unread after {} continuation turn(s) per chunk: {unread}",
+                        crate::review_drive::MAX_CONTINUATIONS
+                    ));
+                } else {
+                    lines.push(format!("{read}; unread: {unread}"));
+                }
+            } else {
+                lines.push(read);
+            }
+        }
+        if !self.uncited_changes.is_empty() {
+            lines.push(format!(
+                "warning: a fix pass changed files no finding cited (the re-audit was pointed at them): {}",
+                self.uncited_changes.join(", ")
+            ));
         }
         if !self.audit_changed_files.is_empty() {
             lines.push(format!(

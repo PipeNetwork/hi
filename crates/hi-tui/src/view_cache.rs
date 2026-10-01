@@ -29,6 +29,8 @@ pub(crate) struct TranscriptViewCache {
     pub subagent_tick: u64,
 
     pub lines: Vec<ratatui::text::Line<'static>>,
+    /// How each of `lines` joins the one above it when copied as text.
+    pub joins: Vec<crate::wrap::RowJoin>,
     /// `prefix[i]` = wrapped rows above flattened line `i`; `prefix[len]` = total.
     pub prefix: Vec<u32>,
     pub prompt_line_starts: Vec<usize>,
@@ -39,6 +41,10 @@ pub(crate) struct TranscriptViewCache {
     pub committed_entries: usize,
     /// Flattened line count corresponding to `committed_entries` (no pending).
     pub committed_flat_lines: usize,
+    /// Flattened line where the last committed entry, with any separator
+    /// before it, starts. Streamed lines grow the open assistant message in
+    /// place, so the incremental path flattens that entry again.
+    pub last_entry_start: usize,
 }
 
 /// The inputs that determine cached transcript geometry. Scroll position is

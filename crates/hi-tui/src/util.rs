@@ -143,23 +143,175 @@ pub(crate) fn notify_done() {
     let _ = out.flush();
 }
 
-/// Copy `text` to the system clipboard. Tries a local OS clipboard tool first
-/// (the most reliable path, independent of terminal escape support), then always
-/// also emits OSC 52 so remote/SSH sessions and OSC-52-capable terminals still
-/// get it. Succeeds if either path did — notably fixing terminals like macOS
-/// Terminal.app that silently ignore OSC 52.
+/// Whether this process can hand text to a clipboard on the machine the
+/// user is sitting at. Over SSH with no X11 or Wayland forwarding there is
+/// nothing here to paste from; the local terminal's own highlight is the
+/// clipboard, and capturing the mouse takes that highlight away.
+pub(crate) fn host_clipboard_available() -> bool {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        host_clipboard_from(
+            std::env::var("DISPLAY").ok().as_deref(),
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        )
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    {
+        true
+    }
+}
+
+pub(crate) fn host_clipboard_from(display: Option<&str>, wayland: Option<&str>) -> bool {
+    fn present(value: Option<&str>) -> bool {
+        value.is_some_and(|text| !text.is_empty())
+    }
+    present(display) || present(wayland)
+}
+
+/// Copy `text` to the system clipboard a browser can paste.
+///
+/// The in-process clipboard (X11 / Wayland / the OS pasteboard) is what
+/// Ctrl-V and middle-click read. External tools are the fallback when that
+/// connection is missing. OSC 52 still goes out so an SSH session can land
+/// on the local clipboard when the terminal honors it. Succeeds if any path
+/// did.
 pub(crate) fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    let native = copy_native(text);
+    let owned = copy_arboard(text).or_else(|_| copy_native(text));
     let osc = copy_osc52(text);
-    // Prefer reporting the native result; fall back to the OSC 52 write status.
-    native.or(osc)
+    owned.or(osc)
+}
+
+/// OSC 52 payload. `ST` (`ESC \`) is the terminator xterm.js-based terminals
+/// accept; BEL is dropped by some of them. Inside tmux the sequence has to be
+/// wrapped in a DCS passthrough or tmux eats it.
+fn osc52_sequence(text: &str, tmux: bool) -> String {
+    let encoded = base64_encode(text.as_bytes());
+    let osc = format!("\x1b]52;c;{encoded}\x1b\\");
+    if tmux {
+        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
+    } else {
+        osc
+    }
 }
 
 fn copy_osc52(text: &str) -> io::Result<()> {
-    let encoded = base64_encode(text.as_bytes());
+    let payload = osc52_sequence(text, std::env::var_os("TMUX").is_some());
+    write_terminal(payload.as_bytes())
+}
+
+/// Write terminal bytes. A live TUI writes `/dev/tty` so the sequence is not
+/// split across the draw buffer. Tests and piped stdout stay on `stdout`,
+/// which the harness captures.
+fn write_terminal(bytes: &[u8]) -> io::Result<()> {
+    use std::io::IsTerminal;
+    if io::stdout().is_terminal()
+        && let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty")
+    {
+        tty.write_all(bytes)?;
+        return tty.flush();
+    }
     let mut out = io::stdout().lock();
-    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.write_all(bytes)?;
     out.flush()
+}
+
+fn clip_err(err: impl std::fmt::Display) -> io::Error {
+    io::Error::other(err.to_string())
+}
+
+/// One clipboard connection for the process. On Linux the app that last wrote
+/// the clipboard has to stay alive and answer paste requests; dropping the
+/// handle makes a later paste into a browser come back empty.
+fn clipboard_slot() -> &'static std::sync::Mutex<Option<arboard::Clipboard>> {
+    use std::sync::{Mutex, OnceLock};
+    static CLIP: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+    CLIP.get_or_init(|| Mutex::new(None))
+}
+
+fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> io::Result<T>) -> io::Result<T> {
+    let mut guard = clipboard_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(arboard::Clipboard::new().map_err(clip_err)?);
+    }
+    let Some(ctx) = guard.as_mut() else {
+        return Err(io::Error::other("clipboard unavailable"));
+    };
+    f(ctx)
+}
+
+fn reset_clipboard() {
+    if let Ok(mut guard) = clipboard_slot().lock() {
+        *guard = None;
+    }
+}
+
+fn copy_arboard(text: &str) -> io::Result<()> {
+    if copy_arboard_once(text).is_ok() {
+        return Ok(());
+    }
+    // A dead display connection (session restart) fails once; reconnect.
+    reset_clipboard();
+    copy_arboard_once(text)
+}
+
+fn copy_arboard_once(text: &str) -> io::Result<()> {
+    with_clipboard(|ctx| {
+        ctx.set_text(text).map_err(clip_err)?;
+        set_primary(ctx, text);
+        Ok(())
+    })
+}
+
+fn set_primary(ctx: &mut arboard::Clipboard, text: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        use arboard::{LinuxClipboardKind, SetExtLinux};
+        // Middle-click paste reads PRIMARY. Some Wayland compositors have no
+        // primary selection; CLIPBOARD above is the one Ctrl-V uses.
+        let _ = ctx
+            .set()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text(text.to_owned());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ctx, text);
+    }
+}
+
+fn arboard_clipboard_text() -> io::Result<String> {
+    with_clipboard(|ctx| ctx.get_text().map_err(clip_err))
+}
+
+fn arboard_primary_text() -> io::Result<String> {
+    #[cfg(target_os = "linux")]
+    let result = {
+        use arboard::{GetExtLinux, LinuxClipboardKind};
+        with_clipboard(|ctx| {
+            ctx.get()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text()
+                .map_err(clip_err)
+        })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no primary selection",
+    ));
+    result
 }
 
 /// Pipe `text` into the first available OS clipboard tool. Returns `Ok` only if
@@ -208,6 +360,11 @@ const PASTE_CHAR_CAP: usize = 512 * 1024;
 
 /// Read CLIPBOARD (Ctrl+V / Cmd+V), grok-style: never falls back to PRIMARY.
 pub(crate) fn read_clipboard() -> io::Result<String> {
+    if let Ok(text) = arboard_clipboard_text()
+        && !text.is_empty()
+    {
+        return Ok(clamp_paste(&text));
+    }
     read_from_tools(&[
         ("pbpaste", &[] as &[&str]),
         ("wl-paste", &["--no-newline"]),
@@ -222,6 +379,11 @@ pub(crate) fn read_clipboard() -> io::Result<String> {
 
 /// Read X11/Wayland PRIMARY (middle-click paste).
 pub(crate) fn read_primary() -> io::Result<String> {
+    if let Ok(text) = arboard_primary_text()
+        && !text.is_empty()
+    {
+        return Ok(clamp_paste(&text));
+    }
     read_from_tools(&[
         ("wl-paste", &["--primary", "--no-newline"]),
         ("xclip", &["-selection", "primary", "-o"]),
@@ -357,6 +519,29 @@ mod tests {
     }
 
     #[test]
+    fn host_clipboard_requires_a_display_server() {
+        assert!(!host_clipboard_from(None, None));
+        assert!(!host_clipboard_from(Some(""), Some("")));
+        assert!(host_clipboard_from(Some(":0"), None));
+        assert!(host_clipboard_from(None, Some("wayland-0")));
+    }
+
+    fn osc52_uses_st_and_tmux_passthrough() {
+        let plain = osc52_sequence("hi", false);
+        assert!(plain.starts_with("\x1b]52;c;aGk="), "{plain:?}");
+        assert!(plain.ends_with("\x1b\\"), "{plain:?}");
+        assert!(
+            !plain.contains('\u{7}'),
+            "BEL is not a reliable OSC terminator"
+        );
+        let wrapped = osc52_sequence("hi", true);
+        assert!(
+            wrapped.starts_with("\x1bPtmux;\x1b\x1b]52;c;"),
+            "{wrapped:?}"
+        );
+        assert!(wrapped.ends_with("\x1b\x1b\\\x1b\\"), "{wrapped:?}");
+    }
+
     fn base64_encoder_handles_padding() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");

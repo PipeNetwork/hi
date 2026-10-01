@@ -12,6 +12,7 @@ fn finding(severity: Severity, title: &str, location: &str) -> Finding {
         location: Some(location.into()),
         verified: true,
         feature_gap: false,
+        from_verify: false,
     }
 }
 
@@ -31,10 +32,9 @@ fn defects(findings: Vec<Finding>) -> ReviewVerdict {
 fn completed(verdict: Option<ReviewVerdict>, unverified: &[&str]) -> ReviewTurnFacts {
     ReviewTurnFacts {
         stop_reason: TurnStopReason::Completed,
-        error: None,
-        changed_files: Vec::new(),
         verdict,
         unverified_citations: unverified.iter().map(|s| s.to_string()).collect(),
+        ..ReviewTurnFacts::default()
     }
 }
 
@@ -43,6 +43,8 @@ fn git_inputs() -> ReviewInputs {
         git: Some(GitScope {
             source: GitSource::Uncommitted,
             files: vec!["src/a.rs".into(), "src/b.rs".into()],
+            numstat: Vec::new(),
+            groups: Vec::new(),
         }),
         notice: Some("no plan.md or spec.md found; auditing recent work for defects: 2 uncommitted files (git status)".into()),
         ..ReviewInputs::default()
@@ -67,7 +69,7 @@ fn git_scoped_audit_reports_defects_with_no_coverage_and_points_wider() {
         drive
             .resume_prompt()
             .unwrap()
-            .contains("Code under audit: the 2 uncommitted file(s)")
+            .contains("Code under audit: the 2 file(s) listed below, uncommitted per `git status`")
     );
     let p2 = finding(Severity::P2, "Log unknown commands", "src/a.rs:9");
     let step = drive.next_step(&completed(Some(defects(vec![p2])), &["src/gone.rs"]));
@@ -108,6 +110,8 @@ fn git_scoped_audit_reports_defects_with_no_coverage_and_points_wider() {
                     subject: "fix".into(),
                 },
                 files: vec!["src/a.rs".into()],
+                numstat: Vec::new(),
+                groups: Vec::new(),
             }),
             ..ReviewInputs::default()
         },
@@ -245,10 +249,8 @@ fn chunked_audit_runs_one_turn_per_chunk_then_merges_and_fixes() {
     // The re-audit is scoped by the fix pass, not the chunks.
     let step = drive.next_step(&ReviewTurnFacts {
         stop_reason: TurnStopReason::Completed,
-        error: None,
         changed_files: vec!["crates/a/src/lib.rs".into()],
-        verdict: None,
-        unverified_citations: Vec::new(),
+        ..ReviewTurnFacts::default()
     });
     match &step {
         ReviewStep::RunPrompt(prompt) => {

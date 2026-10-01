@@ -188,14 +188,28 @@ impl ReadCache {
             }
         }
         if total > MAX_READS_PER_PATH {
-            return Some(format!(
-                "Already read `{}` {total} times this turn. \
-                 Earlier pages may have been compacted to a stub. Use `grep` or \
-                 `edit`; do not page the same file again.",
-                path.display()
-            ));
+            return Some(Self::reread_message(path, total));
         }
         None
+    }
+
+    /// The same reminder as [`Self::admit_read`] once this path is already
+    /// over the per-turn cap, without counting another fetch. Shell dumps
+    /// that are not a single `read` (`awk …; echo; awk …`) consult this so
+    /// they cannot page a file the read tool has already closed.
+    pub fn reread_refusal(&self, path: &Path) -> Option<String> {
+        let total = self.path_reads.get(&cache_key(path)).copied().unwrap_or(0);
+        (total > MAX_READS_PER_PATH).then(|| Self::reread_message(path, total))
+    }
+
+    fn reread_message(path: &Path, total: u32) -> String {
+        format!(
+            "Already read `{}` {total} times this turn. \
+         Earlier pages may have been compacted to a stub. Use `grep` or \
+         `edit`; do not page the same file again. Shell paging (`sed`, `awk`, \
+         `cat`) counts as the same read.",
+            path.display()
+        )
     }
 
     pub fn reset_turn_full_reads(&mut self) {

@@ -76,6 +76,79 @@ fn to_profile_env_var_name_that_is_not_set_stored_as_literal() {
     hi_ai::auth_store::delete(key).unwrap();
 }
 
+/// The recovery path for a store that lost a profile's entry: the pasted key
+/// is sealed under the reference the profile already carries, so config.toml
+/// is unchanged and the profile keeps its model.
+#[test]
+fn a_lost_store_entry_is_resealed_under_the_same_reference() {
+    if run_with_isolated_credentials(std::thread::current().name().unwrap()) {
+        return;
+    }
+    use crate::config::{
+        Config, MissingStoredCredential, Profile, read_config, read_config_file,
+        reseal_profile_api_key, resolve_credential_reference, save_config_to,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = Config {
+        default_profile: Some("default".into()),
+        ..Default::default()
+    };
+    config.profiles.insert(
+        "default".into(),
+        Profile {
+            provider: Some(ProviderName::Pipenetwork),
+            model: Some("ipop/coder-balanced".into()),
+            api_key: Some("first-key".into()),
+            ..Default::default()
+        },
+    );
+    save_config_to(&config, &path).unwrap();
+    // Loading seals the literal into the store; loading again gives the
+    // reference-only view a session normally starts from.
+    read_config(&path).unwrap();
+    let mut config = read_config(&path).unwrap();
+    let reference = config.profiles["default"]
+        .api_key_ref
+        .clone()
+        .expect("sealed reference");
+    let key = reference.strip_prefix("auth-store://").unwrap().to_string();
+    assert_eq!(
+        resolve_credential_reference(&reference, false, true).unwrap(),
+        "first-key"
+    );
+
+    hi_ai::auth_store::delete(&key).unwrap();
+    let err = resolve_credential_reference(&reference, false, true).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<MissingStoredCredential>(),
+        Some(&MissingStoredCredential {
+            reference: reference.clone()
+        }),
+        "{err}"
+    );
+
+    reseal_profile_api_key(&mut config, "default", "second-key", Some(&path)).unwrap();
+    let profile = &config.profiles["default"];
+    assert_eq!(profile.api_key_ref.as_deref(), Some(reference.as_str()));
+    assert!(profile.api_key.is_none());
+    assert_eq!(profile.model.as_deref(), Some("ipop/coder-balanced"));
+    let persisted = read_config_file(&path).unwrap();
+    assert_eq!(
+        persisted.profiles["default"].api_key_ref.as_deref(),
+        Some(reference.as_str()),
+        "the reference is derived from the file path and profile name, so it is unchanged"
+    );
+    assert_eq!(persisted.default_profile.as_deref(), Some("default"));
+    assert_eq!(
+        resolve_credential_reference(&reference, false, true).unwrap(),
+        "second-key"
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("second-key"), "literal leaked: {text}");
+    hi_ai::auth_store::delete(&key).unwrap();
+}
+
 #[test]
 fn migrate_moves_bogus_api_key_env_to_literal() {
     if run_with_isolated_credentials(std::thread::current().name().unwrap()) {

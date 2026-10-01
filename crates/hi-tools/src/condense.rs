@@ -59,6 +59,10 @@ pub(crate) fn condense(s: &str) -> String {
 /// or that has nothing of interest in its body, falls back to plain head+tail
 /// [`truncate_to`] (don't mangle a file dump).
 ///
+/// When the run failed, the digest starts with those failure lines. A later
+/// crate's `test result: FAILED` must not sit under an earlier crate's
+/// `test result: ok`, or the model treats the whole command as green.
+///
 /// Deliberately biased to *over*-keep: a stray noise line surviving is harmless,
 /// but dropping a real failure would send the model after the wrong thing. This
 /// is the "Tier 0" deterministic extractor — no model call, reproducible on the
@@ -68,6 +72,7 @@ pub fn condense_diagnostics(s: &str, max: usize) -> String {
         return truncate_to(s, max);
     }
     let lines: Vec<&str> = s.lines().collect();
+    let lead = failure_lead(&lines);
     let n = lines.len();
     const HEAD: usize = 4; // the "running N tests" / session preamble
     const TAIL: usize = 6; // the summary line(s) live at the very end
@@ -130,14 +135,14 @@ pub fn condense_diagnostics(s: &str, max: usize) -> String {
         }
     }
     if !matched {
-        return truncate_to(s, max);
+        return finish_digest(&lead, s, max);
     }
     // When almost everything is a signal (a wall of failures), there's no green
     // noise to drop — head+tail clip the original rather than pepper it with
     // omission markers.
     let kept = keep.iter().filter(|&&k| k).count();
     if kept * 10 >= n * 9 {
-        return truncate_to(s, max);
+        return finish_digest(&lead, s, max);
     }
 
     let mut out = String::new();
@@ -165,8 +170,86 @@ pub fn condense_diagnostics(s: &str, max: usize) -> String {
             }
         }
     }
-    // Even the condensed view honours the char budget.
-    truncate_to(out.trim_end(), max)
+    // Even the condensed view honours the char budget. The failure lead stays
+    // in the head, so a later truncate cannot hide it behind a passing crate.
+    finish_digest(&lead, out.trim_end(), max)
+}
+
+/// How many failure lines to pin above the condensed body.
+const FAILURE_LEAD_LIMIT: usize = 8;
+
+/// Put failed-crate summaries and compile errors ahead of passing `test result: ok`
+/// lines. A multi-target `cargo test` keeps every target's summary; without this
+/// lead the first screen is the library's green result and the model stops there.
+fn failure_lead(lines: &[&str]) -> String {
+    let mut summaries = Vec::new();
+    let mut compile_summaries = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut names = Vec::new();
+    let mut total = 0usize;
+    for line in lines {
+        let trimmed = line.trim();
+        let bucket = if trimmed.starts_with("test result:") && trimmed.contains("FAILED") {
+            Some(&mut summaries)
+        } else if trimmed.starts_with("error: could not compile")
+            || trimmed.starts_with("error: test failed")
+        {
+            Some(&mut compile_summaries)
+        } else if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
+            Some(&mut diagnostics)
+        } else if (trimmed.starts_with("test ") && trimmed.contains(" ... FAILED"))
+            || trimmed.starts_with("FAILED ")
+        {
+            Some(&mut names)
+        } else {
+            None
+        };
+        if let Some(bucket) = bucket {
+            total += 1;
+            if bucket.len() < FAILURE_LEAD_LIMIT {
+                bucket.push(trimmed);
+            }
+        }
+    }
+    if total == 0 {
+        return String::new();
+    }
+    let mut out = String::from("Failures (read these first):\n");
+    let mut shown = 0usize;
+    for line in summaries
+        .into_iter()
+        .chain(compile_summaries)
+        .chain(diagnostics)
+        .chain(names)
+    {
+        if shown >= FAILURE_LEAD_LIMIT {
+            break;
+        }
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+        shown += 1;
+    }
+    if total > shown {
+        out.push_str(&format!(
+            "- … {extra} more failure lines follow in the output\n",
+            extra = total - shown
+        ));
+    }
+    out
+}
+
+fn finish_digest(lead: &str, body: &str, max: usize) -> String {
+    if lead.is_empty() {
+        return truncate_to(body, max);
+    }
+    let mut combined = String::with_capacity(lead.len() + body.len() + 1);
+    combined.push_str(lead);
+    if !body.is_empty() {
+        combined.push('\n');
+        combined.push_str(body);
+    }
+    truncate_to(&combined, max)
 }
 
 fn starts_rust_test_listing(line: &str) -> bool {
@@ -303,6 +386,60 @@ mod tests {
              test result: FAILED. {passing} passed; 1 failed; 0 ignored\n",
         );
         out
+    }
+
+    #[test]
+    fn multi_crate_failure_leads_before_the_passing_summary() {
+        // cargo test prints the lib crate first. A later integration failure
+        // used to sit under `test result: ok. 564 passed`, and the model
+        // reported the whole run as green.
+        let mut log = String::from(
+            "   Compiling app v0.1.0\nwarning: unused import\n    --> src/lib.rs:1:1\n",
+        );
+        log.push_str("\nrunning 20 tests\n");
+        for i in 0..20 {
+            log.push_str(&format!("test lib::case_{i} ... ok\n"));
+        }
+        log.push_str(
+            "\ntest result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n\n",
+        );
+        log.push_str("     Running tests/integration.rs\n\nrunning 2 tests\n");
+        log.push_str("test integration::kept ... ok\n");
+        log.push_str("test integration::cabac_matrix_is_emitted ... FAILED\n");
+        log.push_str("\nfailures:\n\n---- integration::cabac_matrix_is_emitted stdout ----\n");
+        log.push_str(
+            "thread 'integration::cabac_matrix_is_emitted' panicked at tests/integration.rs:12:5:\n",
+        );
+        log.push_str(
+            "coverage missing [9]\n\nfailures:\n    integration::cabac_matrix_is_emitted\n\n",
+        );
+        log.push_str(
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.2s\n",
+        );
+        log.push_str("\nerror: test failed, to rerun pass `--test integration`\n");
+
+        let out = condense_diagnostics(&log, 5_000);
+        let first = out.lines().next().unwrap_or("");
+        assert!(
+            first.contains("Failures"),
+            "lead with the failure banner, got {first:?}\n{out}"
+        );
+        let banner_end = out.find("\n\n").unwrap_or(out.len());
+        let banner = &out[..banner_end];
+        assert!(banner.contains("cabac_matrix_is_emitted"), "{banner}");
+        assert!(banner.contains("test result: FAILED"), "{banner}");
+        assert!(
+            !banner.contains("test result: ok"),
+            "passing crate summary must not lead: {banner}"
+        );
+        assert!(
+            out.contains("tests/integration.rs:12:5"),
+            "keeps the panic location: {out}"
+        );
+        assert!(
+            out.contains("coverage missing [9]"),
+            "keeps the assertion detail: {out}"
+        );
     }
 
     #[test]

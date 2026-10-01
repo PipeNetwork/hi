@@ -222,6 +222,11 @@ fn typesafe_section_round_trips_and_project_overlay_is_dropped() {
 
 #[test]
 fn typesafe_api_key_ref_resolves_from_auth_store() {
+    // Every test that redirects XDG_CONFIG_HOME holds CWD_LOCK; without it
+    // a sibling reads (or writes) this scratch store as its own.
+    let _lock = crate::CWD_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let previous = std::env::var_os("XDG_CONFIG_HOME");
     unsafe {
@@ -3250,6 +3255,7 @@ fn resolve_falls_back_to_machine_reasoning_effort() {
 fn xai_profile_xhigh_does_not_follow_a_provider_override() {
     let mut config = Config {
         default_profile: Some("default".into()),
+        reasoning_effort: Some(hi_ai::ReasoningEffort::High),
         ..Default::default()
     };
     config.profiles.insert(
@@ -3276,8 +3282,9 @@ fn xai_profile_xhigh_does_not_follow_a_provider_override() {
     drop(env);
     assert_eq!(settings.provider, ProviderName::Pipenetwork);
     assert_eq!(
-        settings.reasoning_effort, None,
-        "xAI xhigh must not ride --provider pipenetwork onto DeepSeek"
+        settings.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::High),
+        "xAI profile xhigh must not ride --provider pipenetwork; machine high stays"
     );
 }
 
@@ -3358,7 +3365,10 @@ fn provider_override_does_not_inherit_mismatched_profile_model() {
         hi_ai::OutputTokenParameter::Auto
     );
     assert_eq!(settings.thinking_budget, None);
-    assert_eq!(settings.reasoning_effort, None);
+    assert_eq!(
+        settings.reasoning_effort,
+        Some(hi_ai::ReasoningEffort::Xhigh)
+    );
     assert_eq!(settings.compat, hi_ai::CompatMode::Auto);
     assert_eq!(settings.deepseek_compat, hi_ai::DeepSeekCompat::Auto);
     assert_eq!(settings.planner_model.as_deref(), Some("pipe/glm-5.2-fast"));
@@ -3575,7 +3585,11 @@ fn cli_reasoning_effort_still_applies_on_a_provider_override() {
 }
 
 #[test]
-fn machine_wide_xhigh_is_xai_only() {
+fn unset_reasoning_effort_defaults_to_xhigh() {
+    assert_eq!(
+        resolve_reasoning_effort(None, None, ProviderName::Pipenetwork, None),
+        Some(hi_ai::ReasoningEffort::Xhigh)
+    );
     assert_eq!(
         resolve_reasoning_effort(
             None,
@@ -3583,7 +3597,7 @@ fn machine_wide_xhigh_is_xai_only() {
             ProviderName::Pipenetwork,
             Some(hi_ai::ReasoningEffort::Xhigh)
         ),
-        None
+        Some(hi_ai::ReasoningEffort::Xhigh)
     );
     assert_eq!(
         resolve_reasoning_effort(

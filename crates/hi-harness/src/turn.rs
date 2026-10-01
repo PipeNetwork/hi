@@ -13,7 +13,7 @@ use crate::completion::{
     self, Decision, Demand, Event, Intent, TurnFacts, coordination_only_round, looks_like_verify,
     read_pagination_only, stall_tool_round,
 };
-use crate::pipe::{PipeCompletion, PipeError, StreamDelta};
+use crate::pipe::{PipeCompletion, PipeError, StreamDelta, StreamRetry, recover_pipe_stream_error};
 use crate::prompt::SYSTEM_PROMPT;
 use crate::tools::{ToolHost, advertised_tools, interrupted_outcome, plan_from_outcome};
 use crate::ui::{AutoHint, Ui};
@@ -115,6 +115,17 @@ impl Harness {
         if !resume && self.dismiss_completed_plan() {
             ui.plan(&[]);
         }
+        // A review audit turn starts with the seed command (verify or
+        // `cargo check`) so the model sees its failures as candidates
+        // instead of starting cold; the result is appended to the prompt.
+        let seeded_input;
+        let input = match self.review_seed_section(input, resume, ui, cancel).await {
+            Some(section) => {
+                seeded_input = format!("{input}{section}");
+                seeded_input.as_str()
+            }
+            None => input,
+        };
         let mut persisted_before = if resume {
             self.turn_open = true;
             if let Some(pending) = &self.pending_turn {
@@ -152,7 +163,10 @@ impl Harness {
         let mut repeat_stop: Option<&'static str> = None;
         let mut truncated_continuations = 0u32;
         let mut promised_continuations = 0u32;
+        let mut recap_continuations = 0u32;
         let mut typesafe_calls = 0u32;
+        let mut request_retries = 0u32;
+        let mut shrunk_for_overflow = false;
         // Review-drive turns pin their intent: the audit prompt mentions
         // fixing, so the heuristic would demand edits mid-audit. The prompt
         // check covers resumed turns, where `forced_intent` was not re-armed.
@@ -168,7 +182,7 @@ impl Harness {
         };
         if review_intent.is_some() {
             if intent == Intent::Review && !self.live.effort_pinned() {
-                self.turn_effort = Some(hi_ai::ReasoningEffort::High);
+                self.turn_effort = Some(hi_ai::ReasoningEffort::Xhigh);
             }
             if let Some(status) = self.review_turn_status(&prompt_text) {
                 ui.status(&status);
@@ -179,13 +193,20 @@ impl Harness {
         // would push the model into editing mid-audit; a stop without a
         // verdict is the drive's format re-ask instead.
         let review_audit_turn = review_intent == Some(Intent::Review);
+        if review_audit_turn && !resume {
+            self.review_read_files.clear();
+        }
         let mut audit_write_denials = 0u32;
         let mut facts = TurnFacts::new(intent, completion::plan_is_open(&self.plan));
+        facts.step_work = facts.plan_open && self.plan_drive.step_edited;
+        facts.plan_steps = self.plan.len();
+        self.attempted_mutation = false;
         if managed_turn && resume {
             let (was_mutated, was_verified, paths) = self.client.recovered_managed_progress()?;
             mutated = was_mutated;
             changed = paths;
             facts.mutated = was_mutated;
+            facts.step_work |= facts.plan_open && was_mutated;
             facts.ran_verify = was_verified;
         }
         let mut continue_hint: Option<&str> = None;
@@ -270,23 +291,69 @@ impl Harness {
             {
                 Ok(completion) => completion,
                 Err(err) => {
-                    if let Some(pipe) = err.downcast_ref::<PipeError>() {
-                        if pipe.is_cancelled() {
-                            return self
-                                .finish_turn(
-                                    persisted_before,
-                                    pre.as_deref(),
-                                    mutated,
-                                    turn_usage,
-                                    changed,
-                                    TurnStopReason::Cancelled,
-                                    None,
-                                    ui,
-                                )
-                                .await;
+                    if let Some(pipe) = err.downcast_ref::<PipeError>()
+                        && pipe.is_cancelled()
+                    {
+                        return self
+                            .finish_turn(
+                                persisted_before,
+                                pre.as_deref(),
+                                mutated,
+                                turn_usage,
+                                changed,
+                                TurnStopReason::Cancelled,
+                                None,
+                                ui,
+                            )
+                            .await;
+                    }
+                    // Managed turns own idempotency through their operation
+                    // ledger; a blind resend there could double-charge.
+                    if !managed_turn
+                        && let Some(step) =
+                            recover_pipe_stream_error(&err, request_retries, shrunk_for_overflow)
+                    {
+                        match step {
+                            StreamRetry::Shrink => {
+                                shrunk_for_overflow = true;
+                                ui.status("context too large; shrinking and retrying");
+                                let _ = self.apply_cheap_shrink(ui, false);
+                                let _ = self.emergency_compact_if_over_window(ui);
+                                persisted_before = self.messages.len();
+                            }
+                            StreamRetry::Repair { hint, status } => {
+                                request_retries = request_retries.saturating_add(1);
+                                ui.status(&status);
+                                continue_hint = Some(hint);
+                            }
+                            StreamRetry::Again { wait, status } => {
+                                request_retries = request_retries.saturating_add(1);
+                                ui.status(&status);
+                                tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        return self
+                                            .finish_turn(
+                                                persisted_before,
+                                                pre.as_deref(),
+                                                mutated,
+                                                turn_usage,
+                                                changed,
+                                                TurnStopReason::Cancelled,
+                                                None,
+                                                ui,
+                                            )
+                                            .await;
+                                    }
+                                    _ = tokio::time::sleep(wait) => {}
+                                }
+                            }
                         }
+                        continue;
+                    }
+                    if let Some(pipe) = err.downcast_ref::<PipeError>() {
                         let kind = if pipe.is_auth() { "auth" } else { "request" };
-                        ui.turn_error(kind, &pipe.to_string(), guidance(pipe));
+                        let message = pipe.to_string();
+                        self.report_turn_error(ui, kind, &message, guidance(pipe));
                         return self
                             .finish_turn(
                                 persisted_before,
@@ -295,17 +362,20 @@ impl Harness {
                                 turn_usage,
                                 changed,
                                 TurnStopReason::Error,
-                                Some(pipe.to_string()),
+                                Some(message),
                                 ui,
                             )
                             .await;
                     }
-                    ui.turn_error("request", &format!("{err:#}"), "check the Pipe API");
+                    let message = format!("{err:#}");
+                    self.report_turn_error(ui, "request", &message, "check the Pipe API");
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                     self.close_persisted_turn(persisted_before, TurnStopReason::Error);
                     return Err(err);
                 }
             };
+            request_retries = 0;
+            shrunk_for_overflow = false;
             verdict_filter.finish(&mut *ui);
             turn_usage.add(completion.usage);
             self.record_context_occupancy(completion.usage);
@@ -341,7 +411,8 @@ impl Harness {
                         continue;
                     }
                     const MSG: &str = "model output was truncated twice with no complete reply";
-                    ui.turn_error(
+                    self.report_turn_error(
+                        ui,
                         "truncated",
                         MSG,
                         "supervised sessions auto-repair; otherwise /retry",
@@ -358,26 +429,55 @@ impl Harness {
                         changed_files: changed,
                         error: Some(MSG.into()),
                         verification: None,
+                        attempted_mutation: self.attempted_mutation,
                     });
                 }
                 truncated_continuations = 0;
+                let last_assistant = last_assistant_visible_text(&self.messages);
+                // A word-for-word copy of the last reply is already in the
+                // transcript; persisting it again only teaches more recaps.
+                let recap = repeated_status_recap(last_assistant.as_deref(), &completion.text);
+                let asked = completion::plan_is_open(&self.plan)
+                    && asked_user_to_pick_next_work(&completion.text);
+                // Tool rounds reset `promised_continuations`, so a recap
+                // before every tool call looped for 40 rounds in live ~/drme.
+                // Past this per-turn budget it is judged like any other stop.
+                let nudge = if recap {
+                    recap_continuations < RECAP_CONTINUATIONS_PER_TURN
+                } else {
+                    promised_unfinished_work(&completion.text)
+                        || asked
+                        || (!mutated && claimed_unapplied_fixes(&completion.text))
+                };
+                // A finished step goes to the close demand below; these
+                // nudges all ask for more edits, which only buys filler.
                 if !review_audit_turn
-                    && (promised_unfinished_work(&completion.text)
-                        || (!mutated && claimed_unapplied_fixes(&completion.text)))
+                    && !facts.ready_to_close_step()
+                    && nudge
                     && promised_continuations < PROMISED_WORK_CONTINUATIONS
                 {
-                    if !completion.is_empty() {
+                    if !completion.is_empty() && !recap {
                         self.messages.push(assistant_message(&completion));
                     }
                     promised_continuations = promised_continuations.saturating_add(1);
+                    if recap {
+                        recap_continuations = recap_continuations.saturating_add(1);
+                    }
                     self.compact_suppressed = false;
-                    continue_hint =
-                        Some(if mutated || !claimed_unapplied_fixes(&completion.text) {
-                            PROMISED_WORK_HINT
-                        } else {
-                            CLAIMED_FIX_HINT
-                        });
-                    ui.status(if !mutated && claimed_unapplied_fixes(&completion.text) {
+                    continue_hint = Some(if recap && completion::plan_is_open(&self.plan) {
+                        RECAP_LOOP_HINT
+                    } else if recap {
+                        RECAP_LOOP_NO_PLAN_HINT
+                    } else if mutated || !claimed_unapplied_fixes(&completion.text) {
+                        PROMISED_WORK_HINT
+                    } else {
+                        CLAIMED_FIX_HINT
+                    });
+                    ui.status(if recap {
+                        "repeated the same status recap; continuing"
+                    } else if asked {
+                        "asked which plan step to do next; continuing"
+                    } else if !mutated && claimed_unapplied_fixes(&completion.text) {
                         "claimed fixes with no file changes; continuing"
                     } else {
                         "model described a fix without a tool call; continuing"
@@ -391,18 +491,20 @@ impl Harness {
                 let decision = completion::decide(Event::ModelStop, &mut facts);
                 match decision {
                     Decision::Continue { demand, hint } => {
-                        if !completion.reasoning.trim().is_empty() || facts.visible_answer {
+                        if !recap
+                            && (!completion.reasoning.trim().is_empty() || facts.visible_answer)
+                        {
                             self.messages.push(assistant_message(&completion));
                         }
                         facts.note_continue(demand);
                         self.compact_suppressed = false;
                         continue_hint = Some(hint);
-                        ui.status(completion::status_for(demand));
+                        ui.status(completion::status_for_facts(&facts, demand));
                         round += 1;
                         continue;
                     }
                     Decision::Error { kind, message } => {
-                        if !completion.reasoning.trim().is_empty() {
+                        if !recap && !completion.reasoning.trim().is_empty() {
                             self.messages.push(assistant_message(&completion));
                         }
                         if kind == "empty_stop" {
@@ -411,11 +513,12 @@ impl Harness {
                                 hi_liveness::InvariantCode::EmptyAssistantAfterTools,
                             );
                         }
-                        ui.turn_error(kind, message, stop_guidance(kind, false));
+                        self.report_turn_error(ui, kind, message, stop_guidance(kind, false));
                         self.session_usage.add(turn_usage);
                         ui.session_usage(self.session_usage);
                         self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                         self.close_persisted_turn(persisted_before, TurnStopReason::Error);
+                        let verification = self.ladder_check_on_stop(mutated, ui, cancel).await;
                         ui.changed_files(changed.clone());
                         self.offer_plan_continue(ui);
                         ui.turn_end(stop_label(kind));
@@ -424,11 +527,15 @@ impl Harness {
                             usage: turn_usage,
                             changed_files: changed,
                             error: Some(message.into()),
-                            verification: None,
+                            verification,
+                            attempted_mutation: self.attempted_mutation,
                         });
                     }
+                    Decision::ClosePlanStep => self.close_finished_plan_step(&mut facts, ui),
                     Decision::Proceed | Decision::Complete => {}
                 }
+                // The turn's answer is kept even when it matches the last
+                // one: a review drive reads each turn's verdict block.
                 if !completion.is_empty() {
                     self.messages.push(assistant_message(&completion));
                 }
@@ -446,6 +553,7 @@ impl Harness {
                     changed_files: changed,
                     error: None,
                     verification,
+                    attempted_mutation: self.attempted_mutation,
                 });
             }
 
@@ -455,6 +563,8 @@ impl Harness {
             facts.used_tools = true;
             let mut mutated_this_round = false;
             let mut verify_this_round = false;
+            let mut failed_mutation_this_round = false;
+            let mut closed_step_this_round = false;
             self.messages.push(assistant_message(&completion));
             self.liveness
                 .set_state(hi_liveness::HarnessState::ExecutingTool);
@@ -490,7 +600,7 @@ impl Harness {
                 let audit_denial = review_audit_turn
                     .then(|| crate::review_guard::audit_denial(&call.name, &call.arguments))
                     .flatten();
-                let outcome = if let Some(outcome) = cached {
+                let mut outcome = if let Some(outcome) = cached {
                     outcome
                 } else if let Some(reason) = &audit_denial {
                     audit_write_denials = audit_write_denials.saturating_add(1);
@@ -511,27 +621,64 @@ impl Harness {
                 if model == "pipe/auto" {
                     self.client.managed_tool_complete(&call.id, &outcome)?;
                 }
+                if review_audit_turn {
+                    self.note_review_reads(&call.name, &call.arguments, &outcome);
+                }
                 ui.tool_call_id(&call.id, &call.name, &call.arguments);
-                if looks_like_verify(&call.name, &call.arguments) {
+                if looks_like_verify(&call.name, &call.arguments)
+                    || self.runs_verify_command(&call.name, &call.arguments)
+                {
                     facts.ran_verify = true;
                     verify_this_round = true;
+                    // A refused rerun replays the last output; keep that verdict.
+                    if !hi_tools::is_probe_refusal(&outcome.content) {
+                        facts.verify_failed =
+                            !completion::verify_passed(outcome.status, &outcome.content);
+                    }
                     facts.grant_verify_credit();
+                }
+                if matches!(
+                    call.name.as_str(),
+                    "write" | "edit" | "multi_edit" | "apply_patch"
+                ) {
+                    self.attempted_mutation = true;
+                    if !outcome.effects.mutation_applied {
+                        facts.failed_mutation = true;
+                        failed_mutation_this_round = true;
+                        if outcome.content.contains("already in this file")
+                            || outcome.content.contains("already failed")
+                        {
+                            facts.grant_reconcile_credit();
+                        }
+                    }
+                }
+                if call.name == "read" && facts.failed_mutation {
+                    facts.grant_reconcile_credit();
                 }
                 if outcome.effects.mutation_applied {
                     mutated = true;
                     mutated_this_round = true;
                     facts.mutated = true;
                     facts.ran_verify = false;
+                    facts.verify_failed = false;
+                    facts.failed_mutation = false;
+                    facts.step_kept_open = false;
                     facts.grant_mutation_credit();
+                    if completion::plan_is_open(&self.plan) {
+                        facts.step_work = true;
+                        self.set_step_edited(true);
+                    }
                     self.liveness.note_progress();
                 }
                 if let Some(plan) = plan_from_outcome(&outcome) {
+                    let proposed = plan.clone();
+                    facts.note_plan_update(&self.plan, &proposed);
+                    facts.preview_plan(&self.plan, &proposed);
                     let plan = completion::accept_plan(&self.plan, plan, &mut facts.work_credits);
-                    self.plan = plan.clone();
-                    if let Some(session) = &mut self.session {
-                        let _ = session.record_plan(&self.plan);
+                    if let Some(note) = completion::plan_refusal_note(&proposed, &plan, &facts) {
+                        outcome.content = note;
                     }
-                    facts.plan_open = completion::plan_is_open(&self.plan);
+                    closed_step_this_round |= self.install_plan(plan.clone(), &mut facts);
                     ui.plan_result_id(
                         &call.id,
                         &call.name,
@@ -582,7 +729,8 @@ impl Harness {
                             hi_liveness::InvariantCode::CompactFailedOverWindow,
                         );
                     }
-                    ui.turn_error(
+                    self.report_turn_error(
+                        ui,
                         kind,
                         msg,
                         "supervised sessions auto-repair when compact has failed; otherwise /retry",
@@ -609,6 +757,7 @@ impl Harness {
                         changed_files: changed,
                         error: Some(msg.into()),
                         verification: None,
+                        attempted_mutation: self.attempted_mutation,
                     });
                 }
             }
@@ -623,13 +772,14 @@ impl Harness {
                 facts.grant_verify_credit();
             }
             facts.plan_open = completion::plan_is_open(&self.plan);
-            let stall_only = stall_tool_round(&completion.tool_calls);
+            let stall_only = stall_tool_round(&completion.tool_calls)
+                || (failed_mutation_this_round && !mutated_this_round);
             let coordination_only = coordination_only_round(&completion.tool_calls);
             let pagination_only =
                 read_pagination_only(&completion.tool_calls, &facts.seen_read_paths);
             facts.observe_read_paths(&completion.tool_calls);
             facts.note_round_kind(
-                mutated_this_round,
+                mutated_this_round || closed_step_this_round,
                 stall_only,
                 verify_this_round,
                 coordination_only,
@@ -668,7 +818,7 @@ impl Harness {
                     if flavored != demand {
                         decision = Decision::Continue {
                             demand: flavored,
-                            hint: completion::hint_for(flavored),
+                            hint: completion::hint_for_facts(&facts, flavored),
                         };
                     }
                     // Only surface the TypeSafe label when the applied demand
@@ -687,7 +837,7 @@ impl Harness {
                     facts.note_continue(demand);
                     self.compact_suppressed = false;
                     continue_hint = Some(hint);
-                    ui.status(completion::status_for(demand));
+                    ui.status(completion::status_for_facts(&facts, demand));
                     if let Some(label) = typesafe_label {
                         ui.status(&format!("typesafe next-action: {label}"));
                     }
@@ -701,7 +851,7 @@ impl Harness {
                             hi_liveness::InvariantCode::EmptyAssistantAfterTools,
                         );
                     }
-                    ui.turn_error(kind, message, stop_guidance(kind, true));
+                    self.report_turn_error(ui, kind, message, stop_guidance(kind, true));
                     self.session_usage.add(turn_usage);
                     ui.session_usage(self.session_usage);
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
@@ -715,22 +865,34 @@ impl Harness {
                         changed_files: changed,
                         error: Some(message.into()),
                         verification: None,
+                        attempted_mutation: self.attempted_mutation,
                     });
                 }
-                Decision::Complete => {
+                Decision::Complete | Decision::ClosePlanStep => {
+                    let label = if decision == Decision::ClosePlanStep {
+                        self.close_finished_plan_step(&mut facts, ui);
+                        "closed the finished plan step"
+                    } else if let Some(label) = repeat_stop {
+                        label
+                    } else if facts.closed_step_without_edits() {
+                        "closed a plan step; the next starts in a new turn"
+                    } else {
+                        "stopped repeating a detached binary probe"
+                    };
                     self.session_usage.add(turn_usage);
                     ui.session_usage(self.session_usage);
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
                     self.close_persisted_turn(persisted_before, TurnStopReason::Completed);
                     ui.changed_files(changed.clone());
                     self.offer_plan_continue(ui);
-                    ui.turn_end(repeat_stop.unwrap_or("stopped repeating a detached binary probe"));
+                    ui.turn_end(label);
                     return Ok(TurnOutcome {
                         stop_reason: TurnStopReason::Completed,
                         usage: turn_usage,
                         changed_files: changed,
                         error: None,
                         verification: None,
+                        attempted_mutation: self.attempted_mutation,
                     });
                 }
                 Decision::Proceed => {}
@@ -739,10 +901,57 @@ impl Harness {
         }
     }
 
+    /// Show a turn error and keep it in the session file.
+    fn report_turn_error(&mut self, ui: &mut dyn Ui, kind: &str, message: &str, guidance: &str) {
+        ui.turn_error(kind, message, guidance);
+        let turn_index = self.turn_index;
+        if let Some(session) = &mut self.session {
+            let _ = session.record_turn_error(turn_index, kind, message);
+        }
+    }
+
     fn offer_plan_continue(&self, ui: &mut dyn Ui) {
         if completion::plan_is_open(&self.plan) && !self.plan_drive.paused {
             ui.suggested_prompt(crate::CONTINUE_PLAN_PROMPT);
         }
+    }
+
+    /// Store a plan that already passed [`completion::accept_plan`] and
+    /// return whether it closed a step. Edits count toward the active step
+    /// only, so a close, a fresh plan, or a finished plan clears them.
+    fn install_plan(&mut self, plan: Vec<hi_tools::PlanStep>, facts: &mut TurnFacts) -> bool {
+        let was_open = completion::plan_is_open(&self.plan);
+        let closed = completion::closes_a_step(&self.plan, &plan);
+        self.plan = plan;
+        if let Some(session) = &mut self.session {
+            let _ = session.record_plan(&self.plan);
+        }
+        facts.plan_open = completion::plan_is_open(&self.plan);
+        facts.plan_steps = self.plan.len();
+        facts.closed_step |= closed;
+        if closed || !was_open || !facts.plan_open {
+            facts.step_work = false;
+            self.set_step_edited(false);
+        }
+        closed
+    }
+
+    /// The model edited the active step, the tests passed, and it still
+    /// would not call `update_plan` after [`completion::PLAN_CLOSE_HINT`].
+    /// Close the step here: the alternative is `plan_stall` with the work
+    /// done, and the drive re-asking for a finished step until it pauses.
+    fn close_finished_plan_step(&mut self, facts: &mut TurnFacts, ui: &mut dyn Ui) {
+        let Some((proposed, title)) = completion::close_active_step(&self.plan) else {
+            return;
+        };
+        let plan = completion::accept_plan(&self.plan, proposed, &mut facts.work_credits);
+        if !self.install_plan(plan, facts) {
+            return;
+        }
+        ui.plan(&self.plan);
+        ui.status(&format!(
+            "plan: marked \"{title}\" done (edited and tests passed; the model did not call update_plan)"
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -765,6 +974,7 @@ impl Harness {
             changed_files,
             error,
             verification: None,
+            attempted_mutation: self.attempted_mutation,
         })
     }
 
@@ -991,7 +1201,7 @@ impl Harness {
 
     pub(crate) fn request_messages(&self, continue_hint: Option<&str>) -> Vec<Message> {
         let mut out = vec![Message::system(SYSTEM_PROMPT)];
-        out.extend(self.messages.iter().cloned());
+        out.extend(without_repeated_replies(&self.messages).cloned());
         if let Some(hint) = continue_hint.map(str::trim).filter(|text| !text.is_empty()) {
             // Not persisted: the session file stays a record of real user
             // turns. The hint only exists on the next Pipe request.
@@ -1018,54 +1228,11 @@ impl Harness {
             other => ui.checkpoint_warning(&format!("could not seal undo point: {other:?}")),
         }
     }
-
-    async fn run_verify(&self, ui: &mut dyn Ui, cancel: &TurnCancellation) -> Option<String> {
-        let command = self.verify_command.as_deref()?;
-        if cancel.is_cancelled() {
-            return None;
-        }
-        ui.status(&format!("verify · {command}"));
-        self.liveness
-            .set_state(hi_liveness::HarnessState::Verifying);
-        self.liveness
-            .emit(hi_liveness::EventCode::VerifyStart, None, None, None);
-        // Verify has no default wall clock, so Esc must be able to end it.
-        // Dropping the run future kills the whole process group.
-        let run = hi_tools::run_check_in_with_runner(self.tools.runner_ref(), command);
-        let ran = tokio::select! {
-            ran = run => Some(ran),
-            _ = cancel.cancelled() => None,
-        };
-        let result = match ran {
-            Some(Ok(execution)) => {
-                let text = execution.display_content();
-                ui.tool_call("verify", command);
-                ui.tool_result("verify", &text);
-                self.liveness.note_progress();
-                Some(if execution.status == hi_tools::ToolStatus::Succeeded {
-                    "passed".into()
-                } else {
-                    "failed".into()
-                })
-            }
-            Some(Err(err)) => {
-                ui.status(&format!("verify failed to start: {err:#}"));
-                Some("failed".into())
-            }
-            None => {
-                ui.status("verify cancelled");
-                Some("cancelled".into())
-            }
-        };
-        self.liveness
-            .emit(hi_liveness::EventCode::VerifyEnd, None, None, None);
-        self.liveness.set_state(hi_liveness::HarnessState::Idle);
-        result
-    }
 }
 
 const TRUNCATED_OUTPUT_CONTINUATIONS: u32 = 2;
 const PROMISED_WORK_CONTINUATIONS: u32 = 2;
+const RECAP_CONTINUATIONS_PER_TURN: u32 = 2;
 
 const TRUNCATED_OUTPUT_HINT: &str = "\
 Your previous reply was truncated at the output token limit. Do not repeat \
@@ -1081,6 +1248,18 @@ const CLAIMED_FIX_HINT: &str = "\
 You claimed to have applied fixes but no file was changed this turn. Call \
 `edit`/`write` now to apply them, or retract the claim with a short verdict. \
 Do not only describe the patches.";
+
+const RECAP_LOOP_HINT: &str = "\
+You just repeated the same status recap without calling a tool. Do not \
+summarize again or ask the user which step to do. Call `edit` or `write` \
+on the active plan step now. If it is already fully implemented, run the \
+project's tests and call update_plan to mark it done instead. Never add \
+filler edits.";
+
+const RECAP_LOOP_NO_PLAN_HINT: &str = "\
+You just repeated your previous message word for word without calling a \
+tool. Do not summarize again. Act on the user's latest message now: call a \
+tool that makes progress on it, or reply with something new.";
 
 const CIRCULAR_DUMP_STUB: &str = "\
 [omitted a truncated repeating review list. Do not continue numbering. \
@@ -1122,6 +1301,76 @@ fn promised_unfinished_work(text: &str) -> bool {
         "say continue",
     ];
     plans.iter().any(|needle| lower.contains(needle))
+}
+
+fn last_assistant_visible_text(messages: &[Message]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != hi_ai::Role::Assistant {
+            return None;
+        }
+        let text = message.text();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn repeated_status_recap(previous: Option<&str>, current: &str) -> bool {
+    let current = current.trim();
+    current.len() >= 80 && previous.is_some_and(|prev| prev.trim() == current)
+}
+
+/// The transcript without text-only replies that repeat an earlier reply of
+/// the same turn. Sessions saved before duplicates stopped being persisted
+/// carry dozens of copies, and each one invites the model to recap again.
+/// The first reply after each user message stays, so every turn keeps an
+/// answer.
+fn without_repeated_replies(messages: &[Message]) -> impl Iterator<Item = &Message> {
+    let mut last_visible: Option<String> = None;
+    messages.iter().filter(move |message| {
+        match message.role {
+            Role::Assistant => {}
+            Role::User => {
+                last_visible = None;
+                return true;
+            }
+            _ => return true,
+        }
+        let text = message.text();
+        let text = text.trim();
+        if text.is_empty() {
+            return true;
+        }
+        let calls_tools = message
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::ToolCall { .. }));
+        if !calls_tools && repeated_status_recap(last_visible.as_deref(), text) {
+            return false;
+        }
+        last_visible = Some(text.to_string());
+        true
+    })
+}
+
+/// Status recaps that hand the next step back to the user ("Want me to
+/// tackle X or Y?") while a plan is still open. Distinct from a review
+/// verdict that merely mentions what to change.
+fn asked_user_to_pick_next_work(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "want me to",
+        "do you want me to",
+        "should i tackle",
+        "should i ",
+        "shall i ",
+        "which should i",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn claimed_unapplied_fixes(text: &str) -> bool {
@@ -1283,7 +1532,7 @@ fn stop_guidance(kind: &str, after_tools: bool) -> &'static str {
 fn stop_label(kind: &str) -> &'static str {
     match kind {
         "empty_stop" => "empty stop after tools",
-        "plan_stall" => "plan stalled without an edit",
+        "plan_stall" => "plan stalled with steps left",
         "unverified_stop" => "edit applied but never verified",
         _ => "inspect budget exhausted",
     }
@@ -1298,12 +1547,81 @@ impl ToolHost {
 #[cfg(test)]
 mod helper_tests {
     use super::repeat_stop_summary;
-    use super::{claimed_unapplied_fixes, promised_unfinished_work, repeating_review_dump};
+    use super::{
+        asked_user_to_pick_next_work, claimed_unapplied_fixes, promised_unfinished_work,
+        repeated_status_recap, repeating_review_dump, without_repeated_replies,
+    };
     use crate::completion::{
         Intent, intent_for_turn, latest_prompt_text, looks_like_verify, user_asked_to_fix,
         user_asked_to_implement,
     };
-    use hi_ai::Message;
+    use hi_ai::{Content, Message};
+
+    /// Live ~/drme turn 54 saved the same 400-character recap before each
+    /// of 40 tool calls. Requests from such a session drop the in-turn
+    /// copies but keep every tool call, tool result, and each turn's first
+    /// reply, even one that matches the previous turn's (a review verdict).
+    #[test]
+    fn requests_skip_replies_that_repeat_the_previous_one() {
+        let recap = "The locked-bytes test passes again (567/567). Now the real issue: dav1d \
+                     still rejects the bitstream. Let me check the `bits_for` function.";
+        let reply = || Message::assistant(vec![Content::Text(recap.into())]);
+        let call = |id: &str| {
+            Message::assistant(vec![Content::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"python3 parse.py"}"#.into(),
+            }])
+        };
+        let with_text_and_call = Message::assistant(vec![
+            Content::Text(recap.into()),
+            Content::ToolCall {
+                id: "c3".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let messages = vec![
+            Message::user("finish the av1 implimentation"),
+            reply(),
+            Message::user("build out full av1 spec implimentation"),
+            reply(),
+            call("c1"),
+            Message::tool_result("c1", "obu_size mismatch"),
+            reply(),
+            call("c2"),
+            Message::tool_result("c2", "obu_size mismatch"),
+            with_text_and_call,
+            Message::tool_result("c3", "ok"),
+            reply(),
+            Message::assistant(vec![Content::Text("Short. ".repeat(3))]),
+            Message::assistant(vec![Content::Text("Short. ".repeat(3))]),
+        ];
+        let kept: Vec<&Message> = without_repeated_replies(&messages).collect();
+        let replies = kept
+            .iter()
+            .filter(|message| message.text().trim() == recap)
+            .count();
+        assert_eq!(
+            replies, 3,
+            "one reply per user message plus the one carrying a tool call"
+        );
+        for id in ["c1", "c2", "c3"] {
+            assert!(
+                kept.iter().any(|message| message.content.iter().any(
+                    |block| matches!(block, Content::ToolCall { id: call, .. } if call == id)
+                )),
+                "{id} call kept"
+            );
+            assert!(
+                kept.iter().any(|message| message.content.iter().any(
+                    |block| matches!(block, Content::ToolResult { call_id, .. } if call_id == id)
+                )),
+                "{id} result kept"
+            );
+        }
+        assert_eq!(kept.len(), messages.len() - 2);
+    }
 
     #[test]
     fn promised_unfinished_work_catches_apply_later_cop_out() {
@@ -1326,6 +1644,26 @@ mod helper_tests {
         ));
         assert!(!promised_unfinished_work(
             "What to change in `server.rs`: the timeout constant should be 30s, not 3s."
+        ));
+    }
+
+    #[test]
+    fn asked_user_to_pick_next_work_catches_status_recap_questions() {
+        assert!(asked_user_to_pick_next_work(
+            "Full test suite passes. Want me to tackle the README/CLI doc sync, or the 8-bit prediction clamp?"
+        ));
+        assert!(asked_user_to_pick_next_work(
+            "Should I implement superres downscale next?"
+        ));
+        assert!(!asked_user_to_pick_next_work(
+            "What to change: implement superres downscale in the encoder."
+        ));
+        let recap = "Full test suite passes: cargo test exit=0, 567 lib tests + all integration tests green.";
+        assert!(repeated_status_recap(Some(recap), recap));
+        assert!(!repeated_status_recap(Some("ok"), "ok"));
+        assert!(!repeated_status_recap(
+            Some(recap),
+            "different recap that is also long enough to compare"
         ));
     }
 

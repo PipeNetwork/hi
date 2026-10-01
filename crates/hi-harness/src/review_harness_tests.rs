@@ -739,17 +739,9 @@ async fn review_without_plan_or_spec_falls_back_to_readme_with_notice() {
             .contains("no plan.md or spec.md found")
     );
 
-    // Large workspace, still no spec: the audit narrows to recent work
-    // (`review_harness_scope_tests`); an explicit directory is the scope.
-    fs::create_dir_all(dir.path().join("src")).unwrap();
-    for index in 0..=crate::review_scope::LARGE_WORKSPACE_FILES {
-        fs::write(dir.path().join(format!("src/f{index}.rs")), "").unwrap();
-    }
-    let mut large = test_harness(&server.url, dir.path().to_path_buf());
-    let (scoped, notes) = start(&mut large, "audit src");
-    assert!(scoped.contains("Scope: limit the code audit to src"));
-    assert_eq!(notes[0], "spec review · audit only · in src · README.md");
-
+    // Large workspace, still no spec: the audit narrows to recent work, and
+    // an explicit directory is the scope or is chunked
+    // (`review_harness_scope_tests`).
     let empty = tempfile::tempdir().unwrap();
     let mut bare = test_harness(&server.url, empty.path().to_path_buf());
     let (prompt, notes) = start(&mut bare, "");

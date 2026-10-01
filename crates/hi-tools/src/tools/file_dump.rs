@@ -9,26 +9,13 @@ pub(super) fn file_dump_read_arguments(command: &str) -> Option<String> {
 
 fn file_dump_command(command: &str) -> Option<&str> {
     let trimmed = command.trim();
-    if trimmed.is_empty()
-        || trimmed.matches('|').count() > 1
-        || trimmed
-            .chars()
-            .any(|ch| matches!(ch, '\n' | '\r' | '>' | '<' | '$' | '`'))
-    {
+    if trimmed.is_empty() || trimmed.matches('|').count() > 1 || has_unquoted_metachar(trimmed) {
         return None;
     }
     if trimmed.contains('&') && !trimmed.contains("&&") {
         return None;
     }
-    let mut segments = Vec::new();
-    for chunk in trimmed.split("&&") {
-        for piece in chunk.split(';') {
-            let piece = piece.trim();
-            if !piece.is_empty() {
-                segments.push(piece);
-            }
-        }
-    }
+    let segments = split_top_level(trimmed);
     let (last, prefixes) = segments.split_last()?;
     if prefixes
         .iter()
@@ -38,6 +25,25 @@ fn file_dump_command(command: &str) -> Option<&str> {
         return None;
     }
     Some(*last)
+}
+
+/// `>` and `<` inside quotes are part of an `awk` range, not a redirect.
+fn has_unquoted_metachar(input: &str) -> bool {
+    let mut quote = None;
+    for ch in input.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '\n' | '\r' | '>' | '<' | '$' | '`' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_banner_shell(command: &str) -> bool {
@@ -58,18 +64,163 @@ fn parse_file_dump_command(trimmed: &str) -> Option<String> {
     if trimmed.contains('|') {
         return None;
     }
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    let words = shell_words(trimmed)?;
     let start = words
         .iter()
-        .position(|word| !is_env_assignment(word) && *word != "env")?;
-    let program = basename(words[start]);
-    let args: Vec<&str> = words[start + 1..].iter().copied().map(unquote).collect();
+        .position(|word| !is_env_assignment(word) && word != "env")?;
+    let program = basename(&words[start]);
+    let args: Vec<&str> = words[start + 1..].iter().map(String::as_str).collect();
     match program {
         "cat" => parse_cat_dump(&args),
         "sed" => parse_sed_print_dump(&args),
         "head" => parse_head_dump(&args),
+        "awk" | "gawk" => parse_awk_range_dump(&args),
         _ => None,
     }
+}
+
+/// Split a shell snippet on unquoted whitespace, dropping matching quotes.
+/// Unclosed quotes are not a file dump.
+fn shell_words(input: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in input.chars() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            ch if ch.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Some(out)
+}
+
+/// `awk 'NR>=738 && NR<=985' src/file.rs` is a line-range page, same as `sed -n`.
+fn parse_awk_range_dump(args: &[&str]) -> Option<String> {
+    let mut script: Option<&str> = None;
+    let mut path: Option<&str> = None;
+    for arg in args {
+        if *arg == "--" {
+            continue;
+        }
+        if arg.starts_with('-') {
+            return None;
+        }
+        if script.is_none() {
+            script = Some(arg);
+        } else if path.is_none() {
+            path = Some(arg);
+        } else {
+            return None;
+        }
+    }
+    let script = script?;
+    let lower = script.to_ascii_lowercase();
+    if lower.contains("system")
+        || lower.contains("getline")
+        || lower.contains("begin")
+        || lower.contains("end")
+    {
+        return None;
+    }
+    let (offset, limit) = parse_awk_line_range(script)?;
+    read_args_json(path?, Some(offset), Some(limit))
+}
+
+fn parse_awk_line_range(script: &str) -> Option<(usize, usize)> {
+    let compact: String = script.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let rest = compact.strip_prefix("NR>=")?;
+    let (start, rest) = rest.split_once("&&NR<=")?;
+    let start: usize = start.parse().ok()?;
+    let end_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    let end: usize = end_digits.parse().ok()?;
+    let tail = &rest[end_digits.len()..];
+    if !tail.is_empty() && tail != "{print}" && tail != "{print$0}" {
+        return None;
+    }
+    if start == 0 || end < start {
+        return None;
+    }
+    Some((start, end.saturating_sub(start).saturating_add(1)))
+}
+
+/// Paths a command pages with `cat`/`sed`/`head`/`awk`, including a compound
+/// `awk …; echo ====; awk …` that is not one `read`.
+pub(super) fn shell_page_paths(command: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for segment in split_top_level(command) {
+        let Some(arguments) = file_dump_read_arguments(segment) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&arguments) else {
+            continue;
+        };
+        if let Some(path) = value.get("path").and_then(|v| v.as_str()) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+fn split_top_level(command: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut quote: Option<char> = None;
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            ';' => {
+                let piece = command[start..i].trim();
+                if !piece.is_empty() {
+                    out.push(piece);
+                }
+                start = i + 1;
+            }
+            '&' if bytes.get(i + 1) == Some(&b'&') => {
+                let piece = command[start..i].trim();
+                if !piece.is_empty() {
+                    out.push(piece);
+                }
+                i += 1;
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = command[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
 }
 
 fn unquote(token: &str) -> &str {

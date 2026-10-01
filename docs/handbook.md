@@ -39,6 +39,14 @@ hi -m pipe/deepseek-v4-flash-0731 "…"
 Interactive `hi` talks to Pipe Network. An optional `openai` profile in config
 is only used for dashboard rows whose model id is prefixed `openai/`.
 
+Keys live in `~/.config/hi/auth.json`; `config.toml` holds only an
+`auth-store://…` reference. If a profile's entry is missing from the store
+(`hi logout`, a `config.toml` copied to a new machine, a rewritten store), `hi`
+on a terminal explains which profile lost its key and asks for it again,
+sealing it under the same reference so the profile keeps its model and
+settings; a headless run prints the same diagnosis with the commands to fix it
+and exits 2.
+
 Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
 
 ```bash
@@ -195,6 +203,43 @@ explicit independent cap. Parallel batches reserve the remaining budget before
 dispatch and return typed denials for the model-ordered suffix, so concurrency
 cannot overspend it.
 
+### Escalation ladder (`/ladder`, `hi --ladder`)
+
+Spend the expensive model only when the cheap one demonstrably failed.
+`/ladder <task>` runs the task on the cheapest rung, lets the verify command
+judge the attempt, and retries or climbs to a stronger model/effort only when
+the check fails. The retry prompt carries the failing output and the original
+task. An attempt that changed no files climbs at once. A request error (say, a
+404 for a model the endpoint does not serve) counts as a failed attempt; a
+completion-policy stop after edits is judged by the check like any other
+attempt.
+
+```toml
+[ladder]
+rungs = [
+  "pipe/deepseek-v4-flash low",   # /model syntax; an effort alone = session model
+  "pipe/deepseek-v4-pro high",
+  "pipe/gpt-6-astra high",
+]
+attempts = 1                  # attempts per rung before climbing (1-5)
+verify = "cargo test --quiet" # when /verify is unset
+jev_start = true              # with a TypeSafe key, a task Jev scores hard skips rung 1
+```
+
+Without `rungs` the ladder is low → medium → high effort on the session model;
+rungs that send the same request (DeepSeek maps medium to high) are merged. The
+check is `/verify`, else `[ladder] verify`, else the detected pipeline (script
+runners such as `npm test` or `make test` only in a trusted folder);
+`--no-verify` leaves no check and the ladder refuses to start. Rungs are live
+only: the session model and effort come back when the ladder ends, and
+snapshots never record a rung. `pipe/auto` is refused as a base or a rung
+because it picks models server-side. A repository `hi.toml` may lower
+`attempts` or turn `jev_start` off, but its `rungs` are ignored and its
+`verify` needs folder trust. `/ladder status` and `/ladder stop` work between
+turns; Esc cancels the running attempt and ends the ladder. Headless:
+`hi --ladder "make the failing test pass"` exits 0 verified, 2 usage, 3 every
+rung failed, 5 stopped early; `--report` adds a `ladder` object.
+
 ## Best-of-N
 
 Run several attempts and keep the one that actually passes — the **test suite is the judge**. `hi --best-of N` is the headless form of `/race`.
@@ -306,7 +351,8 @@ Slash commands (TUI or plain REPL):
 | `/compact [context]` | summarize the conversation to reclaim context |
 | `/context` | context-window breakdown (`/usage` Context tab) |
 | `/retry` | re-run the last prompt |
-| `/review [audit\|status\|stop] [all\|path…]` | spec review: audit the code against `plan.md`/`spec.md` (or, on a large repo without one, the uncommitted changes or the last commit; `all` chunks the whole repo), report coverage and defects, then fix P0/P1s in a bounded loop; headless `hi --spec-review` ([docs](review-command.md)) |
+| `/review [audit\|status\|stop] [all\|path…]` | spec review: audit the code against `plan.md`/`spec.md` (or, on a large repo without one, the uncommitted changes or the last commit, in turns of `[review] chunk_files` files; `all` chunks the whole repo), seeded by the verify command, with a read ledger (`read 21/23 files in scope`; unread files get continuation turns, leftovers make the audit partial), report coverage and defects, then fix P0/P1s in a bounded loop; headless `hi --spec-review` ([docs](review-command.md)) |
+| `/ladder [status\|stop\|<task>]` | run a task on the cheapest `[ladder]` rung; retry or climb to a stronger model/effort only when the verify command fails; headless `hi --ladder` ([details](#escalation-ladder-ladder-hi---ladder)) |
 | `/undo` | restore files from the last turn checkpoint |
 | `/status` | session status |
 | `/usage` (`/cost`) | credit/token usage modal; `/usage manage` opens billing |

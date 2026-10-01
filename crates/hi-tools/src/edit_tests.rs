@@ -237,6 +237,57 @@ fn normalize_confusables_is_length_preserving_per_char() {
 }
 
 #[test]
+fn edit_not_found_help_prefers_distinctive_lines_over_common_openers() {
+    // A live drme edit opened with `assert!(` and the helper cited the first
+    // three asserts in the file, hundreds of lines away from the film-grain
+    // site the rest of old_string actually described.
+    let mut file = String::new();
+    for i in 0..30 {
+        file.push_str(&format!(
+            "fn filler_{i}() {{\n    assert!(\n        side <= stride,\n        \"block exceeds\"\n    );\n}}\n"
+        ));
+    }
+    file.push_str(
+        "fn validate() {\n        assert!(matches!(\n            Av1EncodeConfig::new(64, 64)\n                .film_grain(Av1FilmGrainConfig { enabled: true, ..Default::default() })\n                .validate(),\n            Err(Av1Error::UnsupportedFeature(_))\n        ));\n}\n",
+    );
+    let old = "\
+        assert!(
+            matches!(
+                Av1EncodeConfig::new(64, 64)
+                    .film_grain(Av1FilmGrainConfig { enabled: true, ..Default::default() })
+                    .validate(),
+                Err(Av1Error::UnsupportedFeature(_))
+            ),
+            \"film grain should be rejected\"
+        );";
+    let msg = edit_not_found_help(&file, old);
+    let film = msg
+        .find("film_grain")
+        .expect("points at the film-grain assertion");
+    if let Some(block) = msg.find("block exceeds") {
+        assert!(
+            film < block,
+            "distinctive region comes before a common assert:\n{msg}"
+        );
+    }
+    assert!(msg.contains("UnsupportedFeature"), "{msg}");
+}
+
+#[test]
+fn edit_miss_says_when_new_string_is_already_in_the_file() {
+    let file = "\
+fn decode_frame_id(r: &mut BitReader) -> u32 {
+    r.read_uvlc().unwrap_or(0)
+}
+";
+    let old = "fn decode_frame_id(r: &mut BitReader) -> u32 {\n    0\n}";
+    let new = "fn decode_frame_id(r: &mut BitReader) -> u32 {\n    r.read_uvlc().unwrap_or(0)\n}";
+    let err = apply_edit(file, old, new, false).unwrap_err().to_string();
+    assert!(err.contains("already in this file"), "{err}");
+    assert!(err.contains("update_plan"), "{err}");
+}
+
+#[test]
 fn edit_not_found_help_finds_similar_lines() {
     // The needle has a typo ("funciton" vs "function") — no exact or
     // substring hit, but the similarity fallback should still point at the

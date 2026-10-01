@@ -26,6 +26,7 @@ fn finding(severity: crate::review::Severity, title: &str, location: &str) -> Fi
         location: Some(location.into()),
         verified: true,
         feature_gap: false,
+        from_verify: false,
     }
 }
 
@@ -65,10 +66,9 @@ fn verdict(complete: bool, findings: Vec<Finding>) -> ReviewVerdict {
 fn completed(verdict: Option<ReviewVerdict>, changed: &[&str]) -> ReviewTurnFacts {
     ReviewTurnFacts {
         stop_reason: TurnStopReason::Completed,
-        error: None,
         changed_files: changed.iter().map(|s| s.to_string()).collect(),
         verdict,
-        unverified_citations: Vec::new(),
+        ..ReviewTurnFacts::default()
     }
 }
 
@@ -531,10 +531,7 @@ fn cancel_pauses_and_resume_prompt_replays_the_phase() {
     let mut drive = ReviewDrive::start(inputs(), false, 3);
     let cancelled = ReviewTurnFacts {
         stop_reason: TurnStopReason::Cancelled,
-        error: None,
-        changed_files: Vec::new(),
-        verdict: None,
-        unverified_citations: Vec::new(),
+        ..ReviewTurnFacts::default()
     };
     let step = drive.next_step(&cancelled);
     assert!(matches!(step, ReviewStep::Paused(ref t) if t.contains("paused during audit")));
@@ -571,8 +568,7 @@ fn errored(error: &str, changed: &[&str]) -> ReviewTurnFacts {
         stop_reason: TurnStopReason::Error,
         error: Some(error.into()),
         changed_files: changed.iter().map(|s| s.to_string()).collect(),
-        verdict: None,
-        unverified_citations: Vec::new(),
+        ..ReviewTurnFacts::default()
     }
 }
 

@@ -1,23 +1,29 @@
-//! `/review` drive: the audit -> fix -> re-audit state machine and its
-//! `Harness` glue.
+//! `/review` drive: the audit -> fix -> re-audit state machine.
 //!
-//! The state machine itself ([`ReviewDrive::next_step`]) is pure so every
-//! transition can be unit-tested without a model. The harness methods below
-//! feed it facts from the turn that just ended, seed the fix checklist, arm
-//! the forced intent for the next turn, and persist the drive.
+//! [`ReviewDrive::next_step`] is pure so every transition can be
+//! unit-tested without a model. The `Harness` glue that feeds it facts from
+//! the turn that just ended, seeds the fix checklist, arms the forced
+//! intent, and persists the drive is in [`crate::review_harness`]; the
+//! report it renders is in [`crate::review_report`].
 
-use hi_ai::Role;
-use hi_tools::{PlanStatus, PlanStep};
 use serde::{Deserialize, Serialize};
 
+use crate::TurnStopReason;
 use crate::completion::Intent;
 use crate::review::{
-    ChecklistItem, DEFAULT_REVIEW_PASSES, Finding, InputKind, REVIEW_PREFIX, ReviewAction,
-    ReviewArgs, ReviewInputs, ReviewVerdict, audit_prompt, check_citations, chunk_label,
-    discover_inputs, fingerprint, fix_prompt, format_reask_prompt, parse_checklist, reaudit_prompt,
+    ChecklistItem, DEFAULT_REVIEW_PASSES, Finding, REVIEW_PREFIX, ReviewInputs, ReviewVerdict,
+    VerifySeed, audit_prompt, chunk_label, continuation_prompt, fix_prompt, format_reask_prompt,
+    reaudit_prompt, same_finding_set, uncited_changes,
 };
-use crate::ui::Ui;
-use crate::{Harness, TurnOutcome, TurnStopReason};
+use crate::review_reads::unread_files;
+
+/// Continuation turns per chunk when a defects-only audit leaves files in
+/// scope unread. What is still unread after them makes the audit partial.
+pub const MAX_CONTINUATIONS: u32 = 2;
+
+/// Unread files kept by name on the drive (and in the report); the count
+/// is exact.
+const UNREAD_LISTED: usize = 100;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,9 +69,10 @@ pub struct ReviewDrive {
     pub checklist_items: Vec<ChecklistItem>,
     #[serde(default)]
     pub last_verdict: Option<ReviewVerdict>,
-    /// Fingerprint of the P0/P1 set that started the current fix pass.
+    /// The P0/P1 set that started the current fix pass; a re-audit that
+    /// reports the same set (same places, however worded) is no progress.
     #[serde(default)]
-    pub last_fingerprint: Option<String>,
+    pub last_blocking: Vec<Finding>,
     #[serde(default)]
     pub format_retry_used: bool,
     /// Blocking findings handed to the current fix pass.
@@ -77,6 +84,11 @@ pub struct ReviewDrive {
     /// Files changed by every fix pass so far.
     #[serde(default)]
     pub all_changed_files: Vec<String>,
+    /// Files a fix pass changed that none of its findings cited (tests and
+    /// lockfiles excepted). The re-audit is pointed at them; the report
+    /// warns.
+    #[serde(default)]
+    pub uncited_changes: Vec<String>,
     /// Files an audit or re-audit turn changed. Those turns are read-only
     /// and write tools are denied, but a shell redirection cannot be proven
     /// mutating up front; anything that slips through is reported here so
@@ -91,14 +103,36 @@ pub struct ReviewDrive {
     /// unverified stop, tool storm). The re-audit judges the tree it left.
     #[serde(default)]
     pub fix_turn_error: Option<String>,
-    /// Chunked audit (`all`): index into `inputs.chunks` of the chunk being
+    /// Chunked audit: index into `inputs.chunks` of the chunk being
     /// audited; equals the chunk count once the audit phase is over.
     #[serde(default)]
     pub chunk: usize,
-    /// Chunked audit: the verdicts of the chunks done so far, merged. Becomes
-    /// `last_verdict` when the last chunk is in.
+    /// The verdicts of this audit's turns so far (chunks and
+    /// continuations), merged. Becomes `last_verdict` when the audit ends.
     #[serde(default)]
     pub chunk_verdict: Option<ReviewVerdict>,
+    /// Continuation turns spent on the current chunk.
+    #[serde(default)]
+    pub continuations: u32,
+    /// Files the audit turns read (workspace-relative), every turn.
+    #[serde(default)]
+    pub read_files: Vec<String>,
+    /// Files in scope still unread when the audit gave up asking (first
+    /// [`UNREAD_LISTED`] by name); a defects-only audit with any is partial.
+    #[serde(default)]
+    pub unread_files: Vec<String>,
+    #[serde(default)]
+    pub unread_count: usize,
+    /// Files in scope, over the whole audit (for `read N/M`).
+    #[serde(default)]
+    pub scope_count: usize,
+    /// The seed command's last run ([`crate::review_seed`]).
+    #[serde(default)]
+    pub verify: Option<VerifySeed>,
+    /// True when the next audit or re-audit turn should run the seed
+    /// command first; the turn loop clears it.
+    #[serde(default)]
+    pub pending_seed: bool,
 }
 
 impl Default for ReviewDrive {
@@ -112,22 +146,30 @@ impl Default for ReviewDrive {
             inputs: ReviewInputs::default(),
             checklist_items: Vec::new(),
             last_verdict: None,
-            last_fingerprint: None,
+            last_blocking: Vec::new(),
             format_retry_used: false,
             findings_to_fix: Vec::new(),
             changed_files: Vec::new(),
             all_changed_files: Vec::new(),
+            uncited_changes: Vec::new(),
             audit_changed_files: Vec::new(),
             unverified_citations: Vec::new(),
             stop_reason: None,
             fix_turn_error: None,
             chunk: 0,
             chunk_verdict: None,
+            continuations: 0,
+            read_files: Vec::new(),
+            unread_files: Vec::new(),
+            unread_count: 0,
+            scope_count: 0,
+            verify: None,
+            pending_seed: false,
         }
     }
 }
 
-/// What the frontend does after [`Harness::review_next_step`].
+/// What the frontend does after `Harness::review_next_step`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewStep {
     /// Run another turn with this prompt.
@@ -154,7 +196,7 @@ pub enum ReviewCommand {
 }
 
 /// Facts about the turn that just ended, as the state machine sees them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ReviewTurnFacts {
     pub stop_reason: TurnStopReason,
     pub error: Option<String>,
@@ -162,6 +204,11 @@ pub struct ReviewTurnFacts {
     /// Parsed from the turn's assistant text, citations already checked.
     pub verdict: Option<ReviewVerdict>,
     pub unverified_citations: Vec<String>,
+    /// Files an audit turn read ([`crate::review_reads`]).
+    pub read_files: Vec<String>,
+    /// Files under audit in this turn, when the scope is bounded (a
+    /// defects-only audit); `None` leaves read coverage untracked.
+    pub scope_files: Option<Vec<String>>,
 }
 
 impl ReviewDrive {
@@ -171,6 +218,7 @@ impl ReviewDrive {
             max_passes: max_passes.max(1),
             audit_only,
             inputs,
+            pending_seed: true,
             ..Self::default()
         }
     }
@@ -232,7 +280,7 @@ impl ReviewDrive {
     /// `spec review · fix pass 1/3 · 2 P0/P1 · plan.md + docs/spec.md`; a
     /// narrowed audit adds its scope: `… · audit only · 47 uncommitted files
     /// (git status) · no plan/spec (defects only)`, `… · audit · chunk 2/7
-    /// · crates/hi-cli · …`.
+    /// · crates/hi-cli · continued 1/2 · …`.
     pub fn status_line(&self) -> String {
         let mut parts = vec!["spec review".to_string()];
         let mut chunk_shown = false;
@@ -251,7 +299,13 @@ impl ReviewDrive {
                         self.inputs.chunks.len(),
                         chunk_label(chunk)
                     ));
-                    chunk_shown = true;
+                    chunk_shown = self.inputs.git.is_none();
+                }
+                if self.continuations > 0 {
+                    parts.push(format!(
+                        "continued {}/{MAX_CONTINUATIONS}",
+                        self.continuations
+                    ));
                 }
             }
             ReviewPhase::Fix => parts.push(format!(
@@ -292,28 +346,51 @@ impl ReviewDrive {
     /// Prompt that re-runs the current phase after a pause or a reload.
     pub fn resume_prompt(&self) -> Option<String> {
         match self.phase {
-            ReviewPhase::Audit => {
-                Some(audit_prompt(&self.inputs, &[], self.chunk, self.max_passes))
-            }
+            ReviewPhase::Audit => Some(audit_prompt(
+                &self.inputs,
+                &[],
+                self.chunk,
+                self.max_passes,
+                self.verify.as_ref(),
+            )),
             ReviewPhase::Fix => Some(fix_prompt(
                 &self.findings_to_fix,
                 self.pass,
                 self.max_passes,
             )),
-            ReviewPhase::Reaudit => Some(reaudit_prompt(
-                &self.inputs,
-                &self.coverage_items(),
-                &self.changed_files,
-                &self.findings_to_fix,
-                self.pass,
-                self.max_passes,
-            )),
+            ReviewPhase::Reaudit => Some(self.reaudit_prompt()),
             _ => None,
         }
     }
 
-    fn stop(&mut self, reason: impl Into<String>) -> ReviewStep {
+    fn reaudit_prompt(&self) -> String {
+        reaudit_prompt(
+            &self.inputs,
+            &self.coverage_items(),
+            &self.changed_files,
+            &self.uncited_changes,
+            &self.findings_to_fix,
+            self.pass,
+            self.max_passes,
+        )
+    }
+
+    /// `audit` / `re-audit 2`: what the next seed run precedes.
+    pub fn seed_label(&self) -> String {
+        match self.phase {
+            ReviewPhase::Reaudit => format!("re-audit {}", self.pass),
+            _ => "audit".to_string(),
+        }
+    }
+
+    /// End the loop. An audit stopped between its turns (continuations,
+    /// chunks) reports what its finished turns found.
+    pub(crate) fn stop(&mut self, reason: impl Into<String>) -> ReviewStep {
         let reason = reason.into();
+        if let Some(mut partial) = self.chunk_verdict.take() {
+            partial.mark_feature_gaps(&self.unchecked_items());
+            self.last_verdict = Some(partial);
+        }
         self.phase = ReviewPhase::Stopped;
         self.paused = false;
         self.stop_reason = Some(reason.clone());
@@ -326,11 +403,8 @@ impl ReviewDrive {
             return ReviewStep::Idle;
         }
         if matches!(self.phase, ReviewPhase::Audit | ReviewPhase::Reaudit) {
-            for file in &facts.changed_files {
-                if !self.audit_changed_files.contains(file) {
-                    self.audit_changed_files.push(file.clone());
-                }
-            }
+            push_unique(&mut self.audit_changed_files, &facts.changed_files);
+            push_unique(&mut self.read_files, &facts.read_files);
         }
         match facts.stop_reason {
             TurnStopReason::Cancelled => {
@@ -351,7 +425,7 @@ impl ReviewDrive {
                 // A fix turn ending on a completion-policy error (plan
                 // stall because the defect was already fixed, unverified
                 // stop, tool storm) still leaves a tree worth judging. The
-                // re-audit decides; its fingerprint and the pass cap bound
+                // re-audit decides; the blocking set and the pass cap bound
                 // the loop.
                 self.fix_turn_error = Some(error);
             }
@@ -360,23 +434,13 @@ impl ReviewDrive {
         match self.phase {
             ReviewPhase::Audit | ReviewPhase::Reaudit => self.after_audit(facts),
             ReviewPhase::Fix => {
-                for file in &facts.changed_files {
-                    if !self.changed_files.contains(file) {
-                        self.changed_files.push(file.clone());
-                    }
-                    if !self.all_changed_files.contains(file) {
-                        self.all_changed_files.push(file.clone());
-                    }
-                }
+                push_unique(&mut self.changed_files, &facts.changed_files);
+                push_unique(&mut self.all_changed_files, &facts.changed_files);
+                let uncited = uncited_changes(&facts.changed_files, &self.findings_to_fix);
+                push_unique(&mut self.uncited_changes, &uncited);
                 self.phase = ReviewPhase::Reaudit;
-                ReviewStep::RunPrompt(reaudit_prompt(
-                    &self.inputs,
-                    &self.coverage_items(),
-                    &self.changed_files,
-                    &self.findings_to_fix,
-                    self.pass,
-                    self.max_passes,
-                ))
+                self.pending_seed = true;
+                ReviewStep::RunPrompt(self.reaudit_prompt())
             }
             _ => ReviewStep::Idle,
         }
@@ -400,21 +464,28 @@ impl ReviewDrive {
             return self.stop("no parseable <review> block after one format re-ask");
         };
         self.format_retry_used = false;
-        if self.phase == ReviewPhase::Audit && self.chunk > 0 {
-            // Later chunks add to the first chunk's unverified citations.
-            for path in &facts.unverified_citations {
-                if !self.unverified_citations.contains(path) {
-                    self.unverified_citations.push(path.clone());
-                }
-            }
+        if self.phase == ReviewPhase::Audit {
+            // Every turn of one audit adds to its unverified citations.
+            push_unique(&mut self.unverified_citations, &facts.unverified_citations);
         } else {
             self.unverified_citations = facts.unverified_citations.clone();
         }
-        let mut verdict = match self.absorb_chunk(verdict) {
-            Ok(verdict) => verdict,
-            Err(next_chunk) => return ReviewStep::RunPrompt(next_chunk),
+        let running = match self.chunk_verdict.take() {
+            Some(mut running) => {
+                running.merge(verdict);
+                running
+            }
+            None => verdict,
         };
+        if self.phase == ReviewPhase::Audit
+            && let Some(prompt) = self.continue_audit(facts, &running)
+        {
+            self.chunk_verdict = Some(running);
+            return ReviewStep::RunPrompt(prompt);
+        }
+        let mut verdict = running;
         verdict.mark_feature_gaps(&self.unchecked_items());
+        self.seed_finding(&mut verdict);
         let blocking = verdict.blocking_findings();
         let was_reaudit = self.phase == ReviewPhase::Reaudit;
         self.last_verdict = Some(verdict);
@@ -424,8 +495,7 @@ impl ReviewDrive {
             self.paused = false;
             return ReviewStep::Done(self.done_summary());
         }
-        let print = fingerprint(&blocking);
-        if was_reaudit && self.last_fingerprint.as_deref() == Some(print.as_str()) {
+        if was_reaudit && same_finding_set(&self.last_blocking, &blocking) {
             return self.stop(format!(
                 "no progress: the same {} P0/P1 finding(s) remain after fix pass {}",
                 blocking.len(),
@@ -439,7 +509,7 @@ impl ReviewDrive {
                 self.pass
             ));
         }
-        self.last_fingerprint = Some(print);
+        self.last_blocking = blocking.clone();
         self.pass += 1;
         self.phase = ReviewPhase::Fix;
         self.findings_to_fix = blocking;
@@ -451,261 +521,96 @@ impl ReviewDrive {
         ))
     }
 
-    /// In a chunked audit, fold this chunk's verdict into the running one
-    /// and move to the next chunk (`Err(prompt)`); once the last chunk is
-    /// in, the merged verdict is the audit's (`Ok`). Not chunked: `Ok` as is.
-    fn absorb_chunk(&mut self, verdict: ReviewVerdict) -> Result<ReviewVerdict, String> {
-        if self.phase != ReviewPhase::Audit || self.inputs.chunks.is_empty() {
-            return Ok(verdict);
-        }
-        let merged = match self.chunk_verdict.take() {
-            Some(mut running) => {
-                running.merge(verdict);
-                running
-            }
-            None => verdict,
-        };
-        self.chunk += 1;
-        if self.chunk < self.inputs.chunks.len() {
-            self.chunk_verdict = Some(merged);
-            return Err(audit_prompt(&self.inputs, &[], self.chunk, self.max_passes));
-        }
-        Ok(merged)
-    }
-}
-
-fn plan_steps_for(findings: &[Finding]) -> Vec<PlanStep> {
-    findings
-        .iter()
-        .map(|finding| PlanStep {
-            title: finding.label(),
-            status: PlanStatus::Pending,
-        })
-        .collect()
-}
-
-impl Harness {
-    pub fn review_drive(&self) -> &ReviewDrive {
-        &self.review_drive
-    }
-
-    /// `/review [audit|status|stop] [all] [path...]`.
-    pub fn review_command(&mut self, arg: &str) -> ReviewCommand {
-        let args = ReviewArgs::parse(arg);
-        match args.action {
-            ReviewAction::Status => ReviewCommand::Message(self.review_status_text()),
-            ReviewAction::Stop => ReviewCommand::Message(self.stop_review()),
-            ReviewAction::Run
-                if args.paths.is_empty() && !args.all && self.review_drive.is_active() =>
-            {
-                self.resume_review()
-            }
-            ReviewAction::Run | ReviewAction::Audit => {
-                let audit_only = args.action == ReviewAction::Audit;
-                match self.begin_review(&args.paths, args.all, audit_only, DEFAULT_REVIEW_PASSES) {
-                    Ok(prompt) => ReviewCommand::Start {
-                        prompt,
-                        notes: self.review_start_notes(),
-                    },
-                    Err(message) => ReviewCommand::Message(message),
-                }
-            }
-        }
-    }
-
-    fn review_start_notes(&self) -> Vec<String> {
-        let mut notes = vec![self.review_drive.status_line()];
-        if let Some(notice) = &self.review_drive.inputs.notice {
-            notes.push(format!("spec review: {notice}"));
-        }
-        notes
-    }
-
-    /// Discover inputs, decide the scope ([`crate::review_scope`]), start a
-    /// drive, and return the first audit prompt. `Err` carries a user-facing
-    /// message: a missing explicit path, or a large workspace with nothing
-    /// to audit against and no recent work.
-    pub fn begin_review(
+    /// In the audit phase, after a turn's verdict was merged into
+    /// `running`: the prompt for another turn of the same audit, or `None`
+    /// when the audit is complete. A defects-only turn that left files in
+    /// scope unread gets a continuation (bounded per chunk; what is left
+    /// after that makes the audit partial); then the next chunk, if any.
+    fn continue_audit(
         &mut self,
-        paths: &[String],
-        all: bool,
-        audit_only: bool,
-        max_passes: u32,
-    ) -> Result<String, String> {
-        let mut inputs = discover_inputs(&self.workspace_root, paths);
-        if !inputs.missing.is_empty() {
-            return Err(format!(
-                "spec review: {}",
-                inputs.notice.unwrap_or_else(|| "missing input".into())
-            ));
+        facts: &ReviewTurnFacts,
+        running: &ReviewVerdict,
+    ) -> Option<String> {
+        if let Some(scope) = &facts.scope_files {
+            self.scope_count = self.scope_count_with(scope);
+            let unread = unread_files(scope, &self.read_files);
+            if !unread.is_empty() {
+                // A spec audit reads what grounds its items: its unread
+                // files are reported, not re-asked.
+                if self.inputs.defects_only() && self.continuations < MAX_CONTINUATIONS {
+                    self.continuations += 1;
+                    return Some(continuation_prompt(
+                        &self.inputs,
+                        self.chunk,
+                        &unread,
+                        &running.findings,
+                        self.continuations,
+                        MAX_CONTINUATIONS,
+                        self.verify.as_ref(),
+                    ));
+                }
+                self.unread_count += unread.len();
+                for file in unread {
+                    if self.unread_files.len() < UNREAD_LISTED {
+                        self.unread_files.push(file);
+                    }
+                }
+            }
         }
-        crate::review_scope::resolve_target(&self.workspace_root, &mut inputs, all)?;
-        // A README's lists are install steps and tips, not a checklist of
-        // claims; its feature claims become coverage rows via the prompt.
-        let checklists: Vec<(String, Vec<ChecklistItem>)> = inputs
-            .files
-            .iter()
-            .filter(|input| input.kind != InputKind::Readme)
-            .map(|input| {
-                let body = std::fs::read_to_string(self.workspace_root.join(&input.path))
-                    .unwrap_or_default();
-                (input.path.clone(), parse_checklist(&body))
-            })
-            .collect();
-        let prompt = audit_prompt(&inputs, &checklists, 0, max_passes.max(1));
-        self.review_drive = ReviewDrive::start(inputs, audit_only, max_passes);
-        self.review_drive.checklist_items = checklists
-            .into_iter()
-            .flat_map(|(_, items)| items)
-            .collect();
-        self.forced_intent = Some(Intent::Review);
-        self.persist_review_drive();
-        Ok(prompt)
+        self.continuations = 0;
+        if self.inputs.chunks.is_empty() {
+            return None;
+        }
+        self.chunk += 1;
+        (self.chunk < self.inputs.chunks.len()).then(|| {
+            audit_prompt(
+                &self.inputs,
+                &[],
+                self.chunk,
+                self.max_passes,
+                self.verify.as_ref(),
+            )
+        })
     }
 
-    fn resume_review(&mut self) -> ReviewCommand {
-        let Some(prompt) = self.review_drive.resume_prompt() else {
-            return ReviewCommand::Message(self.review_status_text());
+    /// Scope files seen so far plus this chunk's: chunks are disjoint, so a
+    /// chunked audit sums them; a continuation of the same chunk does not.
+    fn scope_count_with(&self, scope: &[String]) -> usize {
+        if self.continuations > 0 {
+            self.scope_count
+        } else {
+            self.scope_count + scope.len()
+        }
+    }
+
+    /// The seed command failed and the model reported no P0/P1: the
+    /// failure is the defect, unless plan items are missing (then the
+    /// failing tests are likely theirs, and a fix pass must not build them)
+    /// or its output names no workspace file (a missing toolchain, no
+    /// network, a read-only sandbox: nothing a fix pass can reach).
+    fn seed_finding(&self, verdict: &mut ReviewVerdict) {
+        let Some(seed) = &self.verify else {
+            return;
         };
-        self.review_drive.paused = false;
-        if self.review_drive.phase == ReviewPhase::Fix
-            && !crate::completion::plan_is_open(&self.plan)
-        {
-            self.seed_plan(plan_steps_for(&self.review_drive.findings_to_fix));
+        if seed.passed || seed.location.is_none() || verdict.has_blocking() {
+            return;
         }
-        self.forced_intent = self.review_drive.intent_for_prompt(&prompt);
-        self.persist_review_drive();
-        ReviewCommand::Start {
-            prompt,
-            notes: vec![format!("resuming {}", self.review_drive.status_line())],
-        }
-    }
-
-    /// Feed the turn that just ended into the drive. Returns what to do next;
-    /// seeds the fix checklist and arms the forced intent when the answer is
-    /// another turn. The phase status line is announced by that turn when it
-    /// starts (`review_turn_status`), so it is not repeated here.
-    pub fn review_next_step(&mut self, outcome: &TurnOutcome, ui: &mut dyn Ui) -> ReviewStep {
-        if !self.review_drive.is_active() || self.review_drive.paused {
-            return ReviewStep::Idle;
-        }
-        let facts = self.review_turn_facts(outcome);
-        let step = self.review_drive.next_step(&facts);
-        match &step {
-            ReviewStep::RunPrompt(prompt) => {
-                if self.review_drive.phase == ReviewPhase::Fix {
-                    self.seed_plan(plan_steps_for(&self.review_drive.findings_to_fix));
-                    ui.plan(&self.plan);
-                }
-                self.forced_intent = self.review_drive.intent_for_prompt(prompt);
-            }
-            ReviewStep::Paused(_) => ui.suggested_prompt("/review"),
-            ReviewStep::Done(_) | ReviewStep::Stopped(_) => {
-                if self.drop_review_checklist() {
-                    ui.plan(&[]);
-                }
-            }
-            ReviewStep::Idle => {}
-        }
-        self.persist_review_drive();
-        step
-    }
-
-    /// The checklist seeded for the fix passes belongs to the review. Once
-    /// the loop ends, the report carries what is still open; a leftover
-    /// `[P0]` step would otherwise keep the plan drive nagging and make the
-    /// completion policy demand edits on the user's next prompt.
-    fn drop_review_checklist(&mut self) -> bool {
-        if self.review_drive.pass == 0 || self.plan.is_empty() {
-            return false;
-        }
-        self.seed_plan(Vec::new());
-        true
-    }
-
-    fn review_turn_facts(&self, outcome: &TurnOutcome) -> ReviewTurnFacts {
-        let text = self.last_turn_assistant_text();
-        let mut verdict = ReviewVerdict::parse(&text);
-        let unverified = verdict
-            .as_mut()
-            .map(|verdict| check_citations(&self.workspace_root, verdict))
-            .unwrap_or_default();
-        ReviewTurnFacts {
-            stop_reason: outcome.stop_reason,
-            error: outcome.error.clone(),
-            changed_files: outcome.changed_files.clone(),
-            verdict,
-            unverified_citations: unverified,
-        }
-    }
-
-    /// Assistant text since the last user line, joined. The verdict block is
-    /// normally in the final reply, but a model may emit it a round early.
-    fn last_turn_assistant_text(&self) -> String {
-        let start = self
-            .messages
+        let items_missing = verdict
+            .coverage
             .iter()
-            .rposition(|message| message.role == Role::User)
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        self.messages[start..]
-            .iter()
-            .filter(|message| message.role == Role::Assistant)
-            .map(|message| message.text())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    pub fn review_status_text(&self) -> String {
-        if self.review_drive.phase == ReviewPhase::Idle {
-            return "spec review: not running · /review starts one (/review audit reports only; /review audit all covers the whole repo in chunks)"
-                .into();
+            .any(|row| row.state != crate::review::CoverageState::Implemented);
+        if items_missing {
+            return;
         }
-        self.review_drive.status_report().join("\n")
+        verdict.findings.insert(0, seed.synthetic_finding());
     }
+}
 
-    /// End the loop and drop a checklist seeded for the current fix pass.
-    pub fn stop_review(&mut self) -> String {
-        if !self.review_drive.is_active() {
-            return format!(
-                "spec review: nothing to stop · {}",
-                self.review_drive.status_line()
-            );
+fn push_unique(into: &mut Vec<String>, items: &[String]) {
+    for item in items {
+        if !into.contains(item) {
+            into.push(item.clone());
         }
-        self.drop_review_checklist();
-        let step = self.review_drive.stop("stopped by /review stop");
-        self.forced_intent = None;
-        self.persist_review_drive();
-        match step {
-            ReviewStep::Stopped(text) => text,
-            _ => "spec review stopped".into(),
-        }
-    }
-
-    /// Status line for the turn that is about to run, when it is a review turn.
-    pub(crate) fn review_turn_status(&self, prompt: &str) -> Option<String> {
-        self.review_drive
-            .intent_for_prompt(prompt)
-            .map(|_| self.review_drive.status_line())
-    }
-
-    /// Replace the checklist (persisted). Empty clears it.
-    pub(crate) fn seed_plan(&mut self, steps: Vec<PlanStep>) {
-        self.plan = steps;
-        if let Some(session) = &mut self.session {
-            let _ = session.record_plan(&self.plan);
-        }
-    }
-
-    pub(crate) fn persist_review_drive(&mut self) {
-        if let Some(session) = &mut self.session {
-            let _ = session.record_review_drive(&self.review_drive);
-        }
-    }
-
-    /// Findings still open, for headless exit codes.
-    pub fn review_open_blocking(&self) -> Vec<Finding> {
-        self.review_drive.open_blocking()
     }
 }
 
@@ -716,3 +621,7 @@ mod tests;
 #[cfg(test)]
 #[path = "review_drive_scope_tests.rs"]
 mod scope_tests;
+
+#[cfg(test)]
+#[path = "review_drive_reads_tests.rs"]
+mod reads_tests;

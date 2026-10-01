@@ -341,6 +341,7 @@ fn fingerprint_is_stable_and_order_independent() {
         location: Some("src/server.rs:88".into()),
         verified: true,
         feature_gap: false,
+        from_verify: false,
     };
     let b = Finding {
         severity: Severity::P1,
@@ -348,6 +349,7 @@ fn fingerprint_is_stable_and_order_independent() {
         location: Some("src/commands.rs:40".into()),
         verified: true,
         feature_gap: false,
+        from_verify: false,
     };
     let mut moved = a.clone();
     moved.location = Some("src/server.rs:120".into());
@@ -571,4 +573,34 @@ residual: chunk b\n</review>",
     );
     assert!(!clean.complete);
     assert_eq!(clean.findings.len(), 1);
+}
+
+/// Only a repeated row is dropped: a distinct defect a few lines from
+/// another in the same file, sharing a word with it, is kept (a P0 folded
+/// into a P2 would let the audit end clean).
+#[test]
+fn nearby_distinct_findings_are_not_deduped() {
+    let verdict = ReviewVerdict::parse(
+        "<review>\nverdict: COMPLETE\n\
+finding: P2 | Unused import in parser | src/parser.rs:3\n\
+finding: P0 | Parser overflows stack on nested input | src/parser.rs:12\n\
+</review>",
+    )
+    .unwrap();
+    assert_eq!(verdict.findings.len(), 2, "{:?}", verdict.findings);
+    assert_eq!(verdict.blocking_findings().len(), 1);
+
+    let mut first = ReviewVerdict::parse(
+        "<review>\nverdict: COMPLETE\n\
+finding: P1 | Parser drops the last token | src/parser.rs:40\n</review>",
+    )
+    .unwrap();
+    first.merge(
+        ReviewVerdict::parse(
+            "<review>\nverdict: COMPLETE\n\
+finding: P0 | Parser panics on empty input | src/parser.rs:44\n</review>",
+        )
+        .unwrap(),
+    );
+    assert_eq!(first.blocking_findings().len(), 2, "{:?}", first.findings);
 }

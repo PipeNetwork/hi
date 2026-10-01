@@ -325,6 +325,14 @@ pub struct Cli {
     #[arg(long, requires = "spec_review")]
     pub spec_review_audit_only: bool,
 
+    /// Headless escalation ladder (the `/ladder` slash command): run PROMPT
+    /// on the cheapest `[ladder]` rung, judge every attempt with the verify
+    /// command, and retry or climb to a stronger model/effort only when it
+    /// fails. Exit 0 verified, 3 every rung failed, 5 stopped early.
+    /// `--report` adds a `ladder` object.
+    #[arg(long, requires = "prompt", conflicts_with_all = ["spec_review", "goal", "eval_input"])]
+    pub ladder: bool,
+
     /// Run this session in an isolated copy-on-write worktree of the current
     /// repo (one-shot `hi "prompt" --worktree` or interactive). The copy is
     /// removed when the process exits. Distinct from `-p`/`--profile`.
@@ -486,6 +494,13 @@ pub struct Cli {
     /// Quiet: print only the assistant's text (no tool chatter or usage line).
     #[arg(short = 'q', long)]
     pub quiet: bool,
+
+    /// One-shot: after the turn, keep running "Continue the open plan." while
+    /// the plan has open steps, until it finishes or the drive pauses (two
+    /// turns without progress, or HI_PLAN_DRIVE_MAX_TURNS). The TUI always
+    /// drives an open plan.
+    #[arg(long, requires = "prompt")]
+    pub drive: bool,
 
     /// Offline detector eval of the skeptic reviewer: read a JSON
     /// `{objective, sub_goal, diff}` from stdin, run the real skeptic review, print

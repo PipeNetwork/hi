@@ -321,6 +321,11 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// How long a display diff may search for the shortest edit script. Past this
+/// the diff stays correct but may be longer than minimal, so rewriting a large
+/// file cannot stall the edit that produced it.
+const DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A compact, readable diff for UI display: a bold one-line summary of how many
 /// lines changed, then each changed region shown with a few lines of unchanged
 /// context, gutter line numbers, and `±` signs. The context and line numbers let
@@ -329,17 +334,32 @@ pub(crate) fn sh_quote(s: &str) -> String {
 /// `display` half of an edit's [`crate::ToolOutcome`], so the extra context costs no
 /// tokens. (`/diff` shows the full working-tree diff.)
 pub(crate) fn diff(before: &str, after: &str) -> String {
-    use similar::{ChangeTag, TextDiff};
+    diff_within(before, after, usize::MAX)
+}
+
+/// [`diff`] with the body cut off once it reaches `max_body_chars`. The
+/// summary line always counts every changed line, however large the file or
+/// the change: the UI reads its `+N -M` from that line alone.
+pub(crate) fn diff_within(before: &str, after: &str, max_body_chars: usize) -> String {
+    use similar::{ChangeTag, DiffOp, TextDiff};
     /// Lines of unchanged context shown on each side of a changed region.
     const CONTEXT: usize = 2;
 
-    let tdiff = TextDiff::from_lines(before, after);
+    let tdiff = TextDiff::configure()
+        .timeout(DIFF_TIMEOUT)
+        .diff_lines(before, after);
     let (mut adds, mut dels) = (0usize, 0usize);
-    for change in tdiff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => adds += 1,
-            ChangeTag::Delete => dels += 1,
-            ChangeTag::Equal => {}
+    for op in tdiff.ops() {
+        match *op {
+            DiffOp::Insert { new_len, .. } => adds += new_len,
+            DiffOp::Delete { old_len, .. } => dels += old_len,
+            DiffOp::Replace {
+                old_len, new_len, ..
+            } => {
+                dels += old_len;
+                adds += new_len;
+            }
+            DiffOp::Equal { .. } => {}
         }
     }
     if adds == 0 && dels == 0 {
@@ -347,12 +367,17 @@ pub(crate) fn diff(before: &str, after: &str) -> String {
     }
 
     let mut body = String::new();
-    for (hunk_idx, group) in tdiff.grouped_ops(CONTEXT).iter().enumerate() {
+    'hunks: for (hunk_idx, group) in tdiff.grouped_ops(CONTEXT).iter().enumerate() {
         if hunk_idx > 0 {
             body.push_str("\x1b[2m   ⋯\x1b[0m\n"); // gap between changed regions
         }
         for op in group {
             for change in tdiff.iter_changes(op) {
+                let room = max_body_chars.saturating_sub(body.len());
+                if room == 0 {
+                    body.push_str("\x1b[2m   … (diff truncated)\x1b[0m\n");
+                    break 'hunks;
+                }
                 // Number each line by its own side of the diff: removed lines by
                 // their old position, added/context lines by their new one.
                 let (idx, sign, color) = match change.tag() {
@@ -364,7 +389,7 @@ pub(crate) fn diff(before: &str, after: &str) -> String {
                     .map(|i| format!("{:>4}", i + 1))
                     .unwrap_or_else(|| "    ".to_string());
                 let text = change.value();
-                let text = text.strip_suffix('\n').unwrap_or(text);
+                let text = clip_to_char_boundary(text.strip_suffix('\n').unwrap_or(text), room);
                 body.push_str(&format!("{color}{gutter} {sign} {text}\x1b[0m\n"));
             }
         }
@@ -376,6 +401,19 @@ pub(crate) fn diff(before: &str, after: &str) -> String {
         plural(adds),
         plural(dels)
     )
+}
+
+/// The longest prefix of `text` within `max` bytes that ends on a character
+/// boundary.
+fn clip_to_char_boundary(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Replace `old` with `new` in `text`, tolerating the whitespace differences
@@ -464,7 +502,7 @@ pub(crate) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
         return Ok(splice(text, start, end, replacement));
     }
 
-    bail!("{}", edit_not_found_help(text, old));
+    bail!("{}", edit_miss_message(text, old, new));
 }
 
 /// Rewrite only replacement newline bytes to follow the exact sequence in the
@@ -515,68 +553,39 @@ fn preserve_line_endings(replacement: &str, matched: &str) -> String {
 /// than blindly retrying the same string. Falls back to similarity scoring when
 /// no line contains the needle — so a model that got a line slightly wrong still
 /// gets pointed at the right region instead of "no line resembles".
+///
+/// The anchor is the most distinctive line in `old_string`, not the first one.
+/// A multi-line edit that opens with `assert!(` or `{` used to cite the first
+/// three of those in the file and miss the real site hundreds of lines later.
 pub(crate) fn edit_not_found_help(text: &str, old: &str) -> String {
     let mut msg = String::from(
         "old_string not found, even allowing for whitespace differences. \
          (Do not include the line-number gutter from `read` in old_string.) ",
     );
     let lines: Vec<&str> = text.lines().collect();
-    let needle = old
+    let needles: Vec<&str> = old
         .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if needle.is_empty() {
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if needles.is_empty() || lines.is_empty() {
         msg.push_str("Re-read the file and copy the exact text to replace.");
         return msg;
     }
-    // Lines equal (ignoring indentation) or containing the first old line.
-    let hits: Vec<usize> = lines
+    let strong: Vec<&str> = needles
         .iter()
-        .enumerate()
-        .filter(|(_, l)| l.trim() == needle || l.contains(needle))
-        .map(|(i, _)| i)
-        .take(3)
+        .copied()
+        .filter(|line| !weak_edit_needle(line))
         .collect();
-    // If no direct hit, try similarity: score each line by how many words from
-    // the needle it shares, and show the top matches. This catches cases where
-    // the model misremembered a line (wrong variable name, typo, etc.) but is
-    // still close enough to find the right region.
-    let hits = if hits.is_empty() {
-        let needles: Vec<&str> = needle.split_whitespace().collect();
-        if needles.is_empty() {
-            return msg
-                + &format!(
-                    "No line resembling `{}` is in the {}-line file; re-read it to get the current text.",
-                    clip(needle, 60),
-                    lines.len()
-                );
-        }
-        let mut scored: Vec<(usize, usize)> = lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let lower = l.to_lowercase();
-                let score = needles
-                    .iter()
-                    .filter(|w| {
-                        let w = w.to_lowercase();
-                        lower.contains(w.as_str())
-                    })
-                    .count();
-                (i, score)
-            })
-            .filter(|(_, s)| *s > 0)
-            .collect();
-        scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
-        scored.into_iter().take(3).map(|(i, _)| i).collect()
-    } else {
-        hits
-    };
+    let search: &[&str] = if strong.is_empty() { &needles } else { &strong };
+    let mut hits = rank_edit_anchors(&lines, search);
+    if hits.is_empty() {
+        hits = similarity_anchors(&lines, longest_needle(search));
+    }
     if hits.is_empty() {
         msg.push_str(&format!(
             "No line resembling `{}` is in the {}-line file; re-read it to get the current text.",
-            clip(needle, 60),
+            clip(longest_needle(&needles), 60),
             lines.len()
         ));
         return msg;
@@ -584,7 +593,7 @@ pub(crate) fn edit_not_found_help(text: &str, old: &str) -> String {
     msg.push_str("The closest matching lines in the file are:\n");
     for i in hits {
         let lo = i.saturating_sub(2);
-        let hi = (i + 3).min(lines.len());
+        let hi = (i + 6).min(lines.len());
         for (off, line) in lines[lo..hi].iter().enumerate() {
             msg.push_str(&format!("{:>6}\t{}\n", lo + off + 1, line));
         }
@@ -592,6 +601,157 @@ pub(crate) fn edit_not_found_help(text: &str, old: &str) -> String {
     }
     msg.push_str("Copy old_string verbatim from one of these regions.");
     msg
+}
+
+fn edit_miss_message(text: &str, old: &str, new: &str) -> String {
+    let mut msg = edit_not_found_help(text, old);
+    if crate::mutation_repeat::new_string_already_present(text, new) {
+        msg.push_str(
+            "\nYour new_string is already in this file. Do not retry this edit. \
+             If this was a plan step, call update_plan: mark the active step \
+             done and set the next unfinished step active.",
+        );
+    }
+    msg
+}
+
+/// Lines that occur too often to identify an edit site on their own.
+fn weak_edit_needle(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.chars().count() < 8 {
+        return true;
+    }
+    if trimmed.chars().all(|c| {
+        matches!(
+            c,
+            '{' | '}' | '(' | ')' | '[' | ']' | ',' | ';' | '.' | '+' | '-' | '|' | '&'
+        )
+    }) {
+        return true;
+    }
+    matches!(
+        trimmed,
+        "assert!("
+            | "debug_assert!("
+            | "assert_eq!("
+            | "assert_ne!("
+            | "matches!("
+            | "if let"
+            | "else {"
+            | "Ok(())"
+            | "todo!()"
+            | "unimplemented!()"
+    )
+}
+
+fn longest_needle<'a>(needles: &[&'a str]) -> &'a str {
+    needles
+        .iter()
+        .copied()
+        .max_by_key(|needle| needle.len())
+        .unwrap_or("")
+}
+
+fn line_contains_needle(line: &str, needle: &str) -> bool {
+    line.trim() == needle || line.contains(needle)
+}
+
+/// Rank file regions by how many distinctive `old_string` lines they contain.
+/// A line that occurs once outranks a line that occurs on every assertion.
+fn rank_edit_anchors(lines: &[&str], needles: &[&str]) -> Vec<usize> {
+    let weights: Vec<usize> = needles
+        .iter()
+        .map(|needle| {
+            let hits = lines
+                .iter()
+                .filter(|line| line_contains_needle(line, needle))
+                .count();
+            match hits {
+                0 => 0,
+                1 => 8,
+                2..=4 => 4,
+                _ => 1,
+            }
+        })
+        .collect();
+    if weights.iter().all(|weight| *weight == 0) {
+        return Vec::new();
+    }
+    let span = needles.len().saturating_add(4).clamp(4, 24);
+    let mut scored = Vec::new();
+    for start in 0..lines.len() {
+        let end = (start + span).min(lines.len());
+        let mut score = 0usize;
+        let mut anchor = start;
+        let mut anchor_weight = 0usize;
+        for (needle, weight) in needles.iter().zip(weights.iter()) {
+            if *weight == 0 {
+                continue;
+            }
+            if let Some(pos) = lines[start..end]
+                .iter()
+                .position(|line| line_contains_needle(line, needle))
+            {
+                score += weight;
+                if *weight > anchor_weight {
+                    anchor_weight = *weight;
+                    anchor = start + pos;
+                }
+            }
+        }
+        if score > 0 {
+            scored.push((anchor, score));
+        }
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut picked = Vec::new();
+    for (idx, _) in scored {
+        if picked.iter().any(|prev| idx.abs_diff(*prev) < span) {
+            continue;
+        }
+        picked.push(idx);
+        if picked.len() == 3 {
+            break;
+        }
+    }
+    picked
+}
+
+/// Word-overlap fallback for a mistyped line that is not a substring of the file.
+fn similarity_anchors(lines: &[&str], needle: &str) -> Vec<usize> {
+    let tokens: Vec<String> = needle
+        .split_whitespace()
+        .map(|word| word.to_lowercase())
+        .filter(|word| word.len() >= 2)
+        .collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut scored: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let lower = line.to_lowercase();
+            let score = tokens
+                .iter()
+                .filter(|token| lower.contains(token.as_str()))
+                .count();
+            (index, score)
+        })
+        .filter(|(_, score)| *score > 0)
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut picked = Vec::new();
+    for (idx, _) in scored {
+        if picked.iter().any(|prev| idx.abs_diff(*prev) < 3) {
+            continue;
+        }
+        picked.push(idx);
+        if picked.len() == 3 {
+            break;
+        }
+    }
+    picked
 }
 
 /// Truncate to `max` chars with an ellipsis (single-line error context).

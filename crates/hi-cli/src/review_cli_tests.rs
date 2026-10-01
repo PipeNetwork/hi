@@ -38,10 +38,8 @@ fn verdict(complete: bool, findings: Vec<Finding>) -> ReviewVerdict {
 fn completed(verdict: Option<ReviewVerdict>) -> ReviewTurnFacts {
     ReviewTurnFacts {
         stop_reason: TurnStopReason::Completed,
-        error: None,
-        changed_files: Vec::new(),
         verdict,
-        unverified_citations: Vec::new(),
+        ..ReviewTurnFacts::default()
     }
 }
 
@@ -52,6 +50,19 @@ fn p0() -> Finding {
         location: Some("src/server.rs:88".into()),
         verified: true,
         feature_gap: false,
+        from_verify: false,
+    }
+}
+
+fn git_inputs(files: &[&str]) -> ReviewInputs {
+    ReviewInputs {
+        git: Some(hi_harness::GitScope {
+            source: hi_harness::GitSource::Uncommitted,
+            files: files.iter().map(|f| f.to_string()).collect(),
+            numstat: Vec::new(),
+            groups: Vec::new(),
+        }),
+        ..ReviewInputs::default()
     }
 }
 
@@ -180,6 +191,14 @@ fn report_object_carries_inputs_verdict_findings_and_exit_code() {
             .starts_with("spec review")
     );
 
+    assert_eq!(
+        report["read"]["scope_total"], 0,
+        "untracked scope: nothing counted"
+    );
+    assert_eq!(report["read"]["partial"], false);
+    assert!(report["verify"].is_null());
+    assert_eq!(report["uncited_changes"].as_array().unwrap().len(), 0);
+
     let idle = review_report_json(&ReviewDrive::default());
     assert_eq!(idle["phase"], "idle");
     assert!(idle["verdict"].is_null());
@@ -193,14 +212,7 @@ fn report_object_carries_inputs_verdict_findings_and_exit_code() {
 /// scope. `all` is a value of `--spec-review`, not a path.
 #[test]
 fn defects_only_scope_exits_clean_and_reports_its_scope() {
-    let scoped = ReviewInputs {
-        git: Some(hi_harness::GitScope {
-            source: hi_harness::GitSource::Uncommitted,
-            files: vec!["src/a.rs".into()],
-        }),
-        ..ReviewInputs::default()
-    };
-    let mut drive = ReviewDrive::start(scoped, true, 3);
+    let mut drive = ReviewDrive::start(git_inputs(&["src/a.rs"]), true, 3);
     let mut clean = verdict(true, vec![]);
     clean.coverage.clear();
     drive.next_step(&completed(Some(clean)));
@@ -242,4 +254,83 @@ fn defects_only_scope_exits_clean_and_reports_its_scope() {
     assert_eq!(paths, vec!["docs/spec.md".to_string()]);
     let cli = Cli::try_parse_from(["hi", "--spec-review", "all"]).unwrap();
     assert_eq!(cli.spec_review, Some(vec!["all".into()]));
+}
+
+/// A defects-only audit that never read part of its scope, even after its
+/// continuation turns, is partial: exit 3 with the read counts in the
+/// summary and the report, not a clean 0.
+#[test]
+fn partial_read_coverage_exits_incomplete_with_the_counts() {
+    let scope = ["src/a.rs", "src/b.rs", "src/c.rs"];
+    let mut drive = ReviewDrive::start(git_inputs(&scope), true, 3);
+    let mut clean = verdict(true, vec![]);
+    clean.coverage.clear();
+    let turn = |read: &[&str]| ReviewTurnFacts {
+        read_files: read.iter().map(|f| f.to_string()).collect(),
+        scope_files: Some(scope.iter().map(|f| f.to_string()).collect()),
+        ..completed(Some(clean.clone()))
+    };
+    // First turn reads one file: continuation. Two continuations later the
+    // third file is still unread.
+    assert!(matches!(
+        drive.next_step(&turn(&["src/a.rs"])),
+        ReviewStep::RunPrompt(_)
+    ));
+    assert!(matches!(
+        drive.next_step(&turn(&["src/b.rs"])),
+        ReviewStep::RunPrompt(_)
+    ));
+    let ReviewStep::Done(summary) = drive.next_step(&turn(&[])) else {
+        panic!("continuations are bounded");
+    };
+    assert_eq!(
+        summary,
+        "spec review partial: 3 uncommitted files (git status) audited, no plan/spec items · no P0/P1 defects · partial audit: read 2/3 files in scope; 1 unread"
+    );
+    assert_eq!(exit_code(&drive), EXIT_INCOMPLETE_COVERAGE);
+    let report = review_report_json(&drive);
+    assert_eq!(report["read"]["scope_total"], 3);
+    assert_eq!(report["read"]["unread_count"], 1);
+    assert_eq!(report["read"]["unread"][0], "src/c.rs");
+    assert_eq!(report["read"]["files"].as_array().unwrap().len(), 2);
+    assert_eq!(report["read"]["partial"], true);
+    assert_eq!(report["coverage_complete"], false);
+    assert_eq!(report["exit_code"], EXIT_INCOMPLETE_COVERAGE);
+    let run = ReviewRun {
+        drive,
+        last_outcome: None,
+        turns: 3,
+    };
+    let error = run.into_result().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "spec review: partial audit: read 2/3 files in scope; 1 unread (exit 3)"
+    );
+}
+
+/// A failing seed command with no finding from the model becomes a
+/// synthetic P1: exit 4, flagged in the report.
+#[test]
+fn seeded_finding_from_a_failing_verify_exits_with_open_defects() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), "fn a() {}\n").unwrap();
+    let mut drive = ReviewDrive::start(git_inputs(&["src/a.rs"]), true, 3);
+    drive.verify = Some(hi_harness::VerifySeed::from_output(
+        dir.path(),
+        "cargo test",
+        false,
+        "error[E0308]: mismatched types\n --> src/a.rs:4:5\n",
+        "audit",
+    ));
+    let mut clean = verdict(true, vec![]);
+    clean.coverage.clear();
+    drive.next_step(&completed(Some(clean)));
+    assert_eq!(exit_code(&drive), EXIT_OPEN_DEFECTS);
+    let report = review_report_json(&drive);
+    assert_eq!(report["findings"][0]["severity"], "P1");
+    assert_eq!(report["findings"][0]["from_verify"], true);
+    assert_eq!(report["verify"]["command"], "cargo test");
+    assert_eq!(report["verify"]["passed"], false);
+    assert_eq!(report["open_blocking"], 1);
 }

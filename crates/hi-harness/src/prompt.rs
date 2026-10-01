@@ -13,7 +13,9 @@ current step `active` and finished ones `done`. Skip the plan for simple \
 one-step changes. After posting a plan, implement the active step with \
 `edit`/`write` instead of re-reading. Only mark a step `done` when that work \
 is already in the tree. Do not mark pending steps done in bulk; one edit \
-cannot retire the rest of the checklist.
+cannot retire the rest of the checklist. Once a step is implemented and its \
+tests pass, call `update_plan` right away to mark it done before starting the \
+next; never add filler edits to justify closing a step.
 
 Prefer `edit` for a single hunk on a known file, `multi_edit` for several hunks \
 in one file, and `apply_patch` for multi-file coordination. Do not rewrite \
