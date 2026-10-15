@@ -35,18 +35,26 @@ pub async fn run(
     let resume = crate::sentinel_resume::plan(cli, prompt.as_ref());
     let prompt = if resume.ignore_prompt { None } else { prompt };
     let interactive = prompt.is_none() && stdin_tty && !headless_review;
-    let route = match resolve_pipe_route(cli, file, settings) {
-        Ok(route) => route,
-        Err(err) if interactive => {
-            eprintln!("{err:#}");
-            eprintln!("sign in with /login pipenetwork (or run `hi login pipenetwork`)");
-            PipeRoute {
-                api_key: String::new(),
-                base_url: hi_harness::DEFAULT_BASE_URL.to_string(),
-                model: hi_harness::DEFAULT_MODEL.to_string(),
-            }
+    let route = if !settings.lanes.is_empty() {
+        PipeRoute {
+            api_key: settings.api_key.clone(),
+            base_url: settings.base_url.trim_end_matches('/').to_string(),
+            model: settings.model.clone(),
         }
-        Err(err) => return Err(err),
+    } else {
+        match resolve_pipe_route(cli, file, settings) {
+            Ok(route) => route,
+            Err(err) if interactive => {
+                eprintln!("{err:#}");
+                eprintln!("sign in with /login pipenetwork (or run `hi login pipenetwork`)");
+                PipeRoute {
+                    api_key: String::new(),
+                    base_url: hi_harness::DEFAULT_BASE_URL.to_string(),
+                    model: hi_harness::DEFAULT_MODEL.to_string(),
+                }
+            }
+            Err(err) => return Err(err),
+        }
     };
     let session_path = resolve_session_path(cli)?;
     let (workspace_root, state_root) =
@@ -67,7 +75,10 @@ pub async fn run(
         .and_then(|p| p.managed.clone())
         .unwrap_or_default();
     config.base_url = route.base_url;
-    if settings.provider == ProviderName::Pipenetwork && settings.max_tokens > 0 {
+    config.lanes = settings.lanes.clone();
+    if (settings.provider == ProviderName::Pipenetwork || !settings.lanes.is_empty())
+        && settings.max_tokens > 0
+    {
         config.max_tokens = settings.max_tokens;
         config.max_tokens_explicit = settings.max_tokens_explicit;
     }

@@ -113,6 +113,7 @@ pub(crate) fn pipe_settings(api_key: String) -> Settings {
         mcp_pipe_allow: Vec::new(),
         session_harness: crate::config::empty_session_harness(),
         harness: hi_workspace::ResolvedHarnessSettings::default(),
+        lanes: Vec::new(),
     }
 }
 

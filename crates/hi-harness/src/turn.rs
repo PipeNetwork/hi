@@ -13,6 +13,7 @@ use crate::completion::{
     self, Decision, Demand, Event, Intent, TurnFacts, coordination_only_round, looks_like_verify,
     read_pagination_only, stall_tool_round,
 };
+use crate::lanes::{self, LANE_TOOL_NAME};
 use crate::pipe::{PipeCompletion, PipeError, StreamDelta, StreamRetry, recover_pipe_stream_error};
 use crate::prompt::SYSTEM_PROMPT;
 use crate::tools::{ToolHost, advertised_tools, interrupted_outcome, plan_from_outcome};
@@ -259,7 +260,7 @@ impl Harness {
             self.liveness
                 .set_state(hi_liveness::HarnessState::AwaitingModel);
             let messages = self.request_messages(continue_hint);
-            let tools = advertised_tools();
+            let tools = self.turn_tools();
             let liveness = self.liveness.clone();
             let mut verdict_filter =
                 crate::review_stream::VerdictBlockFilter::new(review_audit_turn);
@@ -573,6 +574,9 @@ impl Harness {
             } else {
                 self.score_tool_autos(&completion.tool_calls).await
             };
+            let lane_outcomes = self
+                .dispatch_lane_tools(&completion.tool_calls, ui, cancel)
+                .await;
             for (i, call) in completion.tool_calls.iter().enumerate() {
                 if !ui.dispatch_allowed() {
                     cancel.cancel();
@@ -605,6 +609,13 @@ impl Harness {
                 } else if let Some(reason) = &audit_denial {
                     audit_write_denials = audit_write_denials.saturating_add(1);
                     crate::review_guard::audit_denied_outcome(reason)
+                } else if call.name == LANE_TOOL_NAME {
+                    lane_outcomes
+                        .as_ref()
+                        .and_then(|outcomes| outcomes.get(&call.id).cloned())
+                        .unwrap_or_else(|| {
+                            lanes::lane_failed("lane was not dispatched (lanes are not configured)")
+                        })
                 } else {
                     self.tools
                         .execute_cancellable(
@@ -640,7 +651,8 @@ impl Harness {
                 if matches!(
                     call.name.as_str(),
                     "write" | "edit" | "multi_edit" | "apply_patch"
-                ) {
+                ) || (call.name == LANE_TOOL_NAME && outcome.effects.mutation_attempted)
+                {
                     self.attempted_mutation = true;
                     if !outcome.effects.mutation_applied {
                         facts.failed_mutation = true;
@@ -1199,8 +1211,46 @@ impl Harness {
         )
     }
 
+    fn turn_tools(&self) -> Vec<hi_ai::ToolSpec> {
+        let mut tools = advertised_tools();
+        if self.lanes.as_ref().is_some_and(|pool| pool.is_enabled()) {
+            tools.push(lanes::lane_tool_spec());
+        }
+        tools
+    }
+
+    async fn dispatch_lane_tools(
+        &self,
+        calls: &[crate::pipe::ToolCall],
+        ui: &mut dyn Ui,
+        cancel: &TurnCancellation,
+    ) -> Option<std::collections::HashMap<String, hi_tools::ToolOutcome>> {
+        let pool = self.lanes.as_ref()?;
+        if !calls.iter().any(|call| call.name == LANE_TOOL_NAME) {
+            return None;
+        }
+        Some(
+            lanes::dispatch_lanes(
+                pool,
+                calls,
+                &self.tools,
+                &self.workspace_root,
+                self.effective_reasoning_effort(),
+                self.max_tokens(),
+                ui,
+                cancel,
+            )
+            .await,
+        )
+    }
+
     pub(crate) fn request_messages(&self, continue_hint: Option<&str>) -> Vec<Message> {
-        let mut out = vec![Message::system(SYSTEM_PROMPT)];
+        let system = if self.lanes.as_ref().is_some_and(|pool| pool.is_enabled()) {
+            format!("{SYSTEM_PROMPT}\n\n{}", lanes::COORDINATOR_PROMPT)
+        } else {
+            SYSTEM_PROMPT.to_string()
+        };
+        let mut out = vec![Message::system(system)];
         out.extend(without_repeated_replies(&self.messages).cloned());
         if let Some(hint) = continue_hint.map(str::trim).filter(|text| !text.is_empty()) {
             // Not persisted: the session file stays a record of real user

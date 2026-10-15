@@ -117,3 +117,39 @@ model = "glm-5.2"                        # must match hi-local's --model-id
 base_url = "http://127.0.0.1:8082/v1"
 max_tokens = 4096
 tool_mode = "auto"
+
+# Four LAN GB100/vLLM peers as task-lane workers (opt-in). The profile
+# base_url is the coordinator; [[endpoints]] are GPUs that run narrow
+# sub-tasks with slim context in parallel. Path globs are assignment
+# hints, not crate-to-box ownership. See docs/multi-endpoint-lanes.md.
+# Uncomment and set the LAN URLs, then: hi -p four-box "…"
+#
+# [profiles.four-box]
+# provider = "ollama"
+# model = "Qwen3.8-27B-NVFP4"
+# base_url = "http://192.168.1.10:8000/v1"
+# api_key = "local"
+# max_tokens = 8192
+# tool_mode = "auto"
+#
+# [[profiles.four-box.endpoints]]
+# id = "gpu-a"
+# base_url = "http://192.168.1.10:8000/v1"
+# default = true
+# paths = ["crates/a/**"]
+#
+# [[profiles.four-box.endpoints]]
+# id = "gpu-b"
+# base_url = "http://192.168.1.11:8000/v1"
+# paths = ["crates/b/**"]
+#
+# [[profiles.four-box.endpoints]]
+# id = "gpu-c"
+# base_url = "http://192.168.1.12:8000/v1"
+# paths = ["crates/c/**"]
+#
+# [[profiles.four-box.endpoints]]
+# id = "gpu-d"
+# base_url = "http://192.168.1.13:8000/v1"
+# model = "DeepSeek-R1"
+# paths = ["crates/d/**"]

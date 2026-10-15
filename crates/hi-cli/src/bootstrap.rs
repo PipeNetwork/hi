@@ -148,6 +148,19 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
             println!("compat:     {:?}", settings.compat);
             println!("deepseek:   {:?}", settings.deepseek_compat);
             println!("api_key:    {}", config::mask_key(&settings.api_key));
+            if settings.lanes.is_empty() {
+                println!("lanes:      off");
+            } else {
+                println!("lanes:      {} endpoint(s)", settings.lanes.len());
+                for endpoint in &settings.lanes {
+                    let paths = if endpoint.paths.is_empty() {
+                        "(default / unmatched paths)".to_string()
+                    } else {
+                        endpoint.paths.join(", ")
+                    };
+                    println!("  - {}  {}  {}", endpoint.id, endpoint.base_url, paths);
+                }
+            }
             Ok(())
         }
         Err(err) => {

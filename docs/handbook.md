@@ -93,6 +93,17 @@ provider = "ollama"
 
 `/provider <name>` changes the active profile (base URL, API key, wire format) mid-session, then opens the model picker over the live model list. The `model` field is optional and can be set later with `/model`. `/provider add` creates a new profile interactively (in the TUI, a form with provider picker, API key, model, and base URL fields); `/provider edit [name]` modifies an existing one. Both write to your config file.
 
+### Multi-endpoint task lanes (opt-in)
+
+A profile may list peer OpenAI-compatible GPUs. `base_url` stays the
+coordinator for this session; `[[profiles.<name>.endpoints]]` are workers that
+run **narrow lanes** (tight sub-tasks with slim context) in parallel on one
+workspace. Path prefixes/globs hint assignment; they do not pin a crate to a
+box. Without `endpoints`, `--base-url` is still a single conversation stream.
+
+See [multi-endpoint-lanes.md](multi-endpoint-lanes.md) for a four-box LAN
+vLLM/GB100 example (`hi -p four-box`).
+
 ### Fallback chain
 
 Give a profile a `fallback` list (or pass `--fallback <profile>`, repeatable); if a turn needs another configured profile, `hi` announces the handoff and retries there:

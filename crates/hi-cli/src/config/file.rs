@@ -544,6 +544,33 @@ pub struct Profile {
     pub runtime: Option<LocalRuntimeProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub harness: HarnessOverrides,
+    /// Opt-in peer OpenAI-compatible GPU workers for task-lane parallelism.
+    /// Empty keeps today's single-endpoint profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<ProfileEndpoint>,
+}
+
+/// One peer inference endpoint on a multi-GPU profile.
+///
+/// Path prefixes/globs are assignment hints for lanes, not exclusive ownership
+/// of a crate. The profile's own `base_url` remains the coordinator.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileEndpoint {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
 }
 
 /// Persisted intent for a local runtime. `kind` is currently `mlx`; the
