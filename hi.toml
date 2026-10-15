@@ -118,38 +118,29 @@ base_url = "http://127.0.0.1:8082/v1"
 max_tokens = 4096
 tool_mode = "auto"
 
-# Four LAN GB100/vLLM peers as task-lane workers (opt-in). The profile
-# base_url is the coordinator; [[endpoints]] are GPUs that run narrow
-# sub-tasks with slim context in parallel. Path globs are assignment
-# hints, not crate-to-box ownership. See docs/multi-endpoint-lanes.md.
-# Uncomment and set the LAN URLs, then: hi -p four-box "…"
-#
-# [profiles.four-box]
-# provider = "ollama"
-# model = "Qwen3.8-27B-NVFP4"
-# base_url = "http://192.168.1.10:8000/v1"
-# api_key = "local"
-# max_tokens = 8192
-# tool_mode = "auto"
-#
-# [[profiles.four-box.endpoints]]
-# id = "gpu-a"
-# base_url = "http://192.168.1.10:8000/v1"
-# default = true
-# paths = ["crates/a/**"]
-#
-# [[profiles.four-box.endpoints]]
-# id = "gpu-b"
-# base_url = "http://192.168.1.11:8000/v1"
-# paths = ["crates/b/**"]
-#
-# [[profiles.four-box.endpoints]]
-# id = "gpu-c"
-# base_url = "http://192.168.1.12:8000/v1"
-# paths = ["crates/c/**"]
-#
-# [[profiles.four-box.endpoints]]
-# id = "gpu-d"
-# base_url = "http://192.168.1.13:8000/v1"
-# model = "DeepSeek-R1"
-# paths = ["crates/d/**"]
+# Tailnet Sparks / GX10 as one lane pool. spark-7466 is the coordinator
+# and the default worker. The other two are peers on the same tree; no
+# path prefixes, so lanes are hints only. Each box must serve
+# OpenAI-compatible /v1 on port 8000, and `model` must match
+# vLLM --served-model-name. Then: hi -p sparks "…"
+# See docs/multi-endpoint-lanes.md.
+[profiles.sparks]
+provider = "ollama"
+model = "Qwen3.8-27B-NVFP4"
+base_url = "http://100.116.163.116:8000/v1" # spark-7466
+api_key = "local"
+max_tokens = 8192
+tool_mode = "auto"
+
+[[profiles.sparks.endpoints]]
+id = "spark-7466"
+base_url = "http://100.116.163.116:8000/v1"
+default = true
+
+[[profiles.sparks.endpoints]]
+id = "spark-7a60"
+base_url = "http://100.81.119.49:8000/v1"
+
+[[profiles.sparks.endpoints]]
+id = "gx10-1e82"
+base_url = "http://100.74.5.66:8000/v1"

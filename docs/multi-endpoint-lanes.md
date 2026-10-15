@@ -69,6 +69,16 @@ hi -p four-box "split the remaining work into tight lanes and implement it"
 endpoint. Omit `[[endpoints]]` (or use any other profile) and `hi` is the
 usual single-endpoint session.
 
+The Spark lab profile in `hi.toml` is `sparks`. `spark-7466`
+(`100.116.163.116`) is the coordinator and default worker. `spark-7a60`
+(`100.81.119.49`) and `gx10-1e82` (`100.74.5.66`) are peer workers on the
+same tree, with no path prefixes. Each machine is expected at port 8000.
+
+```bash
+hi --show-config -p sparks
+hi -p sparks "split the remaining work into tight lanes and implement it"
+```
+
 Each endpoint field:
 
 | Field | Role |
