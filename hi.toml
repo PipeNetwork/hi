@@ -118,18 +118,17 @@ base_url = "http://127.0.0.1:8082/v1"
 max_tokens = 4096
 tool_mode = "auto"
 
-# Tailnet Sparks / GX10 as one lane pool. spark-7466 is the coordinator
-# and the default worker. The other two are peers on the same tree; no
-# path prefixes, so lanes are hints only. Each box must serve
-# OpenAI-compatible /v1 on port 8000, and `model` must match
-# vLLM --served-model-name. Then: hi -p sparks "…"
+# Tailnet lane pool. spark-7466 coordinates. All three serve
+# `hi-local` on port 8000 with the same model id. gx10-1e82
+# (100.74.5.66) has been offline since 2026-08-03; gx10-3607 is the
+# live GX10 on the same LAN. No path prefixes. Then: hi -p sparks "…"
 # See docs/multi-endpoint-lanes.md.
 [profiles.sparks]
 provider = "ollama"
-model = "Qwen3.8-27B-NVFP4"
+model = "qwen2.5-3b-instruct"
 base_url = "http://100.116.163.116:8000/v1" # spark-7466
 api_key = "local"
-max_tokens = 8192
+max_tokens = 2048
 tool_mode = "auto"
 
 [[profiles.sparks.endpoints]]
@@ -142,5 +141,5 @@ id = "spark-7a60"
 base_url = "http://100.81.119.49:8000/v1"
 
 [[profiles.sparks.endpoints]]
-id = "gx10-1e82"
-base_url = "http://100.74.5.66:8000/v1"
+id = "gx10-3607"
+base_url = "http://100.113.145.127:8000/v1"
