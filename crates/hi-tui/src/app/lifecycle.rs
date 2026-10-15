@@ -183,6 +183,7 @@ impl crate::App {
             model_issues: HashMap::new(),
             top_notice: None,
             working_status: None,
+            lane_lines: Vec::new(),
             startup_notice: None,
             checkpoint_warning: None,
             quit_notice: None,
@@ -283,6 +284,7 @@ impl crate::App {
         self.current_tool_started = None;
         self.run_streamed_this_call = false;
         self.working_status = None;
+        self.lane_lines.clear();
         self.changed_files_rect = ratatui::layout::Rect::default();
         if !working {
             self.freeze_verb_group();

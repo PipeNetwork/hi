@@ -152,13 +152,27 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
                 println!("lanes:      off");
             } else {
                 println!("lanes:      {} endpoint(s)", settings.lanes.len());
+                let probes = hi_harness::probe_lane_endpoints(
+                    &settings.lanes,
+                    &settings.model,
+                    &settings.api_key,
+                )
+                .await;
                 for endpoint in &settings.lanes {
                     let paths = if endpoint.paths.is_empty() {
                         "(default / unmatched paths)".to_string()
                     } else {
                         endpoint.paths.join(", ")
                     };
-                    println!("  - {}  {}  {}", endpoint.id, endpoint.base_url, paths);
+                    let health = probes
+                        .iter()
+                        .find(|probe| probe.id == endpoint.id)
+                        .map(|probe| if probe.up { "up" } else { "down" })
+                        .unwrap_or("down");
+                    println!(
+                        "  - {}  {health}  {}  {paths}",
+                        endpoint.id, endpoint.base_url
+                    );
                 }
             }
             Ok(())

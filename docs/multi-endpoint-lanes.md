@@ -116,8 +116,8 @@ not in the always-on catalog). The coordinator is prompted to emit several
 The harness then:
 
 1. Matches each lane to an endpoint (path hits, else the `default` worker).
-2. Builds waves so each GPU has at most one in-flight lane and overlapping
-   write paths never run together.
+2. Runs lanes on free GPUs, one at a time per box, skipping write-path
+   overlaps. A GPU that finishes starts the next lane immediately.
 3. Runs a nested tool loop on that GPU with a **slim** prompt (worker
    instructions + task + preloaded files — not the parent transcript).
 4. Merges summaries and file changes back into the parent JSONL session.
@@ -128,12 +128,32 @@ unchanged when `[[endpoints]]` is absent.
 
 ## Write scope and permissions
 
+Lane sessions start in always-approve. `--confirm-edits` (or `/permissions ask`)
+confirms every lane diff in one overlay. Auto mode applies safe file edits and
+asks for the rest together.
+
 Lane file edits stay inside the declared `paths`. A write, edit, or patch
 whose target sits outside that set is refused. A lane that names no paths may
 write anywhere in the workspace and is scheduled alone against other writers.
 Readonly lanes inspect the tree.
 
-Ask-mode sessions hold lane writes until `/yolo`. One-shot runs default to
-always-approve, so those lane writes apply. Auto mode applies safe file edits
-from a lane; `/yolo` approves shell mutations and other unsafe writes.
-Mutating shell commands from parallel lanes run one at a time, in the foreground.
+Each worker sees a small tool list: `read`, `write`, `edit`, `grep`, and
+foreground `bash`. Inside a declared scope, shell is read-only or a build/test
+command (`cargo`, `pytest`, `go`, `npm`, and the usual siblings). Those builds
+get their own `CARGO_TARGET_DIR` under `.hi/lane-targets/<gpu>/`, so two lanes
+can test at the same time. Other mutating shell is refused. A lane with no
+paths may run mutating shell, one command at a time.
+
+The coordinator prompt lists each endpoint id, model, and path hint. Pass
+`endpoint` on the `lane` tool to pin a GPU (for example the DeepSeek box).
+
+A free GPU starts the next non-conflicting lane without waiting for a slower
+peer. Before the first lane, `hi` probes `GET /models` on each box. A transport
+failure or HTTP 5xx takes that GPU out and moves the lane once onto the next
+healthy box. `hi --show-config` prints `up` or `down` for each endpoint.
+
+While a lane runs, the TUI keeps one live line per lane above the transcript
+(endpoint, current tool, last line) and replaces that line in place. The tool
+result includes a short diff and that lane's token counts. The session status
+line gains a `lanes gpu-a 12/4, gpu-b 8/3` suffix (input/output) after a lane
+round.

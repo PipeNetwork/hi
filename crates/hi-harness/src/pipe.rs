@@ -1179,6 +1179,16 @@ pub mod test_support {
                     let mut buf = vec![0u8; 64 * 1024];
                     let n = stream.read(&mut buf).unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..n]);
+                    let first = request.lines().next().unwrap_or("");
+                    if first.starts_with("GET /models") || first.starts_with("GET /v1/models") {
+                        let body = r#"{"object":"list","data":[{"id":"mock"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        continue;
+                    }
                     if let Some(idx) = request.find("\r\n\r\n") {
                         thread_bodies
                             .lock()

@@ -65,7 +65,7 @@ pub use ladder::{
     LadderCommand, LadderPhase, LadderRung, LadderSettings, LadderStep, LadderTurnFacts,
     MAX_ATTEMPTS_PER_RUNG as LADDER_MAX_ATTEMPTS, transcript_label as ladder_transcript_label,
 };
-pub use lanes::LaneEndpointConfig;
+pub use lanes::{LaneEndpointConfig, LaneProbe, probe_lane_endpoints};
 pub use live::LiveSettings;
 pub use liveness::AwaitingUserGuard;
 pub use pipe::{
@@ -276,6 +276,8 @@ pub struct Harness {
     review_read_files: Vec<String>,
     /// Opt-in peer GPU lane pool. `None` keeps a single Pipe client.
     lanes: Option<lanes::LanePool>,
+    /// Per-endpoint token counts from the latest lane round (`gpu-a 12/4`).
+    lane_usage_line: String,
     /// `/ladder`: cheap-first escalation for one task. Never persisted.
     ladder: Ladder,
     ladder_settings: LadderSettings,
@@ -358,6 +360,7 @@ impl Harness {
             review_settings: ReviewSettings::default(),
             review_read_files: Vec::new(),
             lanes,
+            lane_usage_line: String::new(),
             ladder: Ladder::default(),
             ladder_settings: LadderSettings::default(),
             last_verify_output: None,
@@ -776,6 +779,15 @@ impl Harness {
 
     pub fn session_usage(&self) -> Usage {
         self.session_usage
+    }
+
+    /// Suffix for the status line when a lane round reported token counts.
+    pub fn lane_usage_suffix(&self) -> String {
+        if self.lane_usage_line.is_empty() {
+            String::new()
+        } else {
+            format!(" · lanes {}", self.lane_usage_line)
+        }
     }
 
     pub fn verify_command(&self) -> Option<&str> {

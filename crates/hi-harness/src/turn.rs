@@ -1252,7 +1252,7 @@ impl Harness {
     }
 
     async fn dispatch_lane_tools(
-        &self,
+        &mut self,
         calls: &[crate::pipe::ToolCall],
         ui: &mut dyn Ui,
         cancel: &TurnCancellation,
@@ -1261,26 +1261,27 @@ impl Harness {
         if !calls.iter().any(|call| call.name == LANE_TOOL_NAME) {
             return None;
         }
-        Some(
-            lanes::dispatch_lanes(
-                pool,
-                calls,
-                &self.tools,
-                &self.workspace_root,
-                self.effective_reasoning_effort(),
-                self.max_tokens(),
-                self.permission_mode(),
-                ui,
-                cancel,
-            )
-            .await
-            .into(),
+        let round = lanes::dispatch_lanes(
+            pool,
+            calls,
+            &self.tools,
+            &self.workspace_root,
+            self.effective_reasoning_effort(),
+            self.max_tokens(),
+            self.permission_mode(),
+            ui,
+            cancel,
         )
+        .await;
+        if !round.usage_line.is_empty() {
+            self.lane_usage_line = round.usage_line;
+        }
+        Some(round.outcomes.into())
     }
 
     pub(crate) fn request_messages(&self, continue_hint: Option<&str>) -> Vec<Message> {
-        let system = if self.lanes.as_ref().is_some_and(|pool| pool.is_enabled()) {
-            format!("{SYSTEM_PROMPT}\n\n{}", lanes::COORDINATOR_PROMPT)
+        let system = if let Some(pool) = self.lanes.as_ref().filter(|pool| pool.is_enabled()) {
+            format!("{SYSTEM_PROMPT}\n\n{}", lanes::coordinator_prompt(pool))
         } else {
             SYSTEM_PROMPT.to_string()
         };

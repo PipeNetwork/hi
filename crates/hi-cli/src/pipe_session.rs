@@ -124,12 +124,17 @@ pub async fn run(
         harness.set_verify_command(Some(cli.verify.join(" && ")));
     }
     // TUI keeps Ask; one-shot/`--plain` defaults to Always unless `--confirm-edits`.
+    // A lane pool starts in always-approve so peer GPUs can write without a
+    // per-edit stop. `--confirm-edits` keeps ask, which batches lane diffs.
     if !use_tui {
         if cli.confirm_edits {
             harness.set_permission_mode(hi_harness::PermissionMode::Ask);
         } else {
             harness.set_permission_mode(hi_harness::PermissionMode::Always);
         }
+    }
+    if !settings.lanes.is_empty() && !cli.confirm_edits {
+        harness.set_permission_mode(hi_harness::PermissionMode::Always);
     }
 
     let login_config_path = cli.config.clone();
@@ -637,7 +642,7 @@ fn repl_status(harness: &Harness) -> String {
         "off"
     };
     format!(
-        "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox} · {}",
+        "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox} · {}{}",
         harness.model(),
         harness.permission_mode().describe(),
         harness
@@ -650,7 +655,8 @@ fn repl_status(harness: &Harness) -> String {
         usage.input_tokens,
         usage.output_tokens,
         harness.checkpoint_count(),
-        harness.jev_compact_status_line()
+        harness.jev_compact_status_line(),
+        harness.lane_usage_suffix(),
     )
 }
 

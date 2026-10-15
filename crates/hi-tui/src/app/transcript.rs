@@ -622,6 +622,18 @@ impl crate::App {
                 if text.trim().is_empty() {
                     return;
                 }
+                if text.starts_with("lanes:") {
+                    self.lane_lines.clear();
+                }
+                if let Some((key, shown)) = lane_live_line(&text) {
+                    if let Some(slot) = self.lane_lines.iter_mut().find(|(id, _)| id == key) {
+                        slot.1 = shown;
+                    } else {
+                        self.lane_lines.push((key.to_string(), shown));
+                    }
+                    self.event_log.push(format!("lane_live {text}"));
+                    return;
+                }
                 if text.contains("…") && text.len() < 80 {
                     self.event_log.push(format!("live_status {text}"));
                     self.last_turn_event = Some(TurnEventKind::Status);
@@ -1214,6 +1226,16 @@ fn could_be_generic_completion_prefix(content: &str) -> bool {
     ]
     .iter()
     .any(|candidate| candidate.starts_with(&normalized))
+}
+
+/// `[lane {id}] {text}` updates one chrome row. Other status stays in the transcript.
+fn lane_live_line(text: &str) -> Option<(&str, String)> {
+    let rest = text.trim().strip_prefix("[lane ")?;
+    let (key, body) = rest.split_once("] ")?;
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, format!("{key}  {body}")))
 }
 
 fn is_legacy_subagent_status(text: &str) -> bool {
