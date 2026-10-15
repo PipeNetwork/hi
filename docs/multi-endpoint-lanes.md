@@ -125,3 +125,15 @@ The harness then:
 Lane workers cannot spawn further lanes. `/undo` still restores the parent
 turn’s git checkpoint. Pipe Network login, `/verify`, and the TUI are
 unchanged when `[[endpoints]]` is absent.
+
+## Write scope and permissions
+
+Lane file edits stay inside the declared `paths`. A write, edit, or patch
+whose target sits outside that set is refused. A lane that names no paths may
+write anywhere in the workspace and is scheduled alone against other writers.
+Readonly lanes inspect the tree.
+
+Ask-mode sessions hold lane writes until `/yolo`. One-shot runs default to
+always-approve, so those lane writes apply. Auto mode applies safe file edits
+from a lane; `/yolo` approves shell mutations and other unsafe writes.
+Mutating shell commands from parallel lanes run one at a time, in the foreground.

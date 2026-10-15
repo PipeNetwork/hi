@@ -574,14 +574,16 @@ impl Harness {
             } else {
                 self.score_tool_autos(&completion.tool_calls).await
             };
-            let lane_outcomes = self
+            let mut lane_outcomes = self
                 .dispatch_lane_tools(&completion.tool_calls, ui, cancel)
                 .await;
             for (i, call) in completion.tool_calls.iter().enumerate() {
                 if !ui.dispatch_allowed() {
                     cancel.cancel();
                 }
-                if cancel.is_cancelled() {
+                // Lane calls already ran. Keep their outcomes when the user
+                // cancels after the wave, so the transcript matches the files.
+                if cancel.is_cancelled() && call.name != LANE_TOOL_NAME {
                     if model == "pipe/auto" {
                         self.client
                             .managed_tool_complete(&call.id, &interrupted_outcome())?;
@@ -610,12 +612,13 @@ impl Harness {
                     audit_write_denials = audit_write_denials.saturating_add(1);
                     crate::review_guard::audit_denied_outcome(reason)
                 } else if call.name == LANE_TOOL_NAME {
-                    lane_outcomes
-                        .as_ref()
-                        .and_then(|outcomes| outcomes.get(&call.id).cloned())
-                        .unwrap_or_else(|| {
+                    match take_dispatched_lane(&mut lane_outcomes, &call.id) {
+                        Some(outcome) => outcome,
+                        None if cancel.is_cancelled() => interrupted_outcome(),
+                        None => {
                             lanes::lane_failed("lane was not dispatched (lanes are not configured)")
-                        })
+                        }
+                    }
                 } else {
                     self.tools
                         .execute_cancellable(
@@ -748,6 +751,34 @@ impl Harness {
                         "supervised sessions auto-repair when compact has failed; otherwise /retry",
                     );
                     for later in &completion.tool_calls[i + 1..] {
+                        if later.name == LANE_TOOL_NAME
+                            && let Some(outcome) =
+                                take_dispatched_lane(&mut lane_outcomes, &later.id)
+                        {
+                            if managed_turn {
+                                self.client.managed_tool_complete(&later.id, &outcome)?;
+                            }
+                            if outcome.effects.mutation_attempted {
+                                self.attempted_mutation = true;
+                            }
+                            if outcome.effects.mutation_applied {
+                                mutated = true;
+                            }
+                            for change in &outcome.effects.file_changes {
+                                if !changed.contains(&change.path) {
+                                    changed.push(change.path.clone());
+                                }
+                            }
+                            self.messages.push(Message::tool_result(
+                                &later.id,
+                                if managed_turn {
+                                    crate::managed::reported_outcome(&outcome)
+                                } else {
+                                    outcome.content
+                                },
+                            ));
+                            continue;
+                        }
                         if managed_turn {
                             self.client
                                 .managed_tool_complete(&later.id, &interrupted_outcome())?;
@@ -757,6 +788,7 @@ impl Harness {
                             interrupted_outcome().content,
                         ));
                     }
+                    self.last_changed_files = changed.clone();
                     self.session_usage.add(turn_usage);
                     ui.session_usage(self.session_usage);
                     self.seal_checkpoint(pre.as_deref(), mutated, ui).await;
@@ -1224,7 +1256,7 @@ impl Harness {
         calls: &[crate::pipe::ToolCall],
         ui: &mut dyn Ui,
         cancel: &TurnCancellation,
-    ) -> Option<std::collections::HashMap<String, hi_tools::ToolOutcome>> {
+    ) -> Option<std::collections::VecDeque<(String, hi_tools::ToolOutcome)>> {
         let pool = self.lanes.as_ref()?;
         if !calls.iter().any(|call| call.name == LANE_TOOL_NAME) {
             return None;
@@ -1237,10 +1269,12 @@ impl Harness {
                 &self.workspace_root,
                 self.effective_reasoning_effort(),
                 self.max_tokens(),
+                self.permission_mode(),
                 ui,
                 cancel,
             )
-            .await,
+            .await
+            .into(),
         )
     }
 
@@ -1320,6 +1354,15 @@ Call tools to apply remaining fixes, or give a short verdict.]";
 /// [`completion::INSPECT_STOP_VERDICT_HINT`] asks for exactly that wording
 /// as a verdict, so flagging it would loop the harness against itself.
 /// Quote characters are dropped so `Say "continue"` matches.
+fn take_dispatched_lane(
+    outcomes: &mut Option<std::collections::VecDeque<(String, hi_tools::ToolOutcome)>>,
+    id: &str,
+) -> Option<hi_tools::ToolOutcome> {
+    let queue = outcomes.as_mut()?;
+    let index = queue.iter().position(|(call_id, _)| call_id == id)?;
+    queue.remove(index).map(|(_, outcome)| outcome)
+}
+
 fn promised_unfinished_work(text: &str) -> bool {
     let lower: String = text
         .to_ascii_lowercase()

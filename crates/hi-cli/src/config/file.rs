@@ -634,7 +634,7 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
     Ok(config)
 }
 
-fn project_has_sensitive_provider_routes(config: &Config) -> bool {
+pub(super) fn project_has_sensitive_provider_routes(config: &Config) -> bool {
     config.profiles.values().any(|profile| {
         let provider = profile.provider.unwrap_or(ProviderName::Openai);
         let api_url = profile
@@ -646,7 +646,11 @@ fn project_has_sensitive_provider_routes(config: &Config) -> bool {
             .mcp_url
             .as_deref()
             .is_some_and(|url| !hi_provider_config::is_loopback_endpoint(url));
-        remote_api || remote_mcp
+        let remote_lane = profile
+            .endpoints
+            .iter()
+            .any(|endpoint| !hi_provider_config::is_loopback_endpoint(&endpoint.base_url));
+        remote_api || remote_mcp || remote_lane
     })
 }
 

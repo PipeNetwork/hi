@@ -3707,4 +3707,37 @@ paths = ["crates/b/**"]
     assert_eq!(lanes.lanes[0].api_key, "local");
 }
 
+#[test]
+fn remote_lane_endpoint_is_a_sensitive_project_route() {
+    let config: Config = toml::from_str(
+        r#"
+[profiles.local]
+provider = "ollama"
+base_url = "http://127.0.0.1:8080/v1"
+
+[[profiles.local.endpoints]]
+id = "gpu-b"
+base_url = "http://192.168.1.11:8000/v1"
+"#,
+    )
+    .unwrap();
+    assert!(super::file::project_has_sensitive_provider_routes(&config));
+
+    let loopback: Config = toml::from_str(
+        r#"
+[profiles.local]
+provider = "ollama"
+base_url = "http://127.0.0.1:8080/v1"
+
+[[profiles.local.endpoints]]
+id = "gpu-a"
+base_url = "http://127.0.0.1:8000/v1"
+"#,
+    )
+    .unwrap();
+    assert!(!super::file::project_has_sensitive_provider_routes(
+        &loopback
+    ));
+}
+
 mod credential_migration;

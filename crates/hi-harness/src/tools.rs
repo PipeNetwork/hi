@@ -310,6 +310,42 @@ impl ToolHost {
         ui: &mut dyn Ui,
         cancel: &TurnCancellation,
     ) -> ToolOutcome {
+        self.execute_tool(id, name, arguments, permission, auto, ui, cancel, false)
+            .await
+    }
+
+    /// Like [`Self::execute_cancellable`] for a lane worker.
+    ///
+    /// Lane models do not share the parent turn's inspect, verify, or storm
+    /// ledgers. A parallel lane reading the same file must not be refused as
+    /// a repeat, and a lane failure must not stop the coordinator.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_isolated(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        permission: impl Fn() -> PermissionMode,
+        auto: AutoHint,
+        ui: &mut dyn Ui,
+        cancel: &TurnCancellation,
+    ) -> ToolOutcome {
+        self.execute_tool(id, name, arguments, permission, auto, ui, cancel, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tool(
+        &self,
+        id: &str,
+        name: &str,
+        arguments: &str,
+        permission: impl Fn() -> PermissionMode,
+        auto: AutoHint,
+        ui: &mut dyn Ui,
+        cancel: &TurnCancellation,
+        isolated: bool,
+    ) -> ToolOutcome {
         if cancel.is_cancelled() {
             return interrupted_outcome();
         }
@@ -319,58 +355,68 @@ impl ToolHost {
         {
             return denied;
         }
-        self.liveness.note_tool_start(id, name);
+        // Lane workers share this host. Their tools must not occupy the
+        // parent turn's single open-tool slot: a second start would stick
+        // `ToolUnclosed`, which the supervisor treats as a harness bug.
+        if !isolated {
+            self.liveness.note_tool_start(id, name);
+        }
         let fingerprint = tool_fingerprint(name, arguments);
         ui.tool_started_id(id, name, arguments);
-        if let Some(message) = self.admit_inspect_repeat(name, &fingerprint) {
-            // Do not count a refusal toward identical-tool storm: a single
-            // model round of eight greps would otherwise hit the storm
-            // invariant before the harness can stop on probe refusals.
-            self.liveness.note_tool_end(false);
-            return failed_outcome(message);
-        }
-        let verify = verify_command_key(name, arguments);
-        if let Some(message) = self.admit_verify_repeat(verify.as_deref()) {
-            self.liveness.note_tool_end(false);
-            return failed_outcome(message);
-        }
-        if let Some(message) = self.admit_failed_mutation(name, &fingerprint) {
-            self.liveness.note_tool_end(false);
-            return failed_outcome(message);
-        }
-        // Refused before the storm count, like the ledgers above: the third
-        // identical output gets a replay instead of ending the turn.
-        let rerun = rerun_command(name, arguments, verify.is_some());
-        if let Some(message) = self.admit_rerun(&fingerprint, rerun.as_deref()) {
-            self.liveness.note_tool_end(false);
-            return failed_outcome(message);
-        }
-        // Edit, test, edit, test is progress, not a storm: a verify run after a
-        // file change counts as a new call. The verify ledger above still
-        // refuses a rerun when nothing changed.
-        let storm_key = if verify.is_some() {
-            format!(
-                "{fingerprint}@{}",
-                self.mutation_epoch
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            )
+        let (verify, rerun, storm_key) = if isolated {
+            (None, None, String::new())
         } else {
-            fingerprint.clone()
+            if let Some(message) = self.admit_inspect_repeat(name, &fingerprint) {
+                // Do not count a refusal toward identical-tool storm: a single
+                // model round of eight greps would otherwise hit the storm
+                // invariant before the harness can stop on probe refusals.
+                self.liveness.note_tool_end(false);
+                return failed_outcome(message);
+            }
+            let verify = verify_command_key(name, arguments);
+            if let Some(message) = self.admit_verify_repeat(verify.as_deref()) {
+                self.liveness.note_tool_end(false);
+                return failed_outcome(message);
+            }
+            if let Some(message) = self.admit_failed_mutation(name, &fingerprint) {
+                self.liveness.note_tool_end(false);
+                return failed_outcome(message);
+            }
+            // Refused before the storm count, like the ledgers above: the third
+            // identical output gets a replay instead of ending the turn.
+            let rerun = rerun_command(name, arguments, verify.is_some());
+            if let Some(message) = self.admit_rerun(&fingerprint, rerun.as_deref()) {
+                self.liveness.note_tool_end(false);
+                return failed_outcome(message);
+            }
+            // Edit, test, edit, test is progress, not a storm: a verify run after a
+            // file change counts as a new call. The verify ledger above still
+            // refuses a rerun when nothing changed.
+            let storm_key = if verify.is_some() {
+                format!(
+                    "{fingerprint}@{}",
+                    self.mutation_epoch
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                )
+            } else {
+                fingerprint.clone()
+            };
+            self.liveness.note_tool_fingerprint(&storm_key);
+            if self
+                .liveness
+                .snapshot()
+                .invariant
+                .is_some_and(|inv| inv.code == hi_liveness::InvariantCode::IdenticalToolStorm)
+            {
+                // The call that crosses the cap must not start. A full `cargo test`
+                // here is what made the storm look like a stall.
+                self.liveness.note_tool_end(false);
+                return failed_outcome(
+                    "identical tool storm; this call was not started. Stop repeating it.",
+                );
+            }
+            (verify, rerun, storm_key)
         };
-        self.liveness.note_tool_fingerprint(&storm_key);
-        if self
-            .liveness
-            .snapshot()
-            .invariant
-            .is_some_and(|inv| inv.code == hi_liveness::InvariantCode::IdenticalToolStorm)
-        {
-            // The call that crosses the cap must not start. A full `cargo test`
-            // here is what made the storm look like a stall.
-            self.liveness.note_tool_end(false);
-            return failed_outcome(
-                "identical tool storm; this call was not started. Stop repeating it.",
-            );
-        }
         let run = async {
             if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
                 match prepare_mutation_in_with_state(&self.root, &self.state_root, name, arguments)
@@ -422,16 +468,19 @@ impl ToolHost {
             }
             self.mutation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        } else if outcome.status == ToolStatus::Failed
+        } else if !isolated
+            && outcome.status == ToolStatus::Failed
             && matches!(name, "write" | "edit" | "multi_edit" | "apply_patch")
             && let Ok(mut ledger) = self.failed_mutations.lock()
         {
             ledger.note_failure(&fingerprint, &outcome.content);
         }
-        self.record_inspect_output(name, &fingerprint, &outcome.content);
-        self.record_verify_output(verify.as_deref(), &outcome.content);
-        self.record_rerun_output(&fingerprint, rerun.as_deref(), &outcome);
-        if outcome.status == ToolStatus::Failed {
+        if !isolated {
+            self.record_inspect_output(name, &fingerprint, &outcome.content);
+            self.record_verify_output(verify.as_deref(), &outcome.content);
+            self.record_rerun_output(&fingerprint, rerun.as_deref(), &outcome);
+        }
+        if !isolated && outcome.status == ToolStatus::Failed {
             // A suite that keeps failing the same way across edits (drme's
             // pre-existing CABAC test) must not read as nine identical errors.
             if verify.is_some() {
@@ -441,10 +490,12 @@ impl ToolHost {
                 self.liveness.note_tool_error(&outcome.content);
             }
         }
-        let leaked = !self.runner.detached_descendants_preserved()
-            && !run_in_background(name, arguments)
-            && self.runner.foreground_registry().active_count() > 0;
-        self.liveness.note_tool_end(leaked);
+        if !isolated {
+            let leaked = !self.runner.detached_descendants_preserved()
+                && !run_in_background(name, arguments)
+                && self.runner.foreground_registry().active_count() > 0;
+            self.liveness.note_tool_end(leaked);
+        }
         outcome
     }
 
@@ -1083,6 +1134,34 @@ mod tests {
             )
             .await;
         assert_eq!(allowed.status, ToolStatus::Succeeded, "{}", allowed.content);
+    }
+
+    #[tokio::test]
+    async fn isolated_tools_leave_the_parent_open_tool_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let host = host(dir.path().to_path_buf());
+        host.liveness.note_tool_start("parent", "bash");
+        let mut ui = TestUi::default();
+        let outcome = host
+            .execute_isolated(
+                "lane-read",
+                "read",
+                r#"{"path":"a.txt"}"#,
+                || PermissionMode::Always,
+                AutoHint::Heuristic,
+                &mut ui,
+                &TurnCancellation::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, ToolStatus::Succeeded, "{}", outcome.content);
+        let snap = host.liveness.snapshot();
+        assert!(
+            snap.invariant.is_none(),
+            "a lane tool must not stick ToolUnclosed: {:?}",
+            snap.invariant
+        );
+        assert_eq!(snap.last_tool_id.as_deref(), Some("parent"));
     }
 
     #[test]
