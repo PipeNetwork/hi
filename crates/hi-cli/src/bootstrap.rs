@@ -159,11 +159,14 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
                 )
                 .await;
                 for endpoint in &settings.lanes {
-                    let paths = if endpoint.paths.is_empty() {
-                        "(default / unmatched paths)".to_string()
+                    let mut paths = if endpoint.paths.is_empty() {
+                        "(shared pool)".to_string()
                     } else {
                         endpoint.paths.join(", ")
                     };
+                    if endpoint.default {
+                        paths.push_str(" default");
+                    }
                     let health = probes
                         .iter()
                         .find(|probe| probe.id == endpoint.id)

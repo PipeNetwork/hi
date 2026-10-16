@@ -69,12 +69,18 @@ hi -p four-box "split the remaining work into tight lanes and implement it"
 endpoint. Omit `[[endpoints]]` (or use any other profile) and `hi` is the
 usual single-endpoint session.
 
-The Spark lab profile in `hi.toml` is `sparks`. `spark-7466`
-(`100.116.163.116`) is the coordinator and default worker. `spark-7a60`
-(`100.81.119.49`) and `gx10-3607` (`100.113.145.127`) are peer workers on
-the same tree, with no path prefixes. Each one serves `hi-local` at port
-8000 with model id `qwen2.5-3b-instruct`. `gx10-1e82` (`100.74.5.66`) is
-offline.
+The lab profile in `hi.toml` is `sparks`. The 512GB Mac Studio
+(`100.122.74.84`, endpoint `mac-512gb`) coordinates and is the default
+worker. It serves GLM-5.3 Flash through mlx_vlm on port 8080; the model
+id is the on-disk path `/Users/david/models/glm-5-3-flash-mlx-mixed-4_8bit`.
+`spark-7466` (`100.116.163.116`), `spark-7a60` (`100.81.119.49`), and
+`gx10-3607` (`100.113.145.127`) are peer workers on the same tree, with
+no path prefixes. Each of those runs the `hi-lane` user service:
+`hi-local-v2` on port 8000 serving Qwen3-Coder-30B-A3B (Q4_K_M) as model
+id `qwen3-coder-30b-a3b`, with `HI_CUDA_PREFIX_CACHE=1`. That cache turns a
+repeated 2.7k-token prefill from 9s into 0.2s, which matters for write
+lanes because every tool round resends the lane so far. `gx10-1e82`
+(`100.74.5.66`) is offline.
 
 ```bash
 hi --show-config -p sparks
@@ -90,7 +96,7 @@ Each endpoint field:
 | `model` | Optional; inherits the profile model |
 | `api_key` / `api_key_env` / `api_key_ref` | Optional; inherits the profile key |
 | `paths` | Prefixes (`crates/a`) or globs (`crates/a/**`, `*.md`) used as assignment hints |
-| `default` | Fallback worker for unmatched paths and non-path work |
+| `default` | Where a single unmatched lane lands. Several unmatched lanes spread across free GPUs, one each, before any box takes a second lane |
 
 `provider = "ollama"` is the usual choice for LAN vLLM because it does not
 require a real API key. `provider = "openai"` works too if you pair
@@ -123,16 +129,31 @@ not in the always-on catalog). The coordinator is prompted to emit several
 - `task` — one concrete sub-task
 - `paths` — files/directories that lane owns (keep write scopes disjoint)
 - `context_files` — the only files preloaded into that worker
-- `readonly` — investigate without taking the write lock against other lanes
+- `readonly` — investigate without taking the write lock against other lanes.
+  A readonly lane gets the preloaded files and no tools, and answers in one
+  completion.
 
 The harness then:
 
-1. Matches each lane to an endpoint (path hits, else the `default` worker).
+1. Matches each lane to an endpoint. An explicit `endpoint` wins, then a
+   path hint. Lanes that match neither spread across free GPUs, one per box.
+   A single unmatched lane stays on the `default` worker. Among equally
+   loaded GPUs, a lane whose first file matches the last lane a box ran goes
+   back to that box, where its prefix is still cached.
 2. Runs lanes on free GPUs, one at a time per box, skipping write-path
    overlaps. A GPU that finishes starts the next lane immediately.
-3. Runs a nested tool loop on that GPU with a **slim** prompt (worker
-   instructions + task + preloaded files — not the parent transcript).
-4. Merges summaries and file changes back into the parent JSONL session.
+3. Runs the worker with a **slim** prompt: worker instructions, then the
+   preloaded files, then the owned paths, then the task. Files come first so
+   lanes over the same files share a cacheable prefix. Readonly lanes stop
+   after that one reply. Write lanes get read, write, edit, grep, and
+   foreground bash, at most four rounds. Readonly output is capped at 384
+   tokens and write-lane output at 1536. Tool results fed back into the lane
+   are clipped. The lane result lists changed files and the edits that
+   applied.
+4. Merges a short summary back into the parent session. The coordinator's
+   system prompt and tool list are identical on every request, so a server
+   with a prefix cache (mlx_vlm, vLLM) reuses the earlier prefill for the
+   merge and for any follow-up wave.
 
 Lane workers cannot spawn further lanes. `/undo` still restores the parent
 turn’s git checkpoint. Pipe Network login, `/verify`, and the TUI are
@@ -149,9 +170,10 @@ whose target sits outside that set is refused. A lane that names no paths may
 write anywhere in the workspace and is scheduled alone against other writers.
 Readonly lanes inspect the tree.
 
-Each worker sees a small tool list: `read`, `write`, `edit`, `grep`, and
-foreground `bash`. Inside a declared scope, shell is read-only or a build/test
-command (`cargo`, `pytest`, `go`, `npm`, and the usual siblings). Those builds
+A write lane sees a small tool list: `read`, `write`, `edit`, `grep`, and
+foreground `bash`. A readonly lane sees none. Inside a declared scope, shell
+is read-only or a build/test command (`cargo`, `pytest`, `go`, `npm`, and the
+usual siblings). Those builds
 get their own `CARGO_TARGET_DIR` under `.hi/lane-targets/<gpu>/`, so two lanes
 can test at the same time. Other mutating shell is refused. A lane with no
 paths may run mutating shell, one command at a time.

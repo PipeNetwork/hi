@@ -118,28 +118,40 @@ base_url = "http://127.0.0.1:8082/v1"
 max_tokens = 4096
 tool_mode = "auto"
 
-# Tailnet lane pool. spark-7466 coordinates. All three serve
-# `hi-local` on port 8000 with the same model id. gx10-1e82
-# (100.74.5.66) has been offline since 2026-08-03; gx10-3607 is the
-# live GX10 on the same LAN. No path prefixes. Then: hi -p sparks "…"
-# See docs/multi-endpoint-lanes.md.
+# Tailnet lane pool, four GPUs, one tree. The 512GB Mac Studio
+# (hostname 512gb) coordinates: mlx_vlm serves GLM-5.3 Flash on
+# port 8080, and the model id is the on-disk path mlx_vlm reports.
+# The three NVIDIA boxes are peer workers: the hi-lane user service
+# runs hi-local-v2 on port 8000 with Qwen3-Coder-30B-A3B Q4_K_M
+# and HI_CUDA_PREFIX_CACHE=1.
+# Unmatched lanes spread one per free GPU; a lone lane uses the Mac.
+# gx10-1e82 (100.74.5.66) is offline.
+# Then: hi -p sparks "…"  See docs/multi-endpoint-lanes.md.
 [profiles.sparks]
 provider = "ollama"
-model = "qwen2.5-3b-instruct"
-base_url = "http://100.116.163.116:8000/v1" # spark-7466
+model = "/Users/david/models/glm-5-3-flash-mlx-mixed-4_8bit"
+base_url = "http://100.122.74.84:8080/v1" # mac studio 512gb
 api_key = "local"
 max_tokens = 2048
 tool_mode = "auto"
 
 [[profiles.sparks.endpoints]]
+id = "mac-512gb"
+base_url = "http://100.122.74.84:8080/v1"
+model = "/Users/david/models/glm-5-3-flash-mlx-mixed-4_8bit"
+default = true
+
+[[profiles.sparks.endpoints]]
 id = "spark-7466"
 base_url = "http://100.116.163.116:8000/v1"
-default = true
+model = "qwen3-coder-30b-a3b"
 
 [[profiles.sparks.endpoints]]
 id = "spark-7a60"
 base_url = "http://100.81.119.49:8000/v1"
+model = "qwen3-coder-30b-a3b"
 
 [[profiles.sparks.endpoints]]
 id = "gx10-3607"
 base_url = "http://100.113.145.127:8000/v1"
+model = "qwen3-coder-30b-a3b"
