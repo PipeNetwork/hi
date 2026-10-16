@@ -40,6 +40,8 @@ pub struct Settings {
     /// Raw session-source overrides, retained to fence live session switches.
     pub session_harness: hi_workspace::SettingLayer,
     pub harness: hi_workspace::ResolvedHarnessSettings,
+    /// Resolved peer GPU workers. Empty means single-endpoint mode.
+    pub lanes: Vec<hi_harness::LaneEndpointConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +263,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         Some(session_harness.clone()),
         &cli.harness_settings,
     )?;
+    let lanes = resolve_lane_endpoints(route_profile, &api_key, &model, provider)?;
 
     Ok(Settings {
         execution,
@@ -294,6 +297,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         mcp_pipe_allow: config.mcp.pipe.allow.clone(),
         session_harness,
         harness,
+        lanes,
     })
 }
 
@@ -460,6 +464,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         .unwrap_or(ExecutionMode::Durable);
     let session_harness = super::empty_session_harness();
     let harness = resolve_harness(config, profile, Some(session_harness.clone()), &[])?;
+    let lanes = resolve_lane_endpoints(profile, &api_key, &model, provider)?;
 
     Ok(Settings {
         execution,
@@ -505,7 +510,88 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         mcp_pipe_allow: config.mcp.pipe.allow.clone(),
         session_harness,
         harness,
+        lanes,
     })
+}
+
+/// Expand profile `[[endpoints]]` into resolved lane workers. Absent config
+/// yields an empty list and today's single-endpoint path.
+fn resolve_lane_endpoints(
+    route_profile: Option<&Profile>,
+    parent_key: &str,
+    parent_model: &str,
+    provider: ProviderName,
+) -> Result<Vec<hi_harness::LaneEndpointConfig>> {
+    let Some(profile) = route_profile else {
+        return Ok(Vec::new());
+    };
+    if profile.endpoints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut resolved = Vec::new();
+    for (index, endpoint) in profile.endpoints.iter().enumerate() {
+        let id = if endpoint.id.trim().is_empty() {
+            format!("gpu-{}", index + 1)
+        } else {
+            endpoint.id.trim().to_string()
+        };
+        let base_url = endpoint.base_url.trim().trim_end_matches('/').to_string();
+        anyhow::ensure!(
+            !base_url.is_empty(),
+            "profile endpoint '{id}' needs a base_url"
+        );
+        super::profile_edit::ensure_project_endpoint_trusted(
+            Some(profile),
+            &base_url,
+            profile.project_local,
+        )?;
+        let api_key = if let Some(reference) = endpoint.api_key_ref.as_deref() {
+            super::resolve_credential_reference(
+                reference,
+                profile.project_local,
+                profile.project_trusted,
+            )?
+        } else if let Some(key) = endpoint
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            key.to_string()
+        } else if let Some(env_name) = endpoint.api_key_env.as_deref() {
+            if profile.project_local {
+                anyhow::bail!(
+                    "project-local endpoint '{id}' cannot read api_key_env '{env_name}' from the environment"
+                );
+            }
+            std::env::var(env_name)
+                .map_err(|_| anyhow!("env var {env_name} (from endpoint '{id}') is not set"))?
+        } else if !parent_key.trim().is_empty() {
+            parent_key.to_string()
+        } else if provider == ProviderName::Ollama {
+            "ollama".into()
+        } else {
+            anyhow::bail!(
+                "endpoint '{id}' has no API key; set api_key/api_key_env/api_key_ref on the endpoint or its profile"
+            );
+        };
+        let model = endpoint
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(parent_model)
+            .to_string();
+        resolved.push(hi_harness::LaneEndpointConfig {
+            id,
+            base_url,
+            model: Some(model).filter(|value| !value.is_empty()),
+            api_key,
+            paths: endpoint.paths.clone(),
+            default: endpoint.default,
+        });
+    }
+    Ok(resolved)
 }
 
 /// Reasoning effort for this route.

@@ -11,6 +11,7 @@ mod jev_auto;
 mod jev_compact;
 mod ladder;
 mod ladder_harness;
+mod lanes;
 mod live;
 mod managed;
 pub use managed::{ManagedInspection, ManagedSettings, inspect_managed_journal};
@@ -63,6 +64,9 @@ pub use ladder::{
     AttemptResult, DEFAULT_ATTEMPTS_PER_RUNG as LADDER_DEFAULT_ATTEMPTS, Ladder, LadderAttempt,
     LadderCommand, LadderPhase, LadderRung, LadderSettings, LadderStep, LadderTurnFacts,
     MAX_ATTEMPTS_PER_RUNG as LADDER_MAX_ATTEMPTS, transcript_label as ladder_transcript_label,
+};
+pub use lanes::{
+    CoordinatorFallback, LaneEndpointConfig, LaneProbe, coordinator_fallback, probe_lane_endpoints,
 };
 pub use live::LiveSettings;
 pub use liveness::AwaitingUserGuard;
@@ -201,6 +205,8 @@ pub struct HarnessConfig {
     pub jev_compact: bool,
     /// Optional TypeSafe (Jev) next-action gate. Off when no API key is set.
     pub typesafe: TypesafeSettings,
+    /// Opt-in peer GPU workers. Empty keeps today's single-endpoint path.
+    pub lanes: Vec<LaneEndpointConfig>,
 }
 
 impl HarnessConfig {
@@ -221,6 +227,7 @@ impl HarnessConfig {
             auto_compact: true,
             jev_compact: false,
             typesafe: TypesafeSettings::disabled(),
+            lanes: Vec::new(),
         }
     }
 }
@@ -269,6 +276,10 @@ pub struct Harness {
     /// Files the current review audit turn has read so far
     /// ([`review_reads`]). Reset when an audit turn starts; never persisted.
     review_read_files: Vec<String>,
+    /// Opt-in peer GPU lane pool. `None` keeps a single Pipe client.
+    lanes: Option<lanes::LanePool>,
+    /// Per-endpoint token counts from the latest lane round (`gpu-a 12/4`).
+    lane_usage_line: String,
     /// `/ladder`: cheap-first escalation for one task. Never persisted.
     ladder: Ladder,
     ladder_settings: LadderSettings,
@@ -303,6 +314,7 @@ impl Harness {
             liveness.set_session_path(Some(session.path().display().to_string()));
         }
         liveness.set_state(hi_liveness::HarnessState::Idle);
+        let lanes = lanes::LanePool::from_config(&config.lanes, &config.model, &config.api_key);
         Ok(Self {
             client: Client::new(config.base_url, config.api_key).with_managed(
                 config
@@ -349,6 +361,8 @@ impl Harness {
             review_drive: ReviewDrive::default(),
             review_settings: ReviewSettings::default(),
             review_read_files: Vec::new(),
+            lanes,
+            lane_usage_line: String::new(),
             ladder: Ladder::default(),
             ladder_settings: LadderSettings::default(),
             last_verify_output: None,
@@ -767,6 +781,15 @@ impl Harness {
 
     pub fn session_usage(&self) -> Usage {
         self.session_usage
+    }
+
+    /// Suffix for the status line when a lane round reported token counts.
+    pub fn lane_usage_suffix(&self) -> String {
+        if self.lane_usage_line.is_empty() {
+            String::new()
+        } else {
+            format!(" · lanes {}", self.lane_usage_line)
+        }
     }
 
     pub fn verify_command(&self) -> Option<&str> {

@@ -525,7 +525,7 @@ async fn handle_command(
             };
             app.push(Line::styled(
                 format!(
-                    "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox}",
+                    "{} · {} · reasoning {} · ctx {}/{} ({}) · in {} / out {} · undo {} · sandbox {sandbox}{}",
                     harness.model(),
                     harness.permission_mode().describe(),
                     harness
@@ -537,7 +537,8 @@ async fn handle_command(
                     harness.context_window_source(),
                     usage.input_tokens,
                     usage.output_tokens,
-                    harness.checkpoint_count()
+                    harness.checkpoint_count(),
+                    harness.lane_usage_suffix()
                 ),
                 dim(),
             ));

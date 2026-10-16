@@ -694,7 +694,7 @@ pub(crate) fn resolve_api_key_for_endpoint(
     )
 }
 
-fn ensure_project_endpoint_trusted(
+pub(crate) fn ensure_project_endpoint_trusted(
     profile: Option<&Profile>,
     base_url: &str,
     project_profile_controls_endpoint: bool,

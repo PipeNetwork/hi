@@ -153,6 +153,15 @@ See [ADR 001](adr/001-rsi-runtime-boundary.md).
 The agent talks to it like any other provider; GPU crates are not linked into
 `hi-harness` or the core workspace.
 
+## Multi-endpoint task lanes
+
+Interactive `hi-harness` can optionally fan **narrow lanes** across several
+OpenAI-compatible URLs (LAN vLLM peers). The parent turn is the coordinator
+(`PipeClient` on the profile `base_url`); each lane is a nested tool-using
+call on another `PipeClient` with a slim prompt. Matching, conflict locking,
+and fallback live in `hi_harness::lanes`. Absent `[[endpoints]]`, the turn
+loop is unchanged. Details: [multi-endpoint-lanes.md](multi-endpoint-lanes.md).
+
 ## Benchmark evidence boundary
 
 Harness diagnostics reuse session JSONL, git checkpoints, and `hi-trace`

@@ -148,6 +148,36 @@ async fn print_show_config(cli: &Cli) -> Result<()> {
             println!("compat:     {:?}", settings.compat);
             println!("deepseek:   {:?}", settings.deepseek_compat);
             println!("api_key:    {}", config::mask_key(&settings.api_key));
+            if settings.lanes.is_empty() {
+                println!("lanes:      off");
+            } else {
+                println!("lanes:      {} endpoint(s)", settings.lanes.len());
+                let probes = hi_harness::probe_lane_endpoints(
+                    &settings.lanes,
+                    &settings.model,
+                    &settings.api_key,
+                )
+                .await;
+                for endpoint in &settings.lanes {
+                    let mut paths = if endpoint.paths.is_empty() {
+                        "(shared pool)".to_string()
+                    } else {
+                        endpoint.paths.join(", ")
+                    };
+                    if endpoint.default {
+                        paths.push_str(" default");
+                    }
+                    let health = probes
+                        .iter()
+                        .find(|probe| probe.id == endpoint.id)
+                        .map(|probe| if probe.up { "up" } else { "down" })
+                        .unwrap_or("down");
+                    println!(
+                        "  - {}  {health}  {}  {paths}",
+                        endpoint.id, endpoint.base_url
+                    );
+                }
+            }
             Ok(())
         }
         Err(err) => {

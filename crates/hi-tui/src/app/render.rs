@@ -397,8 +397,27 @@ impl crate::App {
         out
     }
 
-    fn live_task_lines(&self, _max: usize) -> Vec<Line<'static>> {
-        Vec::new()
+    fn live_task_lines(&self, max: usize) -> Vec<Line<'static>> {
+        if self.lane_lines.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let overflow = self.lane_lines.len() > max && max >= 2;
+        let take = if overflow { max - 1 } else { max };
+        let th = crate::theme::theme();
+        let mut out: Vec<Line<'static>> = self
+            .lane_lines
+            .iter()
+            .take(take)
+            .map(|(_, line)| Line::styled(line.clone(), Style::default().fg(th.accent_running)))
+            .collect();
+        if self.lane_lines.len() > take {
+            out.push(Line::styled(
+                format!("  +{} more lanes", self.lane_lines.len() - take),
+                dim(),
+            ));
+        }
+        out.truncate(max);
+        out
     }
 
     pub(crate) fn render(&mut self, frame: &mut ratatui::Frame) {

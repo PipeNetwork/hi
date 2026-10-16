@@ -1114,6 +1114,9 @@ pub(crate) struct App {
     /// One replaceable live progress message. Long-running recovery/status
     /// updates belong in chrome, not as a new transcript row each time.
     pub(crate) working_status: Option<String>,
+    /// One live line per in-flight lane (`call id`, rendered text). Replaced
+    /// in place above the transcript instead of appending a row per token.
+    pub(crate) lane_lines: Vec<(String, String)>,
     pub(crate) startup_notice: Option<String>,
     /// Checkpoint warning retained in the composer while also pinned in
     /// `top_notice`; it is intentionally not copied into the transcript.

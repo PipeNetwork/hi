@@ -3656,4 +3656,88 @@ fn top_level_help_lists_everyday_commands() {
     }
 }
 
+#[test]
+fn lane_endpoints_are_opt_in_and_resolve_from_the_profile() {
+    let parsed: Config = toml::from_str(
+        r#"
+[profiles.plain]
+provider = "ollama"
+model = "qwen"
+base_url = "http://127.0.0.1:8080/v1"
+
+[profiles.four-box]
+provider = "ollama"
+model = "Qwen3.8-27B-NVFP4"
+base_url = "http://192.168.1.10:8000/v1"
+api_key = "local"
+
+[[profiles.four-box.endpoints]]
+id = "gpu-a"
+base_url = "http://192.168.1.10:8000/v1"
+default = true
+paths = ["crates/a/**"]
+
+[[profiles.four-box.endpoints]]
+id = "gpu-b"
+base_url = "http://192.168.1.11:8000/v1"
+model = "DeepSeek-R1"
+paths = ["crates/b/**"]
+"#,
+    )
+    .unwrap();
+    assert!(parsed.profiles["plain"].endpoints.is_empty());
+    assert_eq!(parsed.profiles["four-box"].endpoints.len(), 2);
+    assert!(parsed.profiles["four-box"].endpoints[0].default);
+
+    let cli = Cli::try_parse_from(["hi", "--profile", "plain"]).unwrap();
+    let plain = resolve(&cli, &parsed).unwrap();
+    assert!(
+        plain.lanes.is_empty(),
+        "single-endpoint default is unchanged"
+    );
+
+    let cli = Cli::try_parse_from(["hi", "--profile", "four-box"]).unwrap();
+    let lanes = resolve(&cli, &parsed).unwrap();
+    assert_eq!(lanes.base_url, "http://192.168.1.10:8000/v1");
+    assert_eq!(lanes.lanes.len(), 2);
+    assert_eq!(lanes.lanes[0].id, "gpu-a");
+    assert_eq!(lanes.lanes[1].id, "gpu-b");
+    assert_eq!(lanes.lanes[1].model.as_deref(), Some("DeepSeek-R1"));
+    assert_eq!(lanes.lanes[1].paths, ["crates/b/**"]);
+    assert_eq!(lanes.lanes[0].api_key, "local");
+}
+
+#[test]
+fn remote_lane_endpoint_is_a_sensitive_project_route() {
+    let config: Config = toml::from_str(
+        r#"
+[profiles.local]
+provider = "ollama"
+base_url = "http://127.0.0.1:8080/v1"
+
+[[profiles.local.endpoints]]
+id = "gpu-b"
+base_url = "http://192.168.1.11:8000/v1"
+"#,
+    )
+    .unwrap();
+    assert!(super::file::project_has_sensitive_provider_routes(&config));
+
+    let loopback: Config = toml::from_str(
+        r#"
+[profiles.local]
+provider = "ollama"
+base_url = "http://127.0.0.1:8080/v1"
+
+[[profiles.local.endpoints]]
+id = "gpu-a"
+base_url = "http://127.0.0.1:8000/v1"
+"#,
+    )
+    .unwrap();
+    assert!(!super::file::project_has_sensitive_provider_routes(
+        &loopback
+    ));
+}
+
 mod credential_migration;

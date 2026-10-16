@@ -70,10 +70,20 @@ Profiles live in `./hi.toml` or `~/.config/hi/config.toml`. Credentials are stor
 
 The TUI starts in **ask** (confirm file edits and mutating shell). `/auto` allows safe file edits; `/yolo` skips confirms for the session. One-shot and `--plain` default to always-approve unless you pass `--confirm-edits`. Shell writes stay in the project on macOS (Seatbelt) and on Linux when `pipe-wrap` is available. `HI_SANDBOX=off` disables that. `/status` shows sandbox and context occupancy. Tool results are untrusted data, not instructions.
 
+## Multi-endpoint task lanes
+
+Four LAN GPUs are **peer workers**, not a round-robin for one stream. Opt in
+with `[[profiles.<name>.endpoints]]` in `hi.toml`: the profile `base_url` is
+the coordinator; each endpoint is a GPU that can run a narrow lane (slim
+context, only the files that lane needs) in parallel. Path prefixes are
+assignment hints. Unconfigured `hi` is still one endpoint. Setup for four
+GB100/vLLM boxes: [multi-endpoint-lanes.md](docs/multi-endpoint-lanes.md).
+
 ## Docs
 
 - [Handbook](docs/handbook.md)
 - [Architecture](docs/architecture.md)
 - [Sandbox](docs/sandbox.md)
+- [Multi-endpoint task lanes](docs/multi-endpoint-lanes.md)
 
 Homebrew formula (tap yourself or `brew install --build-from-source`): [packaging/homebrew/hi.rb](packaging/homebrew/hi.rb). Binary archives can follow; `cargo install --path crates/hi-cli --locked` is still the supported build.
