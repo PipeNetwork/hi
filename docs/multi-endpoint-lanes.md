@@ -80,12 +80,19 @@ no path prefixes. Each of those runs the `hi-lane` user service:
 id `qwen3-coder-30b-a3b`, with `HI_CUDA_PREFIX_CACHE=1`. That cache turns a
 repeated 2.7k-token prefill from 9s into 0.2s, which matters for write
 lanes because every tool round resends the lane so far. `gx10-1e82`
-(`100.74.5.66`) is offline.
+(`100.74.5.66`) is offline. On the Mac, the launchd agent
+`com.david.glm-flash` (`~/Library/LaunchAgents/com.david.glm-flash.plist`,
+wrapper `~/.local/bin/glm-flash-serve.sh`) starts the GLM server at login and
+restarts it after a crash. The wrapper leaves an already-running server on
+:8080 alone.
 
 ```bash
 hi --show-config -p sparks
-hi -p sparks "split the remaining work into tight lanes and implement it"
+hi -p sparks "add rect_area to shapes.py, whisper to text.py, and mul to mathx.py"
 ```
+
+Prompts need no lane wording. A request that names two or more independent
+files, crates, or questions fans out on its own.
 
 Each endpoint field:
 
@@ -123,8 +130,12 @@ into peer workers.
 ## What the coordinator does
 
 When the pool is present, `hi` injects a `lane` tool (ADR 002: feature-gated,
-not in the always-on catalog). The coordinator is prompted to emit several
-`lane` calls in one response:
+not in the always-on catalog). The coordinator's lane rule: when a request
+covers two or more independent units (files, crates, modules, or separate
+questions), its first response is one `lane` call per unit, before it reads
+those files itself. It then merges the results and fixes only what a lane got
+wrong. Single-file work, quick lookups, and steps that depend on an earlier
+result stay on the coordinator. Each `lane` call carries:
 
 - `task` — one concrete sub-task
 - `paths` — files/directories that lane owns (keep write scopes disjoint)
@@ -147,9 +158,10 @@ The harness then:
    lanes over the same files share a cacheable prefix. Readonly lanes stop
    after that one reply. Write lanes get read, write, edit, grep, and
    foreground bash, at most four rounds. Readonly output is capped at 384
-   tokens and write-lane output at 1536. Tool results fed back into the lane
-   are clipped. The lane result lists changed files and the edits that
-   applied.
+   tokens and write-lane output at 1536. Lanes run at `low` reasoning effort
+   (`minimal` when the session is `minimal`), whatever the coordinator's
+   effort. Tool results fed back into the lane are clipped. The lane result
+   lists changed files and the edits that applied.
 4. Merges a short summary back into the parent session. The coordinator's
    system prompt and tool list are identical on every request, so a server
    with a prefix cache (mlx_vlm, vLLM) reuses the earlier prefill for the
@@ -185,6 +197,11 @@ A free GPU starts the next non-conflicting lane without waiting for a slower
 peer. Before the first lane, `hi` probes `GET /models` on each box. A transport
 failure or HTTP 5xx takes that GPU out and moves the lane once onto the next
 healthy box. `hi --show-config` prints `up` or `down` for each endpoint.
+
+At session start `hi` also checks the coordinator (`GET /models`, two tries,
+4s each). A 2xx or 4xx counts as up. When the coordinator gives no answer,
+the session coordinates on the first live lane endpoint with a different
+URL, using that endpoint's model and key, and prints which one it picked.
 
 While a lane runs, the TUI keeps one live line per lane above the transcript
 (endpoint, current tool, last line) and replaces that line in place. The tool

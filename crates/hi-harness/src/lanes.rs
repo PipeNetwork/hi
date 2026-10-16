@@ -41,23 +41,26 @@ const MAX_LANE_DIFF_CHARS: usize = 600;
 
 /// Coordinator instructions appended to the parent system prompt.
 pub const COORDINATOR_PROMPT: &str = "\
-Peer GPU lanes are enabled. You are the coordinator on one workspace: keep \
-planning, merging, and non-path work here. Split independent coding work into \
-several `lane` calls in ONE response so they run concurrently on different \
-GPUs. Each lane must be a tight sub-task with small context: `task` is one \
-concrete goal; `paths` lists workspace-relative files or directories that \
-lane owns (non-overlapping for parallel writes); `context_files` are the only \
-files preloaded into that lane (keep this small — do not attach the whole \
-tree); `readonly` is true for investigate-only lanes. Path rules may hint \
-which GPU a lane lands on, but lanes share this tree and are not bound to a \
-crate forever. A lane with no endpoint and no path hit is placed on a free \
-GPU, one per box, so an unpinned wave still runs in parallel. A readonly \
-lane answers from its preloaded files and has no tools. Lane file edits stay \
-inside the declared paths. Lane \
-sessions start in always-approve. In ask mode, diffs from parallel lanes \
-are confirmed together. Do not spawn a lane for a trivial \
-single-file tweak you can edit here. If a lane endpoint fails, continue with \
-the others and report that shard's error.";
+Peer GPU lanes are enabled. You are the coordinator on one workspace.
+
+Lane rule: when a request covers two or more independent units (files, \
+crates, modules, or separate questions), your FIRST response is one `lane` \
+call per unit, all in that one response, before you read those files \
+yourself. The lanes run at the same time on different GPUs and read the \
+files for you. After their results return, merge them, and verify or fix \
+only what a lane got wrong. Work on a single file, a quick lookup, or a \
+step that depends on another step's result stays here.
+
+Each lane is a tight sub-task with small context: `task` is one concrete \
+goal with what done looks like; `paths` lists the workspace-relative files \
+or directories that lane owns (disjoint for parallel writes); \
+`context_files` are the only files preloaded into that lane (keep this \
+small); `readonly` is true for investigate-only lanes, which answer from \
+their preloaded files in one reply with no tools. A lane with no endpoint \
+and no path hit lands on a free GPU, one per box. Lane file edits stay \
+inside the declared paths. Lane sessions start in always-approve; in ask \
+mode, diffs from parallel lanes are confirmed together. If a lane endpoint \
+fails, continue with the others and report that shard's error.";
 
 const WORKER_PROMPT: &str = "\
 You are a hi lane worker on one GPU. Complete this ONE narrow task in the \
@@ -266,6 +269,7 @@ pub struct LaneWorker {
     pub id: String,
     pub base_url: String,
     pub model: String,
+    api_key: String,
     client: PipeClient,
     rules: Vec<PathRule>,
     is_default: bool,
@@ -355,7 +359,8 @@ impl LanePool {
                 id,
                 base_url: base_url.clone(),
                 model,
-                client: PipeClient::new(base_url, api_key),
+                client: PipeClient::new(base_url, api_key.clone()),
+                api_key,
                 rules,
                 is_default: endpoint.default,
             });
@@ -576,7 +581,7 @@ fn schedule_waves(requests: &[LaneRequest], assignments: &[LaneAssignment]) -> V
 pub fn lane_tool_spec() -> ToolSpec {
     ToolSpec {
         name: LANE_TOOL_NAME.into(),
-        description: "Run a narrow coding sub-task on a peer GPU endpoint with a slim context (only the files you name). Use several lane calls in one response to fan independent work across GPUs. Keep each task tight; name owned paths; do not overlap write paths for lanes that should run in parallel. File edits stay inside paths. Pass endpoint to pin a GPU from the pool map. Lane sessions start in always-approve; ask mode confirms lane diffs together. The sub-task cannot spawn lanes. Prefer doing a trivial single-file edit yourself.".into(),
+        description: "Run one narrow sub-task on a peer GPU with a slim context (only the files you name). For work that spans two or more independent files, crates, or questions, emit one lane call per unit in the same response, before reading those files yourself; the lanes run in parallel and read them for you. Keep each task tight; name owned paths; keep write paths disjoint. File edits stay inside paths. Pass endpoint to pin a GPU from the pool map. The sub-task cannot spawn lanes. A single-file edit or quick lookup stays with you.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -1104,6 +1109,59 @@ pub async fn probe_lane_endpoints(
     futures_util::future::join_all(checks).await
 }
 
+/// A lane endpoint that stands in for a coordinator that is not answering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoordinatorFallback {
+    pub id: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+}
+
+/// Probes the profile coordinator. When it does not answer `/models` (twice,
+/// so a busy server is not mistaken for a dead one), returns the first lane
+/// endpoint on another server that does. `None` keeps the configured
+/// coordinator.
+pub async fn coordinator_fallback(
+    base_url: &str,
+    api_key: &str,
+    parent_model: &str,
+    endpoints: &[LaneEndpointConfig],
+) -> Option<CoordinatorFallback> {
+    let pool = LanePool::from_config(endpoints, parent_model, api_key)?;
+    let coordinator = PipeClient::new(base_url.to_string(), api_key.to_string());
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(4), coordinator.list_models()).await {
+            Ok(Ok(_)) => return None,
+            Ok(Err(err)) if probe_response_alive(Some(&err)) => return None,
+            _ => {}
+        }
+    }
+    let home = base_url.trim().trim_end_matches('/');
+    let candidates: Vec<&LaneWorker> = pool
+        .workers
+        .iter()
+        .filter(|worker| worker.base_url != home)
+        .collect();
+    let checks = candidates.iter().map(|worker| async {
+        matches!(
+            tokio::time::timeout(Duration::from_millis(1500), worker.client.list_models()).await,
+            Ok(Ok(_))
+        )
+    });
+    let alive = futures_util::future::join_all(checks).await;
+    candidates
+        .into_iter()
+        .zip(alive)
+        .find(|(_, up)| *up)
+        .map(|(worker, _)| CoordinatorFallback {
+            id: worker.id.clone(),
+            base_url: worker.base_url.clone(),
+            model: worker.model.clone(),
+            api_key: worker.api_key.clone(),
+        })
+}
+
 async fn probe_down(pool: &LanePool) -> HashSet<usize> {
     let checks = pool
         .workers
@@ -1214,6 +1272,15 @@ fn lane_output_tokens(readonly: bool, requested: u32) -> u32 {
     requested.clamp(1, cap)
 }
 
+/// A lane is one narrow task. A thinking worker at the parent's high effort
+/// can reason for minutes, and some servers raise the output budget anyway.
+fn lane_effort(parent: Option<hi_ai::ReasoningEffort>) -> Option<hi_ai::ReasoningEffort> {
+    match parent {
+        Some(hi_ai::ReasoningEffort::Minimal) => Some(hi_ai::ReasoningEffort::Minimal),
+        _ => Some(hi_ai::ReasoningEffort::Low),
+    }
+}
+
 fn clip_lane_tool_result(content: &str) -> String {
     clip_chars(content, MAX_LANE_TOOL_RESULT_CHARS)
 }
@@ -1241,6 +1308,7 @@ async fn run_lane(
     let catalog = lane_catalog(request.readonly);
     let round_limit = lane_round_limit(request.readonly);
     let max_tokens = lane_output_tokens(request.readonly, max_tokens);
+    let effort = lane_effort(effort);
     let mut effects = ToolEffects::default();
     let mut last_text = String::new();
     let mut usage = Usage::default();
@@ -2070,6 +2138,14 @@ mod tests {
             MAX_LANE_WRITE_OUTPUT_TOKENS
         );
         assert_eq!(lane_output_tokens(false, 32), 32);
+        assert_eq!(
+            lane_effort(Some(hi_ai::ReasoningEffort::High)),
+            Some(hi_ai::ReasoningEffort::Low)
+        );
+        assert_eq!(
+            lane_effort(Some(hi_ai::ReasoningEffort::Minimal)),
+            Some(hi_ai::ReasoningEffort::Minimal)
+        );
         assert_eq!(lane_output_tokens(true, 0), 1);
         let clipped = clip_lane_tool_result(&"x".repeat(MAX_LANE_TOOL_RESULT_CHARS + 20));
         assert!(clipped.chars().count() <= MAX_LANE_TOOL_RESULT_CHARS + 1);
@@ -2338,6 +2414,33 @@ mod tests {
         assert!(!probe_response_alive(Some(&anyhow::Error::from(down))));
         assert!(probe_response_alive(Some(&anyhow::Error::from(bad))));
         assert!(probe_response_alive(None));
+    }
+
+    #[tokio::test]
+    async fn a_dead_coordinator_hands_the_session_to_a_live_lane() {
+        use crate::pipe::test_support::MockPipe;
+        let Some(live) = MockPipe::new(Vec::new()) else {
+            return;
+        };
+        let dead = "http://127.0.0.1:1/v1";
+        let mut gone = endpoint("gone", &[], true);
+        gone.base_url = dead.into();
+        let mut up = endpoint("up", &[], false);
+        up.base_url = live.url.clone();
+        up.model = Some("coder".into());
+        let endpoints = [gone, up];
+        let fallback = coordinator_fallback(dead, "k", "glm", &endpoints)
+            .await
+            .expect("a live lane takes over");
+        assert_eq!(fallback.id, "up");
+        assert_eq!(fallback.model, "coder");
+        assert_eq!(fallback.base_url, live.url);
+        assert!(
+            coordinator_fallback(&live.url, "k", "glm", &endpoints)
+                .await
+                .is_none(),
+            "a coordinator that answers keeps the session"
+        );
     }
 
     #[test]

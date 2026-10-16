@@ -36,10 +36,31 @@ pub async fn run(
     let prompt = if resume.ignore_prompt { None } else { prompt };
     let interactive = prompt.is_none() && stdin_tty && !headless_review;
     let route = if !settings.lanes.is_empty() {
-        PipeRoute {
+        let configured = PipeRoute {
             api_key: settings.api_key.clone(),
             base_url: settings.base_url.trim_end_matches('/').to_string(),
             model: settings.model.clone(),
+        };
+        match hi_harness::coordinator_fallback(
+            &configured.base_url,
+            &configured.api_key,
+            &configured.model,
+            &settings.lanes,
+        )
+        .await
+        {
+            Some(fallback) => {
+                eprintln!(
+                    "coordinator {} did not answer; this session coordinates on lane endpoint {} ({})",
+                    configured.base_url, fallback.id, fallback.model
+                );
+                PipeRoute {
+                    api_key: fallback.api_key,
+                    base_url: fallback.base_url,
+                    model: fallback.model,
+                }
+            }
+            None => configured,
         }
     } else {
         match resolve_pipe_route(cli, file, settings) {

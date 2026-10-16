@@ -65,7 +65,9 @@ pub use ladder::{
     LadderCommand, LadderPhase, LadderRung, LadderSettings, LadderStep, LadderTurnFacts,
     MAX_ATTEMPTS_PER_RUNG as LADDER_MAX_ATTEMPTS, transcript_label as ladder_transcript_label,
 };
-pub use lanes::{LaneEndpointConfig, LaneProbe, probe_lane_endpoints};
+pub use lanes::{
+    CoordinatorFallback, LaneEndpointConfig, LaneProbe, coordinator_fallback, probe_lane_endpoints,
+};
 pub use live::LiveSettings;
 pub use liveness::AwaitingUserGuard;
 pub use pipe::{
